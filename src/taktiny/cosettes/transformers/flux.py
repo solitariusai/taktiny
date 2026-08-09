@@ -24,6 +24,10 @@ from dataclasses import dataclass
 from taktiny import nn
 from taktiny.layers.attention import JointAttention, Attention
 from taktiny.layers.ffn import FusedGateMLP
+from taktiny.layers.positional_embedding import (
+    SinusoidalPositionalEmbedding,
+    rotate_half,
+)
 
 
 def get_1d_rotary_pos_embed(dim: int, pos: jax.Array, theta: int = 10000) -> tuple[Any, ...]:
@@ -80,7 +84,7 @@ class JointAttentionBlock(nn.Module):
             num_heads=config.num_attention_heads,
             head_dim=config.attention_head_dim,
             use_qkv_norm=True,
-            seed=seed
+            rngs=seed,
         )
 
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=config.eps)
@@ -114,8 +118,8 @@ class JointAttentionBlock(nn.Module):
         cos, sin = rope_cos_sin
 
         def apply_rope(q: Any, k: Any, position_idx: int | None=None) -> tuple[Any, ...]:
-            q_embed = (q * cos[:, None, None, :]) + (nn.rotate_half(q) * sin[:, None, None, :])
-            k_embed = (k * cos[:, None, None, :]) + (nn.rotate_half(k) * sin[:, None, None, :])
+            q_embed = (q * cos[:, None, None, :]) + (rotate_half(q) * sin[:, None, None, :])
+            k_embed = (k * cos[:, None, None, :]) + (rotate_half(k) * sin[:, None, None, :])
             return q_embed, k_embed
 
         self.attn.pos_emb = apply_rope
@@ -166,8 +170,8 @@ class SingleStreamBlock(nn.Module):
         cos, sin = rope_cos_sin
 
         def apply_rope(q: Any, k: Any, position_idx: int | None=None) -> tuple[Any, ...]:
-            q_embed = (q * cos[:, None, None, :]) + (nn.rotate_half(q) * sin[:, None, None, :])
-            k_embed = (k * cos[:, None, None, :]) + (nn.rotate_half(k) * sin[:, None, None, :])
+            q_embed = (q * cos[:, None, None, :]) + (rotate_half(q) * sin[:, None, None, :])
+            k_embed = (k * cos[:, None, None, :]) + (rotate_half(k) * sin[:, None, None, :])
             return q_embed, k_embed
 
         self.attn.pos_emb = apply_rope
@@ -189,14 +193,18 @@ class Flux2Transformer2DModel(nn.Module):
         self.pos_embed = Flux2PosEmbed(theta=config.rope_theta, axes_dim=config.axes_dims_rope)
 
         self.time_in = nn.Sequential(
-            nn.SinusoidalPositionalEmbedding(config.timestep_guidance_channels),
-            nn.Linear(config.timestep_guidance_channels, self.inner_dim, bias=False, seed=seed)
+            [
+                SinusoidalPositionalEmbedding(config.timestep_guidance_channels),
+                nn.Linear(config.timestep_guidance_channels, self.inner_dim, bias=False, seed=seed),
+            ]
         )
 
         if config.guidance_embeds:
             self.guidance_in = nn.Sequential(
-                nn.SinusoidalPositionalEmbedding(config.timestep_guidance_channels),
-                nn.Linear(config.timestep_guidance_channels, self.inner_dim, bias=False, seed=seed)
+                [
+                    SinusoidalPositionalEmbedding(config.timestep_guidance_channels),
+                    nn.Linear(config.timestep_guidance_channels, self.inner_dim, bias=False, seed=seed),
+                ]
             )
         else:
             self.guidance_in = None

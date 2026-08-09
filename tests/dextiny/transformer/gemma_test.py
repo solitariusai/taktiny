@@ -9,7 +9,7 @@ from taktiny.cosettes.transformers.gemma import (
     Gemma3DecoderLayer,
     GemmaDecoderLayer,
 )
-from taktiny.maestro._config import ModelConfig
+from taktiny.maestro.config import ModelConfig
 
 from ._reference import (
     attention_no_bias,

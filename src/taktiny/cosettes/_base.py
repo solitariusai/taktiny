@@ -11,11 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from __future__ import annotations
 from typing import Any
-
-
 import os
 import json
 import re
@@ -32,12 +29,15 @@ from huggingface_hub import (
     split_state_dict_into_shards_factory,
 )
 from safetensors.flax import save_file
+
 from taktiny.nn import Module, Rngs
 from taktiny.nn.module import iter_children
+from taktiny.utils.typing import AxisNames
 
 
 class PretrainedModel(Module):
-    """Base class for models that load and save pretrained checkpoints.
+    """
+    Base class for models that load and save pretrained checkpoints.
 
     Full models are serialized as Safetensors together with a weight index.
     Qwix arrays retain their quantized components and reconstruction metadata.
@@ -922,7 +922,7 @@ class PretrainedModel(Module):
 
         def parameter_sharding(
             parameter: Any,
-            axis_names: Any=None,
+            axis_names: AxisNames | None=None,
             *,
             use_explicit: bool=True,
         ) -> Any:

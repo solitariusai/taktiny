@@ -79,28 +79,14 @@ def joint_qkv_projection(
     q2_weight,
     k2_weight,
     v2_weight,
-    *,
-    num_heads,
-    head_dim,
 ):
-    batch_size, length1, _ = stream1.shape
-    _, length2, _ = stream2.shape
-
-    def project(x, weight, length):
-        return linear(x, weight).reshape(
-            batch_size,
-            length,
-            num_heads,
-            head_dim,
-        )
-
     return (
-        project(stream1, q1_weight, length1),
-        project(stream1, k1_weight, length1),
-        project(stream1, v1_weight, length1),
-        project(stream2, q2_weight, length2),
-        project(stream2, k2_weight, length2),
-        project(stream2, v2_weight, length2),
+        linear(stream1, q1_weight),
+        linear(stream1, k1_weight),
+        linear(stream1, v1_weight),
+        linear(stream2, q2_weight),
+        linear(stream2, k2_weight),
+        linear(stream2, v2_weight),
     )
 
 
@@ -119,11 +105,9 @@ def joint_output_projection(
     o2_weight,
 ):
     stream1, stream2 = attended_states
-    batch_size, length1 = stream1.shape[:2]
-    length2 = stream2.shape[1]
     return (
-        linear(stream1.reshape(batch_size, length1, -1), o1_weight),
-        linear(stream2.reshape(batch_size, length2, -1), o2_weight),
+        linear(stream1, o1_weight, input_dims=2),
+        linear(stream2, o2_weight, input_dims=2),
     )
 
 
@@ -203,7 +187,6 @@ def test_attention_matches_reference_trace(case):
     ), compiled.report(actual_attention, *args).render()
 
 
-@pytest.mark.filterwarnings("ignore:seed is deprecated")
 def test_joint_attention_matches_reference_trace():
     stream1 = dx.AbstractArray("B S1 D1", dtype="float32")
     stream2 = dx.AbstractArray("B S2 D2", dtype="float32", name="stream2")
@@ -212,14 +195,13 @@ def test_joint_attention_matches_reference_trace():
         >> dx.AbstractModule(
             joint_qkv_projection,
             stream2,
-            dx.AbstractArray("D1 H*K", dtype="float32", name="q1_weight"),
-            dx.AbstractArray("D1 H*K", dtype="float32", name="k1_weight"),
-            dx.AbstractArray("D1 H*K", dtype="float32", name="v1_weight"),
-            dx.AbstractArray("D2 H*K", dtype="float32", name="q2_weight"),
-            dx.AbstractArray("D2 H*K", dtype="float32", name="k2_weight"),
-            dx.AbstractArray("D2 H*K", dtype="float32", name="v2_weight"),
+            dx.AbstractArray("D1 H K", dtype="float32", name="q1_weight"),
+            dx.AbstractArray("D1 H K", dtype="float32", name="k1_weight"),
+            dx.AbstractArray("D1 H K", dtype="float32", name="v1_weight"),
+            dx.AbstractArray("D2 H K", dtype="float32", name="q2_weight"),
+            dx.AbstractArray("D2 H K", dtype="float32", name="k2_weight"),
+            dx.AbstractArray("D2 H K", dtype="float32", name="v2_weight"),
             name="joint_qkv_projection",
-            kwargs={"num_heads": 4, "head_dim": 4},
         )
         >> dx.AbstractModule(
             joint_attention,
@@ -228,8 +210,8 @@ def test_joint_attention_matches_reference_trace():
         )
         >> dx.AbstractModule(
             joint_output_projection,
-            dx.AbstractArray("H*K D1", dtype="float32", name="o1_weight"),
-            dx.AbstractArray("H*K D2", dtype="float32", name="o2_weight"),
+            dx.AbstractArray("H K D1", dtype="float32", name="o1_weight"),
+            dx.AbstractArray("H K D2", dtype="float32", name="o2_weight"),
             name="joint_output_projection",
         )
     )
@@ -247,7 +229,7 @@ def test_joint_attention_matches_reference_trace():
         hidden_size2=12,
         num_heads=4,
         head_dim=4,
-        seed=nn.Rngs(0),
+        rngs=nn.Rngs(0),
     )
     actual_stream2 = jnp.ones((2, 3, 12), dtype=jnp.float32)
 

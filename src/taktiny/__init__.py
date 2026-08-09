@@ -21,7 +21,7 @@ __description__ = (
 )
 
 from taktiny.maestro._prelude import Maestro
-from taktiny.maestro._config import ModelConfig
+from taktiny.maestro.config import ModelConfig
 from taktiny.takt import Takt
 from taktiny import nn, peft, kernels, layers
 from taktiny import transforms as tt

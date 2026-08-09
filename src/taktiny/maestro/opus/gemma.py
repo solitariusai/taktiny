@@ -15,16 +15,16 @@
 
 from __future__ import annotations
 from typing import Any
-
-
-import jax.numpy as jnp
+import typing as tp
+import jax.numpy as jnp, jax
 
 from taktiny.maestro._livret import repertoire
-from taktiny.cosettes._common import (
+from taktiny.cosettes.common import (
     TransformerCausalLM,
     TransformerConditionalGeneration,
     DiffusionLM,
     TransformerConditionalGeneration,
+    TransformerContext
 )
 from taktiny.cosettes.transformers.gemma import (
     GemmaTextScaledWordEmbedding,
@@ -36,41 +36,34 @@ from taktiny.cosettes.transformers.gemma import (
     Gemma3DecoderLayer,
 )
 from taktiny import nn
+from taktiny.maestro.config import ModelConfig
+from taktiny.utils.typing import PathLike, LogicalRules
 
 
 class Gemma(TransformerCausalLM):
-    def __init__(
-        self,
-        config: Any,
-        rngs: nn.Rngs | None = None,
-        mesh: Any=None,
-        sharding_rules: Any=None,
-        **kwargs: Any
-    ) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
-
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         config.tie_word_embeddings = True
         super().__init__(
             config,
-            rngs=rngs,
             embedding=GemmaTextScaledWordEmbedding,
             decoder=GemmaDecoderLayer,
             norm=GemmaRMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs
         )
 
     @classmethod
-    def from_pretrained(cls, path_or_repo: Any, mesh: Any=None, sharding_rules: Any=None, local: bool=False, **kwargs: Any) -> Any:
-        from taktiny.maestro._config import ModelConfig
+    def from_pretrained(
+        cls, path_or_repo: Any,
+        mesh: Any=None,
+        sharding_rules: Any=None,
+        local: bool=False,
+        **kwargs: Any
+    ) -> Any:
         if 'config' in kwargs:
             config = kwargs.pop('config')
         else:
             config = ModelConfig.load_config(path_or_repo, local=local)
         config.tie_word_embeddings = True
-
         return super().from_pretrained(
             path_or_repo,
             mesh=mesh,
@@ -80,19 +73,8 @@ class Gemma(TransformerCausalLM):
             **kwargs,
         )
 
-
 class Gemma2(TransformerCausalLM):
-    def __init__(
-        self,
-        config: Any,
-        rngs: nn.Rngs | None = None,
-        mesh: Any=None,
-        sharding_rules: Any=None,
-        **kwargs: Any
-    ) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
-
+    def __init__(self, config: ModelConfig, **kwargs: Any) -> None:
         config.tie_word_embeddings = True
         if getattr(config, 'layer_types', None) is None:
             config.layer_types = [
@@ -105,27 +87,20 @@ class Gemma2(TransformerCausalLM):
             ]
         super().__init__(
             config,
-            rngs=rngs,
             embedding=GemmaTextScaledWordEmbedding,
             decoder=Gemma2DecoderLayer,
             norm=GemmaRMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs
         )
-        self.final_logit_softcapping = getattr(
-            config,
-            'final_logit_softcapping',
-            None,
-        )
+        self.final_logit_softcapping = config.final_logit_softcapping
 
     def __call__(
         self,
-        x: Any,
-        attention_mask: Any=None,
-        position_ids: Any=None,
-        ctx: Any=None,
-        logits_to_keep: int=0,
+        x: jax.Array,
+        attention_mask: jax.Array | None = None,
+        position_ids: jax.Array | None = None,
+        ctx: TransformerContext | None = None,
+        logits_to_keep: int = 0,
     ) -> tuple[Any, ...]:
         logits, ctx = super().__call__(
             x,
@@ -141,56 +116,23 @@ class Gemma2(TransformerCausalLM):
 
 
 class Gemma3(TransformerCausalLM):
-    def __init__(
-        self,
-        config: Any,
-        rngs: nn.Rngs | None = None,
-        mesh: Any=None,
-        sharding_rules: Any=None,
-        **kwargs: Any
-    ) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
-
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         if bool(getattr(config, 'use_bidirectional_attention', False)):
             raise NotImplementedError(
                 'Gemma3 bidirectional attention is not supported'
             )
 
-        config.tie_word_embeddings = True
-        config.head_dim = (
-            getattr(config, 'head_dim', None)
-            or config.hidden_size // config.num_attention_heads
-        )
-        config.num_key_value_heads = (
-            getattr(config, 'num_key_value_heads', None)
-            or config.num_attention_heads
-        )
-        config.rope_theta = (
-            getattr(config, 'rope_theta', None)
-            or 1_000_000.0
-        )
-        config.rope_local_base_freq = (
-            getattr(config, 'rope_local_base_freq', None)
-            or 10_000.0
-        )
-        config.query_pre_attn_scalar = (
-            getattr(config, 'query_pre_attn_scalar', None)
-            or 256
-        )
-        config.attention_bias = bool(
-            getattr(config, 'attention_bias', False)
-        )
-        config.rms_norm_eps = (
-            getattr(config, 'rms_norm_eps', None)
-            or 1e-6
-        )
+        config.tie_word_embeddings      = True
+        config.head_dim                 = config.head_dim or config.hidden_size // config.num_attention_heads
+        config.num_key_value_heads      = config.num_key_value_heads or config.num_attention_heads
+        config.rope_theta               = config.rope_theta or 1_000_000.0
+        config.rope_local_base_freq     = config.rope_local_base_freq or 10_000.0
+        config.query_pre_attn_scalar    = config.query_pre_attn_scalar or 256
+        config.attention_bias           = config.attention_bias or False
+        config.rms_norm_eps             = config.rms_norm_eps or 1e-6
 
-        if getattr(config, 'layer_types', None) is None:
-            pattern = (
-                getattr(config, 'sliding_window_pattern', None)
-                or 6
-            )
+        if config.layer_types is None:
+            pattern = config.sliding_window_pattern or 6
             config.layer_types = [
                 (
                     'sliding_attention'
@@ -202,27 +144,20 @@ class Gemma3(TransformerCausalLM):
 
         super().__init__(
             config,
-            rngs=rngs,
             embedding=Gemma3TextScaledWordEmbedding,
             decoder=Gemma3DecoderLayer,
             norm=Gemma3RMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs
         )
-        self.final_logit_softcapping = getattr(
-            config,
-            'final_logit_softcapping',
-            None,
-        )
+        self.final_logit_softcapping = config.final_logit_softcapping
 
     def __call__(
         self,
-        x: Any,
-        attention_mask: Any=None,
-        position_ids: Any=None,
-        ctx: Any=None,
-        logits_to_keep: int=0,
+        x: jax.Array,
+        attention_mask: jax.Array | None = None,
+        position_ids: jax.Array | None = None,
+        ctx: TransformerContext | None = None,
+        logits_to_keep: int = 0,
     ) -> tuple[Any, ...]:
         logits, ctx = super().__call__(
             x,
@@ -239,20 +174,17 @@ class Gemma3(TransformerCausalLM):
     @classmethod
     def from_pretrained(
         cls,
-        path_or_repo: Any,
-        mesh: Any=None,
-        sharding_rules: Any=None,
-        local: bool=False,
-        **kwargs: Any,
-    ) -> Any:
-        from taktiny.maestro._config import ModelConfig
-
+        path_or_repo: PathLike,
+        mesh: jax.sharding.Mesh | None = None,
+        sharding_rules: LogicalRules | None = None,
+        local: bool = False,
+        **kwargs: tp.Any,
+    ) -> tp.Self:
         if 'config' in kwargs:
             config = kwargs.pop('config')
         else:
             config = ModelConfig.load_config(path_or_repo, local=local)
         config.tie_word_embeddings = True
-
         return super().from_pretrained(
             path_or_repo,
             mesh=mesh,
@@ -262,74 +194,48 @@ class Gemma3(TransformerCausalLM):
             **kwargs,
         )
 
-
 class Gemma3ConditionalGeneration(TransformerConditionalGeneration):
-    def __init__(self, config: Any, rngs: nn.Rngs | None = None, mesh: Any=None, sharding_rules: Any=None, **kwargs: Any) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         super().__init__(
             config,
-            rngs=rngs,
             decoder=Gemma3DecoderLayer,
             norm=nn.RMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs,
         )
-
 
 class Gemma4(TransformerConditionalGeneration):
-    def __init__(self, config: Any, rngs: nn.Rngs | None = None, mesh: Any=None, sharding_rules: Any=None, **kwargs: Any) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         super().__init__(
             config,
-            rngs=rngs,
             decoder=Gemma3DecoderLayer,
             norm=nn.RMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs,
         )
-
 
 class Gemma4Unified(TransformerConditionalGeneration):
-    def __init__(self, config: Any, rngs: nn.Rngs | None = None, mesh: Any=None, sharding_rules: Any=None, **kwargs: Any) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         super().__init__(
             config,
-            rngs=rngs,
             decoder=Gemma3DecoderLayer,
             norm=nn.RMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs,
         )
 
-
 class DiffusionGemma(DiffusionLM):
-    def __init__(self) -> None:
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         raise NotImplementedError(f'There is a plan to implement {self.__class__.__name__}.')
 
-
-repertoire.register('GemmaForCausalLM', Gemma)
-repertoire.register('Gemma2ForCausalLM', Gemma2)
-repertoire.register('Gemma3ForCausalLM', Gemma3)
-repertoire.register(
-    'Gemma3ForConditionalGeneration',
-    Gemma3ConditionalGeneration,
-)
-repertoire.register('Gemma4ForConditionalGeneration', Gemma4)
-repertoire.register('Gemma4UnifiedForConditionalGeneration', Gemma4Unified)
-repertoire.register('DiffusionGemmaForBlockDiffusion', DiffusionGemma)
-
-__all__ = [
-    'Gemma',
-    'Gemma2',
-    'Gemma3',
-    'Gemma3ConditionalGeneration',
-    'Gemma4',
-    'Gemma4Unified',
-    'DiffusionGemma'
+class_map = [
+    ('GemmaForCausalLM', Gemma),
+    ('Gemma2ForCausalLM', Gemma2),
+    ('Gemma3ForCausalLM', Gemma3),
+    ('Gemma3ForConditionalGeneration', Gemma3ConditionalGeneration),
+    ('Gemma4ForConditionalGeneration', Gemma4),
+    ('Gemma4UnifiedForConditionalGeneration', Gemma4Unified),
+    ('DiffusionGemmaForBlockDiffusion', DiffusionGemma),
 ]
+
+__all__ = []
+for name, cls in class_map:
+    repertoire.register(name, cls)
+    __all__.append(cls.__name__)

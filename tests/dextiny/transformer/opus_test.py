@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import pytest
 
 from taktiny import nn
-from taktiny.cosettes._common import (
+from taktiny.cosettes.common import (
     TransformerCausalLM,
     TransformerConditionalGeneration,
 )
@@ -18,7 +18,7 @@ from taktiny.cosettes.transformers.qwen import (
     Qwen3DecoderLayer,
     QwenDecoderLayer,
 )
-from taktiny.maestro._config import ModelConfig
+from taktiny.maestro.config import ModelConfig
 from taktiny.maestro.opus.deepseek import (
     Deepseek,
     DeepseekV2,

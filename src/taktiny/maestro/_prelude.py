@@ -19,23 +19,22 @@ if implemented in this library.
 from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
-from taktiny.maestro import opus
-from taktiny.maestro._config import ModelConfig
-from taktiny.maestro._livret import repertoire
-from taktiny.nn import Rngs
-from taktiny.nn.module import Module
-from taktiny.utils.typing import DType, LogicalRules, PathLike
-
 import jax
 from jax.sharding import Mesh
 from jax.experimental import mesh_utils
 from huggingface_hub import hf_hub_download
 import json
-from pprint import pprint
+
+from taktiny.maestro._livret import repertoire
+from taktiny.maestro.config import ModelConfig
+from taktiny.nn import Rngs
+from taktiny.nn.module import Module
+from taktiny.utils.typing import DType, LogicalRules, PathLike
 
 
 class Maestro:
-    """Registry-backed entry point for pretrained Taktiny models.
+    """
+    Registry-backed entry point for pretrained Taktiny models.
 
     Maestro reads the architecture declared by a Hugging Face configuration,
     resolves its registered Taktiny implementation, and delegates model
@@ -64,7 +63,8 @@ class Maestro:
 
     @classmethod
     def list(cls) -> set[type[Module]]:
-        """Return the distinct model implementation classes in the registry.
+        """
+        Return the distinct model implementation classes in the registry.
 
         Multiple architecture names may resolve to the same implementation, so
         each class appears only once.
@@ -76,7 +76,8 @@ class Maestro:
 
     @classmethod
     def available(cls) -> list[str]:
-        """Return all registered Hugging Face architecture names.
+        """
+        Return all registered Hugging Face architecture names.
 
         The returned strings are the values expected in the ``architectures``
         field of a Hugging Face model configuration.
@@ -87,8 +88,9 @@ class Maestro:
         return repertoire.available()
 
     @classmethod
-    def supported(cls, model_class: str) -> bool:
-        """Check whether an architecture name is registered.
+    def is_supported(cls, model_class: str) -> bool:
+        """
+        Check whether an architecture name is registered.
 
         Args:
             model_class: Hugging Face architecture name, such as
@@ -108,9 +110,11 @@ class Maestro:
         local: bool = False,
         dtype: DType | str | None = None,
         quant: Any = None,
+        use_list: bool = False,
         **kwargs: Any
     ) -> Module:
-        """Load a registered model and materialize its checkpoint weights.
+        """
+        Load a registered model and materialize its checkpoint weights.
 
         The architecture is selected from the model configuration's
         ``architectures`` field. Checkpoint loading, dtype conversion, Qwix
@@ -183,6 +187,7 @@ class Maestro:
             local=local,
             dtype=dtype,
             quant=quant,
+            use_list=use_list,
             **kwargs
         )
 
@@ -193,9 +198,11 @@ class Maestro:
         mesh: Mesh | Mapping[str, int] | None = None,
         sharding_rules: LogicalRules | None = None,
         local: bool = False,
+        use_list: bool = False,
         **kwargs: Any,
     ) -> Module:
-        """Construct an abstract registered model without loading its weights.
+        """
+        Construct an abstract registered model without loading its weights.
 
         This resolves the architecture in the same way as
         ``from_pretrained`` but invokes its constructor under
@@ -263,6 +270,7 @@ class Maestro:
                 rngs=rngs,
                 mesh=mesh,
                 sharding_rules=sharding_rules,
+                use_list=use_list,
                 **kwargs,
             )
         )

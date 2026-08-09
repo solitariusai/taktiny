@@ -9,7 +9,7 @@ from taktiny.cosettes.transformers.qwen import (
     Qwen3DecoderLayer,
     QwenDecoderLayer,
 )
-from taktiny.maestro._config import ModelConfig
+from taktiny.maestro.config import ModelConfig
 
 from ._reference import (
     attention_qkv_bias,

@@ -411,11 +411,11 @@ def gmm(
         def _init_out() -> None:
           out[...] = existing_out[...]
 
-    def mask_k_rem(x: jax.Array, *, dim: int) -> Any:
+    def mask_k_rem(x: jax.Array, *, axis: int) -> Any:
       if k_rem == 0:
         return x
 
-      iota = lax.broadcasted_iota(jnp.int32, x.shape, dim)
+      iota = lax.broadcasted_iota(jnp.int32, x.shape, axis)
       return jnp.where(iota < k_rem, x, 0).astype(x.dtype)
 
     def _store_accum() -> None:
@@ -430,8 +430,8 @@ def gmm(
 
     def _accum(is_last_k_tile: Any) -> None:
       if is_last_k_tile:
-        mask_k_rem_lhs = functools.partial(mask_k_rem, dim=1)
-        mask_k_rem_rhs = functools.partial(mask_k_rem, dim=int(transpose_rhs))
+        mask_k_rem_lhs = functools.partial(mask_k_rem, axis=1)
+        mask_k_rem_rhs = functools.partial(mask_k_rem, axis=int(transpose_rhs))
       else:
         mask_k_rem_lhs = lambda x: x
         mask_k_rem_rhs = lambda x: x

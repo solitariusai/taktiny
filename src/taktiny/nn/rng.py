@@ -13,14 +13,12 @@
 # limitations under the License.
 """Random Number Generators """
 from __future__ import annotations
-
 from collections.abc import Sequence
 import jax
 from jax.typing import ArrayLike
 from jax._src.random.core import PRNGSpecDesc, KeyDTypeLike
 from jax.tree_util import register_pytree_node_class
 from taktiny.utils.typing import PRNGKey
-
 
 @register_pytree_node_class
 class Rngs:

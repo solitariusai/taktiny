@@ -13,33 +13,44 @@
 # limitations under the License.
 """Embedding modules"""
 from __future__ import annotations
-
 from typing import Any
-
-
 import jax
-import math
 import jax.numpy as jnp
 import qwix
-from jax.nn.initializers import normal
+from jax.nn import initializers
 
-from taktiny.nn.module import Module, Parameter
-from taktiny.nn.rng import Rngs
-from taktiny.utils.typing import DType
+from taktiny import nn
+from taktiny.nn.utils import _constrain
+from taktiny.utils.typing import AxisNames, DType, Initializer, ShardMode
 
-class Embedding(Module):
+default_embedding_initializer = initializers.normal(0.02)
+# Deprecated: Embedding seed
+class Embedding(nn.Module):
     def __init__(
         self, num_embeddings: int,
         embedding_dim: int, *,
-        rngs: Rngs | None = None,
-        seed: Rngs | None = None,
-        dtype: DType | str = jnp.float32,
-        initializer: Any = normal(0.02),
-        quant: Any=None,
+        rngs: nn.Rngs | None = None,
+        seed: nn.Rngs | None = None,
+        dtype: DType = jnp.float32,
+        initializer: Initializer = default_embedding_initializer,
+        quant: Any = None,
+        axis_names: AxisNames | None = None,
+        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
+        if not isinstance(num_embeddings, int) or num_embeddings <= 0:
+            raise ValueError('num_embeddings must be a positive integer')
+        if not isinstance(embedding_dim, int) or embedding_dim <= 0:
+            raise ValueError('embedding_dim must be a positive integer')
+        if axis_names is not None:
+            axis_names = tuple(axis_names)
+            if len(axis_names) != 2:
+                raise ValueError(
+                    'axis_names must contain vocabulary and embedding axes'
+                )
+
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-
+        self.shard_mode = shard_mode
         if rngs is None and seed is None:
             raise ValueError("A rngs must be provided to initialize Embedding layer")
 
@@ -49,17 +60,26 @@ class Embedding(Module):
             rngs = seed
 
         key = rngs()
-        self.embedding = Parameter(
+        self.embedding = nn.Parameter(
             initializer(key, (num_embeddings, embedding_dim), dtype)
         )
         self.embedding.quantization = quant
         self.embedding.quantization_kind = 'embedding'
+        if axis_names is not None:
+            self.embedding.axis_names = axis_names
 
-    def __call__(self, indices: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        indices: jax.Array,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array:
         table = self.embedding.value
         if isinstance(table, qwix.QArray):
-            return qwix.dequantize(table[indices])
-        return table[indices]
+            output = qwix.dequantize(table[indices])
+        else:
+            output = table[indices]
+
+        return _constrain(output, out_sharding, self.shard_mode)
 
     @classmethod
     def apply_gather_reduce(
@@ -77,7 +97,13 @@ class Embedding(Module):
             if weights is not None:
                 gathered = gathered * weights[..., None]
             return gathered
-        return sc_gather_reduce(operand, indices, topk_weights=weights, reduce_group_size=reduce_group_size, **kwargs)
+        return sc_gather_reduce(
+            operand,
+            indices,
+            topk_weights=weights,
+            reduce_group_size=reduce_group_size,
+            **kwargs,
+        )
 
     @classmethod
     def apply_ragged_gather(
@@ -110,24 +136,8 @@ class Embedding(Module):
     def extra_repr(self) -> str:
         return f"{self.num_embeddings} → {self.embedding_dim}"
 
-class SinusoidalPositionalEmbedding(Module):
-    def __init__(self, embedding_dim: int) -> None:
-        self.embedding_dim = embedding_dim
 
-    def __call__(self, timesteps: jax.Array) -> jax.Array:
-        is_scalar = timesteps.ndim == 0
-        if is_scalar:
-            timesteps = jnp.expand_dims(timesteps, 0)
 
-        half_dim = self.embedding_dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = jnp.exp(jnp.arange(half_dim, dtype=jnp.float32) * -emb)
-        # timesteps shape is (B,) or (1,) if it was scalar
-        emb = timesteps[:, None] * emb[None, :]
-        emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
-
-        # If embedding_dim is odd, pad by zero
-        if self.embedding_dim % 2 == 1:
-            emb = jnp.pad(emb, ((0, 0), (0, 1)))
-
-        return jnp.squeeze(emb, 0) if is_scalar else emb
+__all__ = [
+    'Embedding',
+]

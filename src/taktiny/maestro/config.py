@@ -11,24 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from __future__ import annotations
-from typing import Any
-
-
+import typing as tp
 from pathlib import Path
 from huggingface_hub import hf_hub_download
 import json
+from taktiny.utils.typing import PathLike
 
 
 class ModelConfig:
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, **kwargs) -> None:
         for k, v in kwargs.items():
             if isinstance(v, dict):
                 v = ModelConfig(**v)
             setattr(self, k, v)
 
-    def __getattr__(self, name: str) -> Any:
+    def __getattr__(self, name: str) -> tp.Any:
         # 1. Check nested text_config (common in HuggingFace multimodal models like Gemma 3/4, Qwen VL, Llama Vision)
         text_cfg = self.__dict__.get('text_config', None)
         if text_cfg is not None and text_cfg is not self:
@@ -47,20 +45,24 @@ class ModelConfig:
         # 3. Gracefully return None for missing keys
         return None
 
-    def get(self, key: Any, default: Any=None) -> Any:
+    def get(self, key: tp.Any, default: tp.Any=None) -> tp.Any:
         """Return a configuration value using mapping-style semantics."""
         value = getattr(self, key, None)
         return default if value is None else value
 
     @classmethod
-    def load_config(cls, path_or_repo: Any, filename: str='config.json', subfolder: Any=None, local: bool=False) -> Any:
+    def load_config(
+        cls, path_or_repo: PathLike,
+        filename: str = 'config.json',
+        subfolder: tp.Any = None,
+        local: bool = False
+    ) -> tp.Self | None:
         if local:
             config_path = Path(path_or_repo).resolve()
             if subfolder:
                 config_path = config_path / subfolder
 
             config_path = config_path / 'config.json'
-
         else:
             try:
                 config_path = hf_hub_download(
@@ -86,6 +88,5 @@ class ModelConfig:
     def __repr__(self) -> str:
         config_str = json.dumps(self.__dict__, indent=2, default=str)
         return f"{self.__class__.__name__} {config_str}"
-
 
 __all__ = ['ModelConfig']

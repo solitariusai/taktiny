@@ -15,10 +15,7 @@
 # limitations under the License.
 """Logging utilities."""
 from __future__ import annotations
-
 from typing import Any
-
-
 import logging
 import os
 import sys
@@ -33,7 +30,6 @@ from logging import (
     WARN,  # NOQA
     WARNING,  # NOQA
 )
-
 from tqdm import auto as tqdm_lib
 import jax
 

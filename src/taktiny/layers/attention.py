@@ -21,16 +21,13 @@ import jax.numpy as jnp
 import math
 
 from taktiny import nn
-from taktiny.layers.posemb import RotaryEmbedding
-from taktiny.utils.typing import ShardMode, DType
-
+from taktiny.layers.positional_embedding import RotaryEmbedding
+from taktiny.utils.typing import AxisNames, DType, ShardMode, Sharding
 
 class SegmentIds(NamedTuple):
     """Compact query and key/value segment identifiers."""
-
     q: jax.Array
     kv: jax.Array
-
 
 class Attention(nn.Module):
     def __init__(
@@ -47,10 +44,10 @@ class Attention(nn.Module):
         dtype: DType | str | None = None,
         window_size: int | None = None,
         rngs: nn.Rngs | None = None,
-        q_axis_names: tuple[str | None, ...] | None = None,
-        k_axis_names: tuple[str | None, ...] | None = None,
-        v_axis_names: tuple[str | None, ...] | None = None,
-        o_axis_names: tuple[str | None, ...] | None = None,
+        q_axis_names: AxisNames | None = None,
+        k_axis_names: AxisNames | None = None,
+        v_axis_names: AxisNames | None = None,
+        o_axis_names: AxisNames | None = None,
         q_bias: bool | None = None,
         k_bias: bool | None = None,
         v_bias: bool | None = None,
@@ -912,113 +909,260 @@ class Attention(nn.Module):
 
         return out, None
 
+
 class JointAttention(nn.Module):
+    """Attend jointly over two independently projected token streams.
+
+    Each stream owns its query, key, value, and output projections. Projected
+    tokens are concatenated along the sequence axis, passed through one shared
+    attention operation, and split back into their original streams before the
+    output projections. Architectural normalization, modulation, and residual
+    policies remain outside this module.
+
+    Inputs use ``[batch, sequence, hidden]`` layout. ``attention_mask`` and
+    ``attention_bias`` describe the concatenated sequence of length
+    ``sequence1 + sequence2``.
     """
-    Generic Joint/Double-Stream Attention for Multimodal architectures (e.g. MM-DiT).
-    Takes two separate streams, projects them to Q, K, V independently,
-    concatenates them for a joint self-attention operation, and splits the output back.
-    """
+
     def __init__(
         self,
         hidden_size1: int,
         hidden_size2: int,
         num_heads: int,
         head_dim: int,
-        use_qkv_norm: bool = False,
+        *,
         pos_emb: nn.Module | None = None,
-        seed: nn.Rngs | None = None
+        bias: bool = False,
+        use_qkv_norm: bool = False,
+        qkv_norm_eps: float = 1e-5,
+        dtype: DType | str | None = None,
+        rngs: nn.Rngs | None = None,
+        q_axis_names: AxisNames | None = None,
+        k_axis_names: AxisNames | None = None,
+        v_axis_names: AxisNames | None = None,
+        o_axis_names: AxisNames | None = None,
+        q_bias: bool | None = None,
+        k_bias: bool | None = None,
+        v_bias: bool | None = None,
+        o_bias: bool | None = None,
+        scaling: float | None = None,
+        shard_mode: ShardMode = ShardMode.AUTO,
+        quant: Any = None,
+        dot_general: Any = None,
     ) -> None:
+        if hidden_size1 <= 0 or hidden_size2 <= 0:
+            raise ValueError('hidden sizes must be positive')
+        if num_heads <= 0 or head_dim <= 0:
+            raise ValueError('num_heads and head_dim must be positive')
+        if qkv_norm_eps <= 0:
+            raise ValueError('qkv_norm_eps must be positive')
+        if rngs is None:
+            raise ValueError(
+                'A rngs must be provided to initialize JointAttention'
+            )
+
+        self.hidden_size1 = hidden_size1
+        self.hidden_size2 = hidden_size2
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.pos_emb = pos_emb
+        self.use_qkv_norm = use_qkv_norm
+        self.qkv_norm_eps = qkv_norm_eps
+        self.scaling = scaling
 
-        # Stream 1 Projections
-        self.q_proj_1 = nn.Linear(hidden_size1, num_heads * head_dim, bias=False, seed=seed)
-        self.k_proj_1 = nn.Linear(hidden_size1, num_heads * head_dim, bias=False, seed=seed)
-        self.v_proj_1 = nn.Linear(hidden_size1, num_heads * head_dim, bias=False, seed=seed)
-        self.o_proj_1 = nn.Linear(num_heads * head_dim, hidden_size1, bias=False, seed=seed)
+        def projection_bias(override: bool | None) -> bool:
+            return bias if override is None else override
 
-        # Stream 2 Projections
-        self.q_proj_2 = nn.Linear(hidden_size2, num_heads * head_dim, bias=False, seed=seed)
-        self.k_proj_2 = nn.Linear(hidden_size2, num_heads * head_dim, bias=False, seed=seed)
-        self.v_proj_2 = nn.Linear(hidden_size2, num_heads * head_dim, bias=False, seed=seed)
-        self.o_proj_2 = nn.Linear(num_heads * head_dim, hidden_size2, bias=False, seed=seed)
+        projection_options = {
+            'dtype': dtype,
+            'rngs': rngs,
+            'shard_mode': shard_mode,
+            'quant': quant,
+            'dot_general': dot_general,
+        }
+
+        self.q_proj_1 = nn.Linear(
+            hidden_size1,
+            (num_heads, head_dim),
+            bias=projection_bias(q_bias),
+            axis_names=q_axis_names,
+            **projection_options,
+        )
+        self.k_proj_1 = nn.Linear(
+            hidden_size1,
+            (num_heads, head_dim),
+            bias=projection_bias(k_bias),
+            axis_names=k_axis_names,
+            **projection_options,
+        )
+        self.v_proj_1 = nn.Linear(
+            hidden_size1,
+            (num_heads, head_dim),
+            bias=projection_bias(v_bias),
+            axis_names=v_axis_names,
+            **projection_options,
+        )
+        self.o_proj_1 = nn.Linear(
+            (num_heads, head_dim),
+            hidden_size1,
+            bias=projection_bias(o_bias),
+            axis_names=o_axis_names,
+            **projection_options,
+        )
+
+        self.q_proj_2 = nn.Linear(
+            hidden_size2,
+            (num_heads, head_dim),
+            bias=projection_bias(q_bias),
+            axis_names=q_axis_names,
+            **projection_options,
+        )
+        self.k_proj_2 = nn.Linear(
+            hidden_size2,
+            (num_heads, head_dim),
+            bias=projection_bias(k_bias),
+            axis_names=k_axis_names,
+            **projection_options,
+        )
+        self.v_proj_2 = nn.Linear(
+            hidden_size2,
+            (num_heads, head_dim),
+            bias=projection_bias(v_bias),
+            axis_names=v_axis_names,
+            **projection_options,
+        )
+        self.o_proj_2 = nn.Linear(
+            (num_heads, head_dim),
+            hidden_size2,
+            bias=projection_bias(o_bias),
+            axis_names=o_axis_names,
+            **projection_options,
+        )
 
         if use_qkv_norm:
-            self.q_norm_1 = nn.RMSNorm(head_dim)
-            self.k_norm_1 = nn.RMSNorm(head_dim)
-            self.q_norm_2 = nn.RMSNorm(head_dim)
-            self.k_norm_2 = nn.RMSNorm(head_dim)
+            norm_options = {
+                'eps': qkv_norm_eps,
+                'dtype': dtype,
+                'axis_names': ('head_dim',),
+                'shard_mode': shard_mode,
+            }
+            self.q_norm_1 = nn.RMSNorm(head_dim, **norm_options)
+            self.k_norm_1 = nn.RMSNorm(head_dim, **norm_options)
+            self.q_norm_2 = nn.RMSNorm(head_dim, **norm_options)
+            self.k_norm_2 = nn.RMSNorm(head_dim, **norm_options)
         else:
             self.q_norm_1 = self.k_norm_1 = None
             self.q_norm_2 = self.k_norm_2 = None
+
+    def _validate_inputs(
+        self,
+        x1: jax.Array,
+        x2: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        x1 = jnp.asarray(x1)
+        x2 = jnp.asarray(x2)
+        if x1.ndim != 3 or x2.ndim != 3:
+            raise ValueError(
+                'JointAttention inputs must use [batch, sequence, hidden] '
+                f'layout, got {x1.shape} and {x2.shape}'
+            )
+        if x1.shape[0] != x2.shape[0]:
+            raise ValueError(
+                'JointAttention inputs must have the same batch size, got '
+                f'{x1.shape[0]} and {x2.shape[0]}'
+            )
+        if x1.shape[-1] != self.hidden_size1:
+            raise ValueError(
+                f'x1 must end in hidden_size1={self.hidden_size1}, got '
+                f'{x1.shape}'
+            )
+        if x2.shape[-1] != self.hidden_size2:
+            raise ValueError(
+                f'x2 must end in hidden_size2={self.hidden_size2}, got '
+                f'{x2.shape}'
+            )
+        return x1, x2
+
+    @staticmethod
+    def _joint_position_idx(
+        position_idx: jax.Array | tuple[jax.Array, jax.Array] | None,
+    ) -> jax.Array | None:
+        if position_idx is None or not isinstance(position_idx, tuple):
+            return position_idx
+        if len(position_idx) != 2:
+            raise ValueError('position_idx must contain exactly two arrays')
+        first, second = map(jnp.asarray, position_idx)
+        if first.ndim != second.ndim or first.shape[:-1] != second.shape[:-1]:
+            raise ValueError(
+                'per-stream position arrays must have matching leading shapes'
+            )
+        return jnp.concatenate((first, second), axis=-1)
 
     def __call__(
         self,
         x1: jax.Array,
         x2: jax.Array,
-        # We can pass modulation chunks dynamically (like from AdaLN)
-        mod1: tuple[jax.Array, ...] | None = None,
-        mod2: tuple[jax.Array, ...] | None = None,
-        position_idx: jax.Array | None = None
+        attention_mask: jax.Array | None = None,
+        attention_bias: jax.Array | None = None,
+        is_causal: bool = False,
+        segment_ids: SegmentIds | jax.Array | None = None,
+        position_idx: jax.Array | tuple[jax.Array, jax.Array] | None = None,
+        out_shardings: tuple[Sharding, Sharding] | None = None,
+        kernel: str = 'dot_product',
+        **kernel_kwargs: Any,
     ) -> tuple[jax.Array, jax.Array]:
-        B, L1, _ = x1.shape
-        _, L2, _ = x2.shape
+        """Apply joint attention and return one output per input stream."""
+        x1, x2 = self._validate_inputs(x1, x2)
+        length1 = x1.shape[1]
 
-        # 1. Project Stream 1
-        q1 = self.q_proj_1(x1).reshape(B, L1, self.num_heads, self.head_dim)
-        k1 = self.k_proj_1(x1).reshape(B, L1, self.num_heads, self.head_dim)
-        v1 = self.v_proj_1(x1).reshape(B, L1, self.num_heads, self.head_dim)
+        q1 = self.q_proj_1(x1)
+        k1 = self.k_proj_1(x1)
+        v1 = self.v_proj_1(x1)
+        q2 = self.q_proj_2(x2)
+        k2 = self.k_proj_2(x2)
+        v2 = self.v_proj_2(x2)
 
-        # 2. Project Stream 2
-        q2 = self.q_proj_2(x2).reshape(B, L2, self.num_heads, self.head_dim)
-        k2 = self.k_proj_2(x2).reshape(B, L2, self.num_heads, self.head_dim)
-        v2 = self.v_proj_2(x2).reshape(B, L2, self.num_heads, self.head_dim)
-
-        # 3. Apply QK Norms if specified
         if self.q_norm_1 is not None:
             q1, k1 = self.q_norm_1(q1), self.k_norm_1(k1)
             q2, k2 = self.q_norm_2(q2), self.k_norm_2(k2)
 
-        # 4. Apply specific modulations if provided by caller (e.g. DiT scale/shift)
-        # mod is expected to be (shift_q, scale_q, shift_k, scale_k, shift_v, scale_v) or None
-        if mod1 is not None:
-            shift_q1, scale_q1, shift_k1, scale_k1, shift_v1, scale_v1 = mod1
-            shift_q1, scale_q1 = shift_q1.reshape(B, 1, self.num_heads, self.head_dim), scale_q1.reshape(B, 1, self.num_heads, self.head_dim)
-            shift_k1, scale_k1 = shift_k1.reshape(B, 1, self.num_heads, self.head_dim), scale_k1.reshape(B, 1, self.num_heads, self.head_dim)
-            shift_v1, scale_v1 = shift_v1.reshape(B, 1, self.num_heads, self.head_dim), scale_v1.reshape(B, 1, self.num_heads, self.head_dim)
+        q = jnp.concatenate((q1, q2), axis=1)
+        k = jnp.concatenate((k1, k2), axis=1)
+        v = jnp.concatenate((v1, v2), axis=1)
 
-            q1 = q1 * (1 + scale_q1) + shift_q1
-            k1 = k1 * (1 + scale_k1) + shift_k1
-            v1 = v1 * (1 + scale_v1) + shift_v1
-
-        if mod2 is not None:
-            shift_q2, scale_q2, shift_k2, scale_k2, shift_v2, scale_v2 = mod2
-            shift_q2, scale_q2 = shift_q2.reshape(B, 1, self.num_heads, self.head_dim), scale_q2.reshape(B, 1, self.num_heads, self.head_dim)
-            shift_k2, scale_k2 = shift_k2.reshape(B, 1, self.num_heads, self.head_dim), scale_k2.reshape(B, 1, self.num_heads, self.head_dim)
-            shift_v2, scale_v2 = shift_v2.reshape(B, 1, self.num_heads, self.head_dim), scale_v2.reshape(B, 1, self.num_heads, self.head_dim)
-
-            q2 = q2 * (1 + scale_q2) + shift_q2
-            k2 = k2 * (1 + scale_k2) + shift_k2
-            v2 = v2 * (1 + scale_v2) + shift_v2
-
-        # 5. Concatenate streams for joint attention!
-        q = jnp.concatenate([q1, q2], axis=1)
-        k = jnp.concatenate([k1, k2], axis=1)
-        v = jnp.concatenate([v1, v2], axis=1)
-
-        # Apply Positional Embeddings (e.g. RoPE)
         if self.pos_emb is not None:
-            q, k = self.pos_emb(q, k, position_idx)
+            q, k = self.pos_emb(q, k, self._joint_position_idx(position_idx))
 
-        # 6. Apply JAX native Attention
-        out = jax.nn.dot_product_attention(q, k, v)
+        out = Attention.apply(
+            query=q,
+            key=k,
+            value=v,
+            kernel=kernel,
+            mask=attention_mask,
+            bias=attention_bias,
+            scale=self.scaling,
+            is_causal=is_causal,
+            segment_ids=segment_ids,
+            **kernel_kwargs,
+        )
+        out1, out2 = jnp.split(out, (length1,), axis=1)
 
-        # 7. Split streams back apart
-        out1, out2 = jnp.split(out, [L1], axis=1)
-
-        # 8. Final Output Projections
-        out1 = self.o_proj_1(out1.reshape(B, L1, -1))
-        out2 = self.o_proj_2(out2.reshape(B, L2, -1))
+        if out_shardings is None:
+            out_sharding1 = out_sharding2 = None
+        else:
+            if len(out_shardings) != 2:
+                raise ValueError('out_shardings must contain exactly two values')
+            out_sharding1, out_sharding2 = out_shardings
+        out1 = self.o_proj_1(out1, out_sharding=out_sharding1)
+        out2 = self.o_proj_2(out2, out_sharding=out_sharding2)
 
         return out1, out2
+
+    def extra_repr(self) -> str:
+        return (
+            f'{self.hidden_size1} + {self.hidden_size2}, '
+            f'heads={self.num_heads}, head_dim={self.head_dim}'
+        )
+
+
+__all__ = ['Attention', 'JointAttention', 'SegmentIds']

@@ -12,14 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Public model-transformation API."""
-
 from __future__ import annotations
-
 from collections.abc import Callable
 import json
 import os
 from typing import Any, TypeVar
-
 from huggingface_hub import hf_hub_download
 from huggingface_hub.errors import EntryNotFoundError
 from safetensors import safe_open
@@ -58,7 +55,8 @@ def _replace_child(parent: Module, name: str, child: Module) -> None:
 
 
 class Takt:
-    """Apply registered transformations to existing model instances.
+    """
+    Apply registered transformations to existing model instances.
 
     ``Takt`` complements ``Maestro``: Maestro constructs and loads a model,
     while Takt transforms a model that already exists. PEFT implementations
@@ -72,7 +70,8 @@ class Takt:
 
     @classmethod
     def register_peft(cls, config_type: type) -> Any:
-        """Register an implementation for a PEFT configuration type.
+        """
+        Register an implementation for a PEFT configuration type.
 
         Args:
             config_type: Configuration class used to select the implementation.
@@ -131,7 +130,8 @@ class Takt:
 
     @classmethod
     def apply_peft(cls, model: M, config: Any) -> M:
-        """Apply a PEFT configuration to a model in place.
+        """
+        Apply a PEFT configuration to a model in place.
 
         The registered implementation may replace modules inside ``model``.
         The same model instance is returned for convenient assignment.
@@ -176,7 +176,8 @@ class Takt:
         subfolder: PathLike | None = None,
         rngs: Rngs | None = None,
     ) -> M:
-        """Load a saved PEFT adapter into an existing base model.
+        """
+        Load a saved PEFT adapter into an existing base model.
 
         Local directories are detected automatically. Hub repositories support
         revisions, private-repository tokens, subfolders, and sharded adapter
@@ -295,7 +296,8 @@ class Takt:
         dtype: DType | str | None = None,
         quant: Any = None,
     ) -> M:
-        """Merge PEFT adapter weights into their base modules in place.
+        """
+        Merge PEFT adapter weights into their base modules in place.
 
         Adapter calculations are performed in float32. ``dtype`` controls the
         merged dense-weight dtype, while ``quant`` optionally requantizes the

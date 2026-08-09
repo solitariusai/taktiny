@@ -242,7 +242,7 @@ attention and MLP modules are applied as residual branches.
 
 ```python
 from taktiny import nn
-from taktiny.cosettes._common import (
+from taktiny.cosettes.common import (
     TransformerCausalLM,
     TransformerDecoderLayer,
 )

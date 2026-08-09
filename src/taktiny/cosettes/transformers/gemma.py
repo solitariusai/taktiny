@@ -22,10 +22,10 @@ import jax, jax.numpy as jnp
 from jax.nn.initializers import normal
 
 from taktiny import nn
-from taktiny.cosettes._common import TransformerDecoderLayer
-from taktiny.maestro._config import ModelConfig
+from taktiny.cosettes.common import TransformerDecoderLayer
+from taktiny.maestro.config import ModelConfig
 from taktiny.layers import Attention, GateMLP, RotaryEmbedding
-from taktiny.utils.typing import ShardMode
+from taktiny.utils.typing import AxisNames, Initializer, ShardMode
 
 
 class GemmaTextScaledWordEmbedding(nn.Embedding):
@@ -34,8 +34,10 @@ class GemmaTextScaledWordEmbedding(nn.Embedding):
         embedding_dim: int, *,
         rngs: nn.Rngs | None = None,
         dtype: Any=jnp.float32,
-        initializer: Any = normal(0.02),
+        initializer: Initializer = normal(0.02),
         quant: Any=None,
+        axis_names: AxisNames | None=None,
+        shard_mode: Any=ShardMode.AUTO,
     ) -> None:
         super().__init__(
             num_embeddings,
@@ -44,11 +46,17 @@ class GemmaTextScaledWordEmbedding(nn.Embedding):
             dtype=dtype,
             initializer=initializer,
             quant=quant,
+            axis_names=axis_names,
+            shard_mode=shard_mode,
         )
         self.embedding_scale = embedding_dim ** 0.5
 
-    def __call__(self, indices: jax.Array) -> Any:
-        return super().__call__(indices) * self.embedding_scale
+    def __call__(self, indices: jax.Array, out_sharding: Any=None) -> Any:
+        x = super().__call__(indices)
+        x = x * self.embedding_scale
+        if self.shard_mode == ShardMode.EXPLICIT and out_sharding is not None:
+            x = jax.lax.with_sharding_constraint(x, out_sharding)
+        return x
 
 
 class GemmaRMSNorm(nn.RMSNorm):
@@ -112,10 +120,13 @@ class Gemma2DecoderLayer(TransformerDecoderLayer):
 class Gemma3TextScaledWordEmbedding(GemmaTextScaledWordEmbedding):
     """Gemma 3 embedding with its scale rounded to the embedding dtype."""
 
-    def __call__(self, indices: jax.Array) -> Any:
+    def __call__(self, indices: jax.Array, out_sharding: Any=None) -> Any:
         x = nn.Embedding.__call__(self, indices)
         scale = jnp.asarray(self.embedding_scale, dtype=x.dtype)
-        return x * scale
+        x = x * scale
+        if self.shard_mode == ShardMode.EXPLICIT and out_sharding is not None:
+            x = jax.lax.with_sharding_constraint(x, out_sharding)
+        return x
 
 
 class Gemma3RMSNorm(nn.RMSNorm):
@@ -125,9 +136,9 @@ class Gemma3RMSNorm(nn.RMSNorm):
         eps: float=1e-6,
         dtype: Any=jnp.float32,
         with_scale: bool=True,
-        axis_names: Any=None,
+        axis_names: AxisNames | None=None,
         shard_mode: Any=ShardMode.AUTO,
-        initializer: Any=jnp.zeros,
+        initializer: Initializer=jnp.zeros,
     ) -> None:
         super().__init__(
             hidden_size,

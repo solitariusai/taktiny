@@ -15,63 +15,40 @@
 
 from __future__ import annotations
 from typing import Any
-
+import typing as tp
 
 from taktiny.maestro._livret import repertoire
-from taktiny.cosettes._common import TransformerCausalLM, TransformerConditionalGeneration
+from taktiny.cosettes.common import TransformerCausalLM, TransformerConditionalGeneration
 from taktiny.cosettes.transformers.llama import LlamaDecoderLayer
+from taktiny.maestro.config import ModelConfig
 from taktiny import nn
 
 
 class Llama(TransformerCausalLM):
-    def __init__(
-        self,
-        config: Any,
-        rngs: nn.Rngs | None = None,
-        mesh: Any=None,
-        sharding_rules: Any=None,
-        **kwargs: Any
-    ) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
-
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         super().__init__(
             config,
-            rngs=rngs,
             decoder=LlamaDecoderLayer,
             norm=nn.RMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs
         )
 
+# TODO: Llama4
 class Llama4(TransformerConditionalGeneration):
-    def __init__(
-        self,
-        config: Any,
-        rngs: nn.Rngs | None = None,
-        mesh: Any=None,
-        sharding_rules: Any=None,
-        **kwargs: Any,
-    ) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
-
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         super().__init__(
             config,
-            rngs=rngs,
             decoder=LlamaDecoderLayer,
             norm=nn.RMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs,
         )
 
-
-repertoire.register('LlamaForCausalLM', Llama)
-repertoire.register('Llama4ForConditionalGeneration', Llama4)
-
-__all__ = [
-    'Llama',
-    'Llama4'
+class_map = [
+    ('LlamaForCausalLM', Llama),
+    ('Llama4ForConditionalGeneration', Llama4),
 ]
+
+__all__ = []
+for name, cls in class_map:
+    repertoire.register(name, cls)
+    __all__.append(cls.__name__)

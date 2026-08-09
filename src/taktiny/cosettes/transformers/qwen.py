@@ -20,10 +20,10 @@ import jax
 import jax.numpy as jnp
 
 from taktiny import nn
-from taktiny.cosettes._common import TransformerDecoderLayer
+from taktiny.cosettes.common import TransformerDecoderLayer
 from taktiny.layers import Attention, GateMLP, RotaryEmbedding
-from taktiny.layers.posemb import rotate_half
-from taktiny.utils.typing import ShardMode
+from taktiny.layers.positional_embedding import rotate_half
+from taktiny.utils.typing import AxisNames, ShardMode
 
 
 class QwenRotaryEmbedding(RotaryEmbedding):
@@ -183,9 +183,9 @@ class QwenMLP(GateMLP):
         bias: bool=False,
         dtype: Any=None,
         rngs: Any=None,
-        gate_axis_names: Any=None,
-        up_axis_names: Any=None,
-        down_axis_names: Any=None,
+        gate_axis_names: AxisNames | None=None,
+        up_axis_names: AxisNames | None=None,
+        down_axis_names: AxisNames | None=None,
         shard_mode: Any=ShardMode.AUTO,
         quant: Any=None,
         dot_general: Any=None,

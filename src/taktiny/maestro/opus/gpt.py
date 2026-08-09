@@ -14,34 +14,24 @@
 """GPT architectures"""
 
 from __future__ import annotations
-from typing import Any
-
 
 from taktiny.maestro._livret import repertoire
-from taktiny.cosettes._common import TransformerCausalLM
-
-
+from taktiny.cosettes.common import TransformerCausalLM
 from taktiny.cosettes.transformers.llama import LlamaDecoderLayer
 from taktiny import nn
 
 
+# TODO: GPTOSS
 class GPTOSS(TransformerCausalLM):
-    def __init__(self, config: Any, rngs: nn.Rngs | None = None, mesh: Any=None, sharding_rules: Any=None, **kwargs: Any) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         super().__init__(
             config,
-            rngs=rngs,
             decoder=LlamaDecoderLayer,
             norm=nn.RMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs,
         )
 
-
 repertoire.register('GptOssForCausalLM', GPTOSS)
-
 __all__ = [
     'GPTOSS'
 ]

@@ -14,14 +14,12 @@
 """Qwen architectures"""
 
 from __future__ import annotations
-from typing import Any
-
-
-import numpy as np
+import typing as tp
+import jax.numpy as jnp, jax
 
 from taktiny.maestro._livret import repertoire
-from taktiny.maestro._config import ModelConfig
-from taktiny.cosettes._common import (
+from taktiny.maestro.config import ModelConfig
+from taktiny.transformer import (
     TransformerCausalLM,
     TransformerConditionalGeneration,
 )
@@ -31,76 +29,42 @@ from taktiny.cosettes.transformers.qwen import (
     Qwen3DecoderLayer,
 )
 from taktiny import nn
+from taktiny.utils.typing import PathLike, LogicalRules
 
 
 class Qwen(TransformerCausalLM):
-    def __init__(
-        self,
-        config: Any,
-        rngs: nn.Rngs | None = None,
-        mesh: Any=None,
-        sharding_rules: Any=None,
-        **kwargs: Any
-    ) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
-
-        config.num_key_value_heads = (
-            getattr(config, 'num_key_value_heads', None)
-            or config.num_attention_heads
-        )
-        config.head_dim = (
-            getattr(config, 'head_dim', None)
-            or getattr(config, 'kv_channels', None)
-            or config.hidden_size // config.num_attention_heads
-        )
-        config.rope_theta = (
-            getattr(config, 'rope_theta', None)
-            or getattr(config, 'rotary_emb_base', None)
-            or 10_000.0
-        )
-        config.rms_norm_eps = (
-            getattr(config, 'rms_norm_eps', None)
-            or getattr(config, 'layer_norm_epsilon', None)
-            or 1e-6
-        )
-        config.hidden_act = (
-            getattr(config, 'hidden_act', None)
-            or 'silu'
-        )
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
+        config.num_key_value_heads = config.num_key_value_heads or config.num_attention_heads
+        config.head_dim = config.head_dim or config.kv_channels or config.hidden_size // config.num_attention_heads
+        config.rope_theta = config.rope_theta or config.rotary_emb_base or 10_000.0
+        config.rms_norm_eps = config.rms_norm_eps or config.layer_norm_epsilon or 1e-6
+        config.hidden_act = config.hidden_act or 'silu'
         config.attention_bias = False
-        config.mlp_bias = not bool(getattr(config, 'no_bias', True))
-        config.seq_length = (
-            getattr(config, 'seq_length', None)
-            or config.max_position_embeddings
-        )
-
+        config.mlp_bias = not bool(config.no_bias)
+        config.seq_length = config.seq_length or config.max_position_embeddings
         super().__init__(
             config,
-            rngs=rngs,
             decoder=QwenDecoderLayer,
             norm=nn.RMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs
         )
 
     @classmethod
     def from_pretrained(
         cls,
-        path_or_repo: Any,
-        mesh: Any=None,
-        sharding_rules: Any=None,
-        local: bool=False,
-        **kwargs: Any,
-    ) -> Any:
+        path_or_repo: PathLike,
+        mesh: jax.sharding.Mesh | None = None,
+        sharding_rules: LogicalRules | None = None,
+        local: bool = False,
+        **kwargs: tp.Any,
+    ) -> tp.Self:
         if 'config' in kwargs:
             config = kwargs.pop('config')
         else:
             config = ModelConfig.load_config(path_or_repo, local=local)
 
-        def split_qkv(value: Any) -> Any:
-            return np.split(value, 3, axis=0)
+        def split_qkv(value: tp.Any) -> tp.Any:
+            return jnp.split(value, 3, axis=0)
 
         module_map = [
             ('transformer.wte.weight', 'model.embed_tokens.embedding'),
@@ -137,102 +101,65 @@ class Qwen(TransformerCausalLM):
             **kwargs,
         )
 
-
 class Qwen2(TransformerCausalLM):
-    def __init__(
-        self,
-        config: Any,
-        rngs: nn.Rngs | None = None,
-        mesh: Any=None,
-        sharding_rules: Any=None,
-        **kwargs: Any
-    ) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
-
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         super().__init__(
             config,
-            rngs=rngs,
             decoder=Qwen2DecoderLayer,
             norm=nn.RMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs
         )
 
-
 class Qwen3(TransformerCausalLM):
-    def __init__(self, config: Any, rngs: nn.Rngs | None = None, mesh: Any=None, sharding_rules: Any=None, **kwargs: Any) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         super().__init__(
             config,
-            rngs=rngs,
             decoder=Qwen3DecoderLayer,
             norm=nn.RMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs,
         )
 
+# TODO: Qwen3MoE
 class Qwen3MoE(TransformerCausalLM):
-    def __init__(self, config: Any, rngs: nn.Rngs | None = None, mesh: Any=None, sharding_rules: Any=None, **kwargs: Any) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         super().__init__(
             config,
-            rngs=rngs,
             decoder=Qwen2DecoderLayer,
             norm=nn.RMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs,
         )
 
-
+# TODO: Qwen3Next
 class Qwen3Next(TransformerCausalLM):
-    def __init__(self, config: Any, rngs: nn.Rngs | None = None, mesh: Any=None, sharding_rules: Any=None, **kwargs: Any) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         super().__init__(
             config,
-            rngs=rngs,
             decoder=Qwen2DecoderLayer,
             norm=nn.RMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs,
         )
 
-
+# TODO: Qwen3_5MoE
 class Qwen3_5MoE(TransformerConditionalGeneration):
-    def __init__(self, config: Any, rngs: nn.Rngs | None = None, mesh: Any=None, sharding_rules: Any=None, **kwargs: Any) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         super().__init__(
             config,
-            rngs=rngs,
             decoder=Qwen2DecoderLayer,
             norm=nn.RMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs,
         )
 
-
-repertoire.register('QwenForCausalLM', Qwen)
-repertoire.register('QWenLMHeadModel', Qwen)
-repertoire.register('Qwen2ForCausalLM', Qwen2)
-repertoire.register('Qwen3ForCausalLM', Qwen3)
-repertoire.register('Qwen3MoeForCausalLM', Qwen3MoE)
-repertoire.register('Qwen3NextForCausalLM', Qwen3Next)
-repertoire.register('Qwen3_5MoeForConditionalGeneration', Qwen3_5MoE)
-
-__all__ = [
-    'Qwen',
-    'Qwen2',
-    'Qwen3',
-    'Qwen3MoE',
-    'Qwen3Next',
-    'Qwen3_5MoE'
+class_map = [
+    ('QwenForCausalLM', Qwen),
+    ('QWenLMHeadModel', Qwen),
+    ('Qwen2ForCausalLM', Qwen2),
+    ('Qwen3ForCausalLM', Qwen3),
+    ('Qwen3MoeForCausalLM', Qwen3MoE),
+    ('Qwen3NextForCausalLM', Qwen3Next),
+    ('Qwen3_5MoeForConditionalGeneration', Qwen3_5MoE),
 ]
+
+__all__ = []
+for name, cls in class_map:
+    repertoire.register(name, cls)
+    __all__.append(cls.__name__)

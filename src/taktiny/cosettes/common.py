@@ -8,17 +8,24 @@
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# WITHOUT WARRANTIES OR CONDITIONS OF tp.Any KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Common base modules for transformer architectures"""
 
 from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import Any, Self
+import typing as tp
+from dataclasses import dataclass
+import jax
+import jax.numpy as jnp
+import qwix
+from dataclasses import replace
+from functools import partial
+
 from taktiny import nn
 from taktiny.cosettes._base import PretrainedModel
-from taktiny.maestro._config import ModelConfig
+from taktiny.maestro.config import ModelConfig
 from taktiny.utils.typing import (
     ArrayLike,
     DType,
@@ -28,13 +35,6 @@ from taktiny.utils.typing import (
 )
 from taktiny.utils.sharding import create_sharding
 from taktiny.layers import RotaryEmbedding, GateMLP, Attention
-
-from dataclasses import dataclass
-import jax
-import jax.numpy as jnp
-import qwix
-from dataclasses import replace
-from functools import partial
 
 
 KVCache = tuple[jax.Array, jax.Array]
@@ -61,11 +61,10 @@ def _approximate_gelu(x: jax.Array) -> jax.Array:
 )
 @dataclass(frozen=True)
 class TransformerContext:
-    key_cache: jax.Array | None
-    value_cache: jax.Array | None
-    position_idx: jax.Array | None
-    is_causal: bool
-
+    key_cache: tp.Optional[jax.Array] = None
+    value_cache: tp.Optional[jax.Array] = None
+    position_idx: tp.Optional[jax.Array] = None
+    is_causal: tp.Optional[bool] = None
 
 class TransformerDecoderLayer(nn.Module):
     """An ordered transformer decoder block assembled from module types.
@@ -100,18 +99,22 @@ class TransformerDecoderLayer(nn.Module):
         config: ModelConfig,
         *,
         rngs: nn.Rngs,
-        layer_idx: int | None = None,
+        layer_idx: tp.Optional[int] = None,
         **modules: nn.Module | type[nn.Module],
     ) -> None:
-        shard_mode = getattr(config, 'shard_mode', ShardMode.AUTO)
-        quant = getattr(config, 'quant', None)
-        dot_general = getattr(config, 'dot_general', None)
+        if not modules:
+            raise ValueError('TransformerDecoderLayer requires at least one module')
 
-        hidden_size = getattr(config, 'hidden_size', None)
-        num_heads = getattr(config, 'num_attention_heads', None)
-        num_kv_heads = getattr(config, 'num_key_value_heads', None)
-        max_position_embeddings = getattr(config, 'max_position_embeddings', None)
-        rope_parameters = getattr(config, 'rope_parameters', None)
+        shard_mode              = config.shard_mode or ShardMode.AUTO
+        quant                   = config.quant
+        dot_general             = config.dot_general
+        hidden_size             = config.hidden_size
+        num_heads               = config.num_attention_heads
+        num_kv_heads            = config.num_key_value_heads
+        max_position_embeddings = config.max_position_embeddings
+        rope_parameters         = config.rope_parameters
+        intermediate_size       = config.intermediate_size
+
         if isinstance(rope_parameters, dict):
             rope_theta_param = rope_parameters.get('rope_theta', None)
         elif rope_parameters is not None:
@@ -124,15 +127,14 @@ class TransformerDecoderLayer(nn.Module):
             or rope_theta_param
             or 10000.0
         )
-        intermediate_size = getattr(config, 'intermediate_size', None)
 
         required = {
-            'hidden_size': hidden_size,
-            'num_attention_heads': num_heads,
-            'num_key_value_heads': num_kv_heads,
-            'max_position_embeddings': max_position_embeddings,
-            'rope_theta': rope_theta,
-            'intermediate_size': intermediate_size,
+            'hidden_size'               : hidden_size,
+            'num_attention_heads'       : num_heads,
+            'num_key_value_heads'       : num_kv_heads,
+            'max_position_embeddings'   : max_position_embeddings,
+            'rope_theta'                : rope_theta,
+            'intermediate_size'         : intermediate_size,
         }
         missing = [name for name, value in required.items() if value is None]
         if missing:
@@ -145,42 +147,36 @@ class TransformerDecoderLayer(nn.Module):
             or getattr(config, 'dtype', None)
             or 'bfloat16'
         )
-        head_dim = getattr(config, 'head_dim', None) or hidden_size // num_heads
-        mlp_bias = getattr(config, 'mlp_bias', None) or False
-        attention_bias = getattr(config, 'attention_bias', None) or False
-        eps = getattr(config, 'rms_norm_eps', None) or 1e-6
-        rope_scaling = getattr(config, 'rope_scaling', None)
-        sliding_window = getattr(config, 'sliding_window', None)
-        if getattr(config, 'use_sliding_window', None) is False:
-            sliding_window = None
-        layer_types = getattr(config, 'layer_types', None)
+        head_dim        = config.head_dim or hidden_size // num_heads
+        mlp_bias        = config.mlp_bias or False
+        attention_bias  = config.attention_bias or False
+        eps             = config.rms_norm_eps or 1e-6
+        rope_scaling    = config.rope_scaling
+        sliding_window  = config.sliding_window or config.use_sliding_window
+        layer_types     = config.layer_types
         if layer_idx is not None and layer_types is not None:
             layer_type = layer_types[layer_idx]
             if layer_type in ('full_attention', 'full'):
-                sliding_window = None
-        hidden_act = (
-            getattr(config, 'hidden_act', None)
-            or getattr(config, 'hidden_activation', None)
-            or getattr(config, 'act', None)
-            or 'silu'
-        )
-        if hidden_act in ('gelu_pytorch_tanh', 'gelu_new', 'gelu_fast'):
-            hidden_act = _approximate_gelu
-        attention_scaling = None
-        query_pre_attn_scalar = getattr(config, 'query_pre_attn_scalar', None)
-        if query_pre_attn_scalar is not None:
-            attention_scaling = query_pre_attn_scalar ** -0.5
-        attention_softcap = getattr(config, 'attn_logit_softcapping', None)
-        attention_dropout = getattr(config, 'attention_dropout', None) or 0.0
+                sliding_window  = None
 
-        if hidden_size % num_heads != 0 and getattr(config, 'head_dim', None) is None:
+        hidden_act = config.hidden_act or config.hidden_activation or config.act or 'silu'
+        if hidden_act in ('gelu_pytorch_tanh', 'gelu_new', 'gelu_fast'):
+            hidden_act          = _approximate_gelu
+        attention_scaling       = None
+        query_pre_attn_scalar   = config.query_pre_attn_scalar
+        if query_pre_attn_scalar is not None:
+            attention_scaling   = query_pre_attn_scalar ** -0.5
+        attention_softcap       = config.attn_logit_softcapping
+        attention_dropout       = config.attention_dropout or  0.0
+
+        if hidden_size % num_heads != 0 and config.head_dim is None:
             raise ValueError(
-                'hidden_size must be divisible by num_attention_heads when '
+                'hidden_size should be divisible by num_attention_heads when '
                 'head_dim is not configured'
             )
         if num_heads % num_kv_heads != 0:
             raise ValueError(
-                'num_attention_heads must be divisible by num_key_value_heads'
+                'num_attention_heads should be divisible by num_key_value_heads'
             )
 
         self.hidden_size = hidden_size
@@ -198,9 +194,6 @@ class TransformerDecoderLayer(nn.Module):
         self.rope_scaling = rope_scaling
         self.sliding_window = sliding_window
         self.layer_idx = layer_idx
-
-        if not modules:
-            raise ValueError('TransformerDecoderLayer requires at least one module')
 
         module_order = []
         module_kinds = []
@@ -249,7 +242,7 @@ class TransformerDecoderLayer(nn.Module):
         head_dim: int,
         max_position_embeddings: int,
         rope_theta: float,
-        rope_scaling: Mapping[str, Any] | None,
+        rope_scaling: Mapping[str, tp.Any] | None,
         sliding_window: int | None,
         hidden_act: str | Callable[[jax.Array], jax.Array],
         attention_bias: bool,
@@ -260,7 +253,7 @@ class TransformerDecoderLayer(nn.Module):
         eps: float,
         dtype: DType | str,
         shard_mode: ShardMode,
-        quant: Any,
+        quant: tp.Any,
         dot_general: Callable[..., jax.Array] | None,
         rngs: nn.Rngs,
     ) -> tuple[nn.Module, str]:
@@ -268,7 +261,7 @@ class TransformerDecoderLayer(nn.Module):
             module = module_type
             module_type = type(module)
         elif not isinstance(module_type, type) or not issubclass(module_type, nn.Module):
-            raise TypeError(f'{name} must be an nn.Module subclass or instance')
+            raise TypeError(f'{name} should be an nn.Module subclass or instance')
         elif issubclass(module_type, nn.RMSNorm):
             module = module_type(
                 hidden_size,
@@ -375,7 +368,6 @@ class TransformerDecoderLayer(nn.Module):
             zip(self.module_order, self.module_kinds)
         ):
             module = getattr(self, name)
-
             if kind == 'norm':
                 if pending is None:
                     x = self._apply_norm(module, x, out_sharding)
@@ -463,56 +455,60 @@ class TransformerModel(nn.Module):
         norm: nn.Module | type[nn.Module] | None = None,
         use_list: bool = True,
     ) -> None:
-        num_hidden_layers = getattr(config, 'num_hidden_layers', None)
-        vocab_size = getattr(config, 'vocab_size', None)
-        hidden_size = getattr(config, 'hidden_size', None)
-
-        if num_hidden_layers is None:
+        if (num_hidden_layers := config.num_hidden_layers) is None:
             raise ValueError(
                 'Missing required transformer config value: num_hidden_layers'
             )
-        if vocab_size is None:
+        if (vocab_size := config.vocab_size) is None:
             raise ValueError('Missing required transformer config value: vocab_size')
-        if hidden_size is None:
+        if (hidden_size := config.hidden_size) is None:
             raise ValueError('Missing required transformer config value: hidden_size')
-        dtype = (
-            getattr(config, 'torch_dtype', None)
-            or getattr(config, 'dtype', None)
-            or 'bfloat16'
-        )
-        quant = getattr(config, 'quant', None)
         if not isinstance(num_hidden_layers, int) or num_hidden_layers < 1:
-            raise ValueError('num_hidden_layers must be a positive integer')
+            raise ValueError('num_hidden_layers should be a positive integer')
         if not isinstance(module, type) or not issubclass(module, nn.Module):
-            raise TypeError('module must be an nn.Module subclass')
+            raise TypeError('module should be an nn.Module subclass')
+
+        dtype = config.torch_dtype or config.dtype or 'bfloat16'
+        quant = config.quant
+        shard_mode = config.shard_mode or ShardMode.AUTO
         if isinstance(embedding, nn.Module):
             embed_tokens = embedding
         elif isinstance(embedding, type) and issubclass(embedding, nn.Module):
+            embedding_kwargs = {
+                'rngs': rngs,
+                'dtype': dtype,
+                'quant': quant,
+            }
+            if issubclass(embedding, nn.Embedding):
+                embedding_kwargs.update(
+                    axis_names=('vocab', 'embed'),
+                    shard_mode=shard_mode,
+                )
             embed_tokens = embedding(
                 vocab_size,
                 hidden_size,
-                rngs=rngs,
-                dtype=dtype,
-                quant=quant,
+                **embedding_kwargs,
             )
         else:
-            raise TypeError('embedding must be an nn.Module subclass or instance')
+            raise TypeError('embedding should be an nn.Module subclass or instance')
 
-        self.config = config
-        self.num_hidden_layers = num_hidden_layers
-        self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
-        self.embed_tokens = embed_tokens
+        self.config             = config
+        self.num_hidden_layers  = num_hidden_layers
+        self.vocab_size         = vocab_size
+        self.hidden_size        = hidden_size
+        self.embed_tokens       = embed_tokens
         if hasattr(self.embed_tokens, 'embedding'):
             self.embed_tokens.embedding.axis_names = ('vocab', 'embed')
+        if isinstance(self.embed_tokens, nn.Embedding):
+            self.embed_tokens.shard_mode = shard_mode
 
         self.use_list = use_list
         if use_list:
             self.layers = nn.List(
-                *(
+                [
                     module(config, rngs=rngs, layer_idx=layer_idx)
                     for layer_idx in range(num_hidden_layers)
-                )
+                ]
             )
         else:
             def stacked_layers() -> Iterator[nn.Module]:
@@ -529,26 +525,29 @@ class TransformerModel(nn.Module):
         elif isinstance(norm, type) and issubclass(norm, nn.RMSNorm):
             self.norm = norm(
                 hidden_size,
-                eps=getattr(config, 'rms_norm_eps', None) or 1e-6,
+                eps=config.rms_norm_eps or 1e-6,
                 dtype=jnp.float32,
-                shard_mode=getattr(config, 'shard_mode', ShardMode.AUTO),
+                shard_mode=config.shard_mode or ShardMode.AUTO,
                 axis_names=('embed',),
             )
         elif isinstance(norm, type) and issubclass(norm, nn.LayerNorm):
             self.norm = norm(
                 hidden_size,
-                eps=getattr(config, 'layer_norm_eps', None) or 1e-5,
+                eps=config.layer_norm_eps or 1e-5,
                 axis_names=('embed',),
             )
         elif norm is not None:
             raise TypeError(
-                'norm must be a normalization nn.Module subclass or instance'
+                'norm should be a normalization nn.Module subclass or instance'
             )
 
         self.remat = False
 
     def enable_remat(self) -> None:
         self.remat = True
+
+    def disable_remat(self) -> None:
+        self.remat = False
 
     def __call__(
         self,
@@ -560,9 +559,12 @@ class TransformerModel(nn.Module):
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> tuple[jax.Array, KVCache | None]:
         if not jnp.issubdtype(x.dtype, jnp.inexact):
-            x = self.embed_tokens(x)
+            if isinstance(self.embed_tokens, nn.Embedding):
+                x = self.embed_tokens(x, out_sharding=out_sharding)
+            else:
+                x = self.embed_tokens(x)
 
-        def call_layer(layer: Any, hidden_states: Any, layer_cache: Any) -> Any:
+        def call_layer(layer: tp.Any, hidden_states: tp.Any, layer_cache: tp.Any) -> tp.Any:
             return layer(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -580,20 +582,20 @@ class TransformerModel(nn.Module):
 
         if kv_cache is not None:
             if len(kv_cache) != 2:
-                raise ValueError('kv_cache must contain key and value caches')
+                raise ValueError('kv_cache should contain key and value caches')
 
             key_cache, value_cache = kv_cache
             if key_cache.shape[0] != self.num_hidden_layers:
                 raise ValueError(
-                    'key cache must have one entry for each transformer layer'
+                    'key cache should have one entry for each transformer layer'
                 )
             if value_cache.shape[0] != self.num_hidden_layers:
                 raise ValueError(
-                    'value cache must have one entry for each transformer layer'
+                    'value cache should have one entry for each transformer layer'
                 )
 
         if not self.use_list:
-            def apply_layer(layer: Any, carry: Any) -> tuple[Any, ...]:
+            def apply_layer(layer: tp.Any, carry: tp.Any) -> tuple[tp.Any, ...]:
                 hidden_states, layer_idx = carry
                 layer_cache = None
                 if kv_cache is not None:
@@ -697,7 +699,7 @@ class TransformerCausalLM(PretrainedModel):
     attention kernels without requiring a dense block-diagonal mask.
     """
 
-    default_sharding_rules = [
+    default_sharding_rules = (
         ('vocab', 'tp'),
         ('embed', None),
         ('heads', 'tp'),
@@ -706,7 +708,7 @@ class TransformerCausalLM(PretrainedModel):
         ('mlp', 'tp'),
         ('batch', 'fsdp'),
         ('sequence', None),
-    ]
+    )
 
     def __init__(
         self, config: ModelConfig,
@@ -734,15 +736,10 @@ class TransformerCausalLM(PretrainedModel):
         self.config = config
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
-        self.shard_mode = getattr(config, 'shard_mode', ShardMode.AUTO)
-        self.quant = getattr(config, 'quant', None)
-        self.dot_general = getattr(config, 'dot_general', None)
-        self.dtype = (
-            getattr(config, 'torch_dtype', None)
-            or getattr(config, 'dtype', None)
-            or 'bfloat16'
-        )
-
+        self.shard_mode = config.shard_mode or ShardMode.AUTO
+        self.quant = config.quant
+        self.dot_general = config.dot_general
+        self.dtype = config.torch_dtype or config.dtype or 'bfloat16'
         self.model = TransformerModel(
             config,
             rngs=rngs,
@@ -752,17 +749,12 @@ class TransformerCausalLM(PretrainedModel):
             use_list=use_list,
         )
 
-        tied = getattr(config, 'tie_word_embeddings', None) # maybe
-        if tied is None:
-            tied = getattr(config, 'tied_word_embeddings', None)
-        if tied is None:
-            tied = getattr(config, 'tied_word_embedding', False)
-
-        self.tied_word_embeddings = bool(tied and lm_head is None)
+        tied = config.tie_word_embeddings or config.tied_word_embedding or False
+        self.tied_word_embeddings = tied and lm_head is None
         if self.tied_word_embeddings:
             if not hasattr(self.model.embed_tokens, 'embedding'):
                 raise TypeError(
-                    'A tied embedding must expose its weight as `embedding`'
+                    'A tied embedding should expose its weight as `embedding`'
                 )
         else:
             if lm_head is None:
@@ -783,13 +775,13 @@ class TransformerCausalLM(PretrainedModel):
                     dot_general=self.dot_general,
                 )
             else:
-                raise TypeError('lm_head must be an nn.Module subclass or instance')
+                raise TypeError('lm_head should be an nn.Module subclass or instance')
 
         if sharding_rules is None:
             sharding_rules = self.default_sharding_rules
 
-        self.model_out_sharding = None
-        self.logits_out_sharding = None
+        self.model_out_sharding     = None
+        self.logits_out_sharding    = None
         if mesh is not None and self.shard_mode == ShardMode.EXPLICIT:
             self.model_out_sharding = create_sharding(
                 mesh,
@@ -805,7 +797,10 @@ class TransformerCausalLM(PretrainedModel):
     def enable_remat(self) -> None:
         self.model.enable_remat()
 
-    def __getattr__(self, name: str) -> Any:
+    def disable_remat(self) -> None:
+        self.model.disable_remat()
+
+    def __getattr__(self, name: str) -> tp.Any:
         if (
             name == 'lm_head'
             and self.__dict__.get('tied_word_embeddings', False)
@@ -824,7 +819,7 @@ class TransformerCausalLM(PretrainedModel):
         logits_to_keep: int | jax.Array = 0,
     ) -> tuple[jax.Array, TransformerContext | None]:
         if ctx is not None and not isinstance(ctx, TransformerContext):
-            raise TypeError('ctx must be a TransformerContext or None')
+            raise TypeError('ctx should be a TransformerContext or None')
 
         kv_cache = None
         position_idx = None
@@ -834,7 +829,7 @@ class TransformerCausalLM(PretrainedModel):
             is_causal = ctx.is_causal
             if (ctx.key_cache is None) != (ctx.value_cache is None):
                 raise ValueError(
-                    'TransformerContext must contain both key and value caches'
+                    'TransformerContext should contain both key and value caches'
                 )
             if ctx.key_cache is not None:
                 kv_cache = (ctx.key_cache, ctx.value_cache)
@@ -858,14 +853,14 @@ class TransformerCausalLM(PretrainedModel):
 
         if isinstance(logits_to_keep, int):
             if logits_to_keep < 0:
-                raise ValueError('logits_to_keep must be non-negative')
+                raise ValueError('logits_to_keep should be non-negative')
             if logits_to_keep:
                 x = x[:, -logits_to_keep:, :]
         else:
             indices = jnp.asarray(logits_to_keep, dtype=jnp.int32)
             if indices.ndim != 1 or indices.shape[0] != x.shape[0]:
                 raise ValueError(
-                    'logits_to_keep must contain one index per batch row'
+                    'logits_to_keep should contain one index per batch row'
                 )
             indices = jnp.where(indices < 0, indices + x.shape[1], indices)
             x = jnp.take_along_axis(
@@ -915,15 +910,14 @@ class TransformerCausalLM(PretrainedModel):
         path_or_repo: PathLike,
         config: ModelConfig,
         module_map: Mapping[str, str] | Sequence[tuple[str, str]] | None,
-        **kwargs: Any,
-    ) -> Self:
+        **kwargs: tp.Any,
+    ) -> tp.Self:
         module_map = module_map or []
         if isinstance(module_map, dict):
             module_map = list(module_map.items())
 
-        tied = getattr(config, 'tie_word_embeddings', False)
-
         new_module_map = list(module_map)
+        tied = config.tie_word_embeddings or False
         if tied:
             embedding_target = None
             for rule in module_map:
@@ -941,7 +935,12 @@ class TransformerCausalLM(PretrainedModel):
                     ('lm_head.weight', embedding_target)
                 )
 
-        return super().from_pretrained(path_or_repo, config=config, module_map=new_module_map, **kwargs)
+        return super().from_pretrained(
+            path_or_repo,
+            config=config,
+            module_map=new_module_map,
+            **kwargs
+        )
 
     @classmethod
     def from_pretrained(
@@ -950,21 +949,21 @@ class TransformerCausalLM(PretrainedModel):
         mesh: jax.sharding.Mesh | None = None,
         sharding_rules: LogicalRules | None = None,
         local: bool = False,
-        **kwargs: Any,
-    ) -> Self:
+        **kwargs: tp.Any,
+    ) -> tp.Self:
         # Load config
         if 'config' in kwargs:
             config = kwargs.pop('config')
         else:
             config = ModelConfig.load_config(path_or_repo, local=local)
 
-        # We define how HuggingFace weights map to our components using our new Tuple format
+        # Define how HuggingFace weights map to components using new Tuple format
         module_map = [
             ("model.embed_tokens.weight", "model.embed_tokens.embedding"),
         ]
 
         # Call the base class safetensors loader
-        # (Note: PretrainedModel.from_pretrained will need to be updated to pass mesh and sharding_rules down!)
+        # TODO: PretrainedModel.from_pretrained will need to be updated to pass mesh and sharding_rules down
         return cls._load_from_pretrained(
             path_or_repo,
             config,
@@ -1120,17 +1119,17 @@ class TransformerCausalLM(PretrainedModel):
         seed: int,
     ) -> tuple[jax.Array, DecodeCarry, GenerationSettings]:
         if not isinstance(max_new_tokens, int) or max_new_tokens < 1:
-            raise ValueError('max_new_tokens must be a positive integer')
+            raise ValueError('max_new_tokens should be a positive integer')
         if not isinstance(top_k, int) or top_k < 0:
-            raise ValueError('top_k must be a non-negative integer')
+            raise ValueError('top_k should be a non-negative integer')
         if not 0 < top_p <= 1:
-            raise ValueError('top_p must be in the interval (0, 1]')
+            raise ValueError('top_p should be in the interval (0, 1]')
         if repetition_penalty <= 0:
-            raise ValueError('repetition_penalty must be positive')
+            raise ValueError('repetition_penalty should be positive')
 
         input_ids = jnp.asarray(input_ids)
         if input_ids.ndim != 2:
-            raise ValueError('input_ids must have shape [batch, sequence]')
+            raise ValueError('input_ids should have shape [batch, sequence]')
         batch_size, seq_len = input_ids.shape
 
         if attention_mask is None:
@@ -1139,7 +1138,7 @@ class TransformerCausalLM(PretrainedModel):
             attention_mask = jnp.asarray(attention_mask, dtype=jnp.bool_)
             if attention_mask.shape != input_ids.shape:
                 raise ValueError(
-                    'attention_mask must have the same shape as input_ids'
+                    'attention_mask should have the same shape as input_ids'
                 )
 
         prompt_lengths = jnp.sum(
@@ -1148,7 +1147,7 @@ class TransformerCausalLM(PretrainedModel):
             dtype=jnp.int32,
         )
         if bool(jnp.any(prompt_lengths == 0)):
-            raise ValueError('each prompt must contain at least one token')
+            raise ValueError('each prompt should contain at least one token')
 
         compact_order = jnp.argsort(
             ~attention_mask,
@@ -1184,7 +1183,7 @@ class TransformerCausalLM(PretrainedModel):
         pad_token_id = int(pad_token_id)
 
         if not isinstance(seed, int):
-            raise TypeError('seed must be an integer')
+            raise TypeError('seed should be an integer')
         key = jax.random.key(seed)
 
         num_layers = getattr(self.config, 'num_hidden_layers', None)
@@ -1208,7 +1207,7 @@ class TransformerCausalLM(PretrainedModel):
         model_dtype = jnp.dtype(self.dtype)
         if not jnp.issubdtype(model_dtype, jnp.inexact):
             raise TypeError(
-                'model compute dtype must be floating-point, '
+                'model compute dtype should be floating-point, '
                 f'got {model_dtype}'
             )
 
@@ -1303,17 +1302,17 @@ class TransformerCausalLM(PretrainedModel):
         repetition_penalty: float = 1.0,
         eos_token_id: int | Sequence[int] | None = None,
         pad_token_id: int | None = None,
-        streamer: Any = None,
+        streamer: tp.Any = None,
     ) -> jax.Array:
         if not isinstance(max_new_tokens, int) or max_new_tokens < 0:
-            raise ValueError('max_new_tokens must be a non-negative integer')
+            raise ValueError('max_new_tokens should be a non-negative integer')
 
         input_ids = jnp.asarray(input_ids)
         if streamer is not None:
             if not callable(getattr(streamer, 'put', None)):
-                raise TypeError('streamer must provide a callable put method')
+                raise TypeError('streamer should provide a callable put method')
             if not callable(getattr(streamer, 'end', None)):
-                raise TypeError('streamer must provide a callable end method')
+                raise TypeError('streamer should provide a callable end method')
 
             streamer.put(jax.device_get(input_ids))
             generated = []
@@ -1502,7 +1501,7 @@ class TransformerConditionalGeneration(PretrainedModel):
         audio_token_id: int | None = None,
         mesh: jax.sharding.Mesh | None = None,
         sharding_rules: LogicalRules | None = None,
-        **kwargs: Any,
+        **kwargs: tp.Any,
     ) -> None:
         if rngs is None:
             rngs = nn.Rngs(42)
@@ -1611,7 +1610,7 @@ class TransformerConditionalGeneration(PretrainedModel):
         if self.vision_tower is not None and hasattr(self.vision_tower, 'enable_remat'):
             self.vision_tower.enable_remat()
 
-    def encode_vision(self, pixel_values: jax.Array, **kwargs: Any) -> jax.Array:
+    def encode_vision(self, pixel_values: jax.Array, **kwargs: tp.Any) -> jax.Array:
         """Encode vision inputs and project features into hidden dimension."""
         if self.vision_tower is None:
             raise ValueError("vision_tower is not configured for this model")
@@ -1625,7 +1624,7 @@ class TransformerConditionalGeneration(PretrainedModel):
             vision_features = self.multi_modal_projector(vision_features)
         return vision_features
 
-    def encode_audio(self, input_features: jax.Array, **kwargs: Any) -> jax.Array:
+    def encode_audio(self, input_features: jax.Array, **kwargs: tp.Any) -> jax.Array:
         """Encode audio inputs and project features into hidden dimension."""
         if self.audio_tower is None:
             raise ValueError("audio_tower is not configured for this model")
@@ -1669,11 +1668,11 @@ class TransformerConditionalGeneration(PretrainedModel):
         logits_to_keep: int | jax.Array = 0,
         image_token_id: int | None = None,
         audio_token_id: int | None = None,
-        **kwargs: Any,
+        **kwargs: tp.Any,
     ) -> tuple[jax.Array, TransformerContext | None]:
         if inputs_embeds is None:
             if input_ids is None:
-                raise ValueError("You must specify either input_ids or inputs_embeds")
+                raise ValueError("You should specify either input_ids or inputs_embeds")
 
             embed_fn = self.get_input_embeddings()
             if embed_fn is not None:
@@ -1721,10 +1720,10 @@ class TransformerConditionalGeneration(PretrainedModel):
                 ctx = replace(ctx, key_cache=new_cache[0], value_cache=new_cache[1])
             return logits, ctx
         else:
-            raise NotImplementedError("Subclass must implement forward pass or provide language_model / model")
+            raise NotImplementedError("Subclass should implement forward pass or provide language_model / model")
 
     @classmethod
-    def from_pretrained(cls, path_or_repo: Any, mesh: Any=None, sharding_rules: Any=None, local: bool=False, **kwargs: Any) -> Any:
+    def from_pretrained(cls, path_or_repo: tp.Any, mesh: tp.Any=None, sharding_rules: tp.Any=None, local: bool=False, **kwargs: tp.Any) -> tp.Any:
         if 'config' in kwargs:
             config = kwargs.pop('config')
         else:
@@ -1787,7 +1786,7 @@ class TransformerConditionalGeneration(PretrainedModel):
 
 class DiffusionIM(PretrainedModel):
     """Base class for Diffusion Image Models (e.g., Flux, DiT, Stable Diffusion)."""
-    def __init__(self, config: Any=None, *, rngs: nn.Rngs | None = None, **kwargs: Any) -> None:
+    def __init__(self, config: tp.Any=None, *, rngs: nn.Rngs | None = None, **kwargs: tp.Any) -> None:
         if rngs is None:
             rngs = nn.Rngs(42)
         self.config = config
@@ -1795,7 +1794,7 @@ class DiffusionIM(PretrainedModel):
 
 class DiffusionLM(PretrainedModel):
     """Base class for Diffusion Language Models (e.g., Diffusion Gemma, Discrete Diffusion LM)."""
-    def __init__(self, config: Any=None, *, rngs: nn.Rngs | None = None, **kwargs: Any) -> None:
+    def __init__(self, config: tp.Any=None, *, rngs: nn.Rngs | None = None, **kwargs: tp.Any) -> None:
         if rngs is None:
             rngs = nn.Rngs(42)
         self.config = config

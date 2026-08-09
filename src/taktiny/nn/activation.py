@@ -12,14 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Activation modules"""
-
 from __future__ import annotations
-from taktiny import nn
 from collections.abc import Callable
 import jax
+from taktiny import nn
 
-
-class _ActBase(nn.Module):
+class _ActivationBase(nn.Module):
     def __call__(
         self,
         x: jax.Array,
@@ -38,76 +36,61 @@ class _ActBase(nn.Module):
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}()"
 
-
-class SiLU(_ActBase):
+class SiLU(_ActivationBase):
     def __call__(self, x: jax.Array) -> jax.Array:
         return super().__call__(x)
 
-
-class GELU(_ActBase):
+class GELU(_ActivationBase):
     def __call__(self, x: jax.Array) -> jax.Array:
         return super().__call__(x)
 
-
-class ReLU(_ActBase):
+class ReLU(_ActivationBase):
     def __call__(self, x: jax.Array) -> jax.Array:
         return super().__call__(x)
 
-
-class ELU(_ActBase):
+class ELU(_ActivationBase):
     def __call__(self, x: jax.Array) -> jax.Array:
         return super().__call__(x)
 
-
-class Swish(_ActBase):
+class Swish(_ActivationBase):
     def __call__(self, x: jax.Array) -> jax.Array:
         return super().__call__(x)
 
-
-class SELU(_ActBase):
+class SELU(_ActivationBase):
     def __call__(self, x: jax.Array) -> jax.Array:
         return super().__call__(x)
 
-
-class SoftPlus(_ActBase):
+class SoftPlus(_ActivationBase):
     def __call__(self, x: jax.Array) -> jax.Array:
         return super().__call__(x)
 
-
-class Mish(_ActBase):
+class Mish(_ActivationBase):
     def __call__(self, x: jax.Array) -> jax.Array:
         return super().__call__(x)
 
-
-class HardSwish(_ActBase):
+class HardSwish(_ActivationBase):
     def __call__(self, x: jax.Array) -> jax.Array:
         return super().__call__(x)
 
-
-class Sigmoid(_ActBase):
+class Sigmoid(_ActivationBase):
     def __call__(self, x: jax.Array) -> jax.Array:
         return super().__call__(x)
 
-
-class SoftSign(_ActBase):
+class SoftSign(_ActivationBase):
     def __call__(self, x: jax.Array) -> jax.Array:
         return super().__call__(x, jax.nn.soft_sign)
 
-
-class Tanh(_ActBase):
+class Tanh(_ActivationBase):
     def __call__(self, x: jax.Array) -> jax.Array:
         return super().__call__(x)
 
-
-class HardTanh(_ActBase):
+class HardTanh(_ActivationBase):
     def __call__(self, x: jax.Array) -> jax.Array:
         return super().__call__(x)
 
-
-class HardSigmoid(_ActBase):
+class HardSigmoid(_ActivationBase):
     def __call__(self, x: jax.Array) -> jax.Array:
         return super().__call__(x)
-
 
 __all__ = [
     'SiLU',

@@ -11,36 +11,36 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Feed Forward Network modules"""
-
+"""
+Feed Forward Network modules
+TODO: rewrite this file
+"""
 from __future__ import annotations
 from typing import Any
-
-
 import jax, jax.numpy as jnp
-from typing import Callable
 
-from taktiny.utils.typing import ShardMode
-from taktiny.nn.module import Module
+from taktiny.utils.typing import AxisNames, ShardMode
 from taktiny import nn
+from taktiny.nn.utils import _resolve_activation
+from taktiny.utils.typing import Activation, DType
 
-class GateMLP(Module):
+class GateMLP(nn.Module):
     def __init__(
         self,
         hidden_size: int,
         intermediate_size: int,
-        activation: Callable | str = jax.nn.silu,
+        activation: Activation = jax.nn.silu,
         bias: bool = False,
-        dtype: str | None = None,
+        dtype: DType | None = None,
         rngs: nn.Rngs | None = None,
-        gate_axis_names: tuple[str | None, ...] | None = None,
-        up_axis_names: tuple[str | None, ...] | None = None,
-        down_axis_names: tuple[str | None, ...] | None = None,
+        gate_axis_names: AxisNames | None = None,
+        up_axis_names: AxisNames | None = None,
+        down_axis_names: AxisNames | None = None,
         shard_mode: ShardMode = ShardMode.AUTO,
-        quant: Any=None,
-        dot_general: Any=None,
+        quant: Any = None,
+        dot_general: Any = None,
     ) -> None:
-        self.activation = activation if isinstance(activation, Callable) else getattr(jax.nn, activation)
+        self.activation = _resolve_activation(activation)
 
         self.gate_proj = nn.Linear(
             hidden_size, intermediate_size,
@@ -69,7 +69,7 @@ class GateMLP(Module):
         up = self.up_proj(x)
         return self.down_proj(gate * up, out_sharding=out_sharding)
 
-class FusedGateMLP(Module):
+class FusedGateMLP(nn.Module):
     """
     GateMLP where the gate and up projections are fused into a single linear layer.
     """
@@ -77,17 +77,17 @@ class FusedGateMLP(Module):
         self,
         hidden_size: int,
         intermediate_size: int,
-        activation: Callable | str = jax.nn.silu,
+        activation: Activation = jax.nn.silu,
         bias: bool = False,
         dtype: str | None = None,
         seed: nn.Rngs | None = None,
-        linear_in_axis_names: tuple[str | None, ...] | None = None,
-        linear_out_axis_names: tuple[str | None, ...] | None = None,
+        linear_in_axis_names: AxisNames | None = None,
+        linear_out_axis_names: AxisNames | None = None,
         shard_mode: ShardMode = ShardMode.AUTO,
         quant: Any=None,
         dot_general: Any=None,
     ) -> None:
-        self.activation = activation if isinstance(activation, Callable) else getattr(jax.nn, activation)
+        self.activation = _resolve_activation(activation)
 
         self.linear_in = nn.Linear(hidden_size, intermediate_size * 2, bias=bias, dtype=dtype, seed=seed, axis_names=linear_in_axis_names, shard_mode=shard_mode, quant=quant, dot_general=dot_general)
         self.linear_out = nn.Linear(intermediate_size, hidden_size, bias=bias, dtype=dtype, seed=seed, axis_names=linear_out_axis_names, shard_mode=shard_mode, quant=quant, dot_general=dot_general)
@@ -161,8 +161,7 @@ class FusedGateMLP(Module):
         else:
             raise ValueError(f"Unknown MoE kernel method: '{kernel}'")
 
-
-class MoeFFN(Module):
+class MoeFFN(nn.Module):
     """
     Mixture-of-Experts (MoE) FFN module utilizing Megablox Grouped Matrix Multiply (GMM)
     and activation sorting kernels.
@@ -246,19 +245,18 @@ class MoeFFN(Module):
         else:
             raise ValueError(f"Unknown MoE kernel method: '{kernel}'")
 
-
-class MLP(Module):
+class MLP(nn.Module):
     def __init__(
         self,
         hidden_size: int,
         intermediate_size: int,
-        activation: Callable | str = jax.nn.gelu,
+        activation: Activation = jax.nn.gelu,
         bias: bool = True,
         dtype: str | None = None,
         rngs: nn.Rngs | None = None,
         shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
-        self.activation = activation if isinstance(activation, Callable) else getattr(jax.nn, activation)
+        self.activation = _resolve_activation(activation)
         self.fc1 = nn.Linear(hidden_size, intermediate_size, bias=bias, dtype=dtype, rngs=rngs, shard_mode=shard_mode)
         self.fc2 = nn.Linear(intermediate_size, hidden_size, bias=bias, dtype=dtype, rngs=rngs, shard_mode=shard_mode)
 

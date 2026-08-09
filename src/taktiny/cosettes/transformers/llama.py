@@ -17,7 +17,7 @@ from typing import Any
 
 
 from taktiny import nn
-from taktiny.cosettes._common import TransformerDecoderLayer
+from taktiny.cosettes.common import TransformerDecoderLayer
 from taktiny.layers import GateMLP, Attention
 
 

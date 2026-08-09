@@ -4,7 +4,7 @@ import jax.numpy as jnp
 
 from taktiny import nn
 from taktiny.cosettes.transformers.llama import LlamaDecoderLayer
-from taktiny.maestro._config import ModelConfig
+from taktiny.maestro.config import ModelConfig
 
 
 def linear(x, weight, input_dims=1):

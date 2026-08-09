@@ -11,7 +11,7 @@ from safetensors.numpy import save_file
 from taktiny import Takt, nn
 from taktiny.cosettes import _base as pretrained_base
 from taktiny.cosettes._base import PretrainedModel
-from taktiny.maestro._config import ModelConfig
+from taktiny.maestro.config import ModelConfig
 from taktiny.peft import LoraConfig
 
 

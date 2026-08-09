@@ -19,23 +19,24 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 import enum
 from os import PathLike as OSPathLike
 from typing import Any, Protocol, TypeAlias, TypeVar, runtime_checkable
-
 import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from jax.typing import ArrayLike as JaxArrayLike
-from jax.typing import DTypeLike
+from jax.typing import ArrayLike as JaxArrayLike, DTypeLike
 
 
 Array: TypeAlias = jax.Array
 ArrayLike: TypeAlias = JaxArrayLike
+Activation: TypeAlias = str | Callable[[Array], Array]
 DType: TypeAlias = DTypeLike
+Initializer: TypeAlias = Callable[..., Array]
 PRNGKey: TypeAlias = jax.Array
 PyTree: TypeAlias = Any
 Shape: TypeAlias = Sequence[int]
 Axes: TypeAlias = int | Sequence[int]
-AxisName: TypeAlias = str | tuple[str | None, ...] | None
-AxisNames: TypeAlias = tuple[str | None, ...]
-LogicalRules: TypeAlias = Sequence[tuple[str, AxisName]]
+AxisName: TypeAlias = str | None
+AxisNames: TypeAlias = tuple[AxisName, ...]
+MeshAxisName: TypeAlias = str | tuple[str, ...] | None
+LogicalRules: TypeAlias = Sequence[tuple[str, MeshAxisName]]
 Sharding: TypeAlias = NamedSharding | PartitionSpec | None
 MeshLike: TypeAlias = Mesh | None
 PathLike: TypeAlias = str | OSPathLike[str]
@@ -45,16 +46,12 @@ StateDict: TypeAlias = dict[str, PyTree]
 ParameterDict: TypeAlias = dict[str, Any]
 ModuleFactory: TypeAlias = Callable[..., Any]
 LossFn: TypeAlias = Callable[[Any, Batch], Array]
-
 T = TypeVar('T')
-
 
 class ShardMode(enum.Enum):
     """Select automatic constraints or explicit output shardings."""
-
     AUTO = 'auto'
     EXPLICIT = 'explicit'
-
 
 @runtime_checkable
 class StatefulIterator(Protocol[T]):
@@ -68,25 +65,26 @@ class StatefulIterator(Protocol[T]):
 
     def set_state(self, state: PyTree) -> None: ...
 
-
 @runtime_checkable
 class EpochAware(Protocol):
     """Data source that supports deterministic epoch selection."""
-
     def set_epoch(self, epoch: int) -> None: ...
 
 
 __all__ = [
     'Array',
     'ArrayLike',
+    'Activation',
     'Axes',
     'AxisName',
     'AxisNames',
     'Batch',
     'DType',
     'EpochAware',
+    'Initializer',
     'LogicalRules',
     'LossFn',
+    'MeshAxisName',
     'MeshLike',
     'ModuleFactory',
     'MutableBatch',

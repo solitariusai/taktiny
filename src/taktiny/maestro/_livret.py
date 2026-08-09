@@ -12,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Module for register any model architectures"""
-
 from __future__ import annotations
 from typing import Any
-
 
 class Repertoire:
     def __init__(self) -> None:

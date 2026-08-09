@@ -3,8 +3,8 @@ import jax.numpy as jnp
 import pytest
 
 from taktiny import nn
-from taktiny.cosettes._common import TransformerCausalLM, TransformerModel
-from taktiny.maestro._config import ModelConfig
+from taktiny.cosettes.common import TransformerCausalLM, TransformerModel
+from taktiny.maestro.config import ModelConfig
 
 
 class RematTestLayer(nn.Module):

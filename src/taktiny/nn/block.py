@@ -13,17 +13,22 @@
 # limitations under the License.
 """Utilities modules for stack/group other modules"""
 from __future__ import annotations
-
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import (
+    Callable,
+    Iterable,
+    ItemsView,
+    Iterator,
+    KeysView,
+    Mapping,
+    Sequence,
+    ValuesView,
+)
 from typing import Any
-
 import jax
 import jax.numpy as jnp
-
 from taktiny import transforms as tt
 from taktiny.nn.module import Module
 from taktiny.utils.typing import PyTree
-
 
 def _stack_modules(modules: Iterable[Module]) -> tuple[Module, int]:
     modules = tuple(modules)
@@ -37,13 +42,41 @@ def _stack_modules(modules: Iterable[Module]) -> tuple[Module, int]:
                 f'{type(module).__name__}'
             )
 
-    structure = jax.tree_util.tree_structure(modules[0])
+    reference = modules[0]
+    structure = jax.tree_util.tree_structure(reference)
+    reference_leaves = jax.tree_util.tree_leaves(reference)
     for index, module in enumerate(modules[1:], start=1):
+        if type(module) is not type(reference):
+            raise ValueError(
+                'all modules must have the same type; '
+                f'modules[0] is {type(reference).__name__} and '
+                f'modules[{index}] is {type(module).__name__}'
+            )
         if jax.tree_util.tree_structure(module) != structure:
             raise ValueError(
-                'all modules must have the same PyTree structure; '
+                'all modules must have the same PyTree structure and static '
+                'configuration; '
                 f'modules[0] and modules[{index}] differ'
             )
+        for leaf_index, (reference_leaf, leaf) in enumerate(
+            zip(reference_leaves, jax.tree_util.tree_leaves(module))
+        ):
+            reference_shape = getattr(reference_leaf, 'shape', None)
+            shape = getattr(leaf, 'shape', None)
+            if shape != reference_shape:
+                raise ValueError(
+                    'all corresponding module leaves must have the same '
+                    f'shape; leaf {leaf_index} in modules[0] has shape '
+                    f'{reference_shape} and modules[{index}] has shape {shape}'
+                )
+            reference_dtype = getattr(reference_leaf, 'dtype', None)
+            dtype = getattr(leaf, 'dtype', None)
+            if dtype != reference_dtype:
+                raise ValueError(
+                    'all corresponding module leaves must have the same '
+                    f'dtype; leaf {leaf_index} in modules[0] has dtype '
+                    f'{reference_dtype} and modules[{index}] has dtype {dtype}'
+                )
 
     stacked = jax.tree_util.tree_map(
         lambda *values: jnp.stack(values),
@@ -59,8 +92,21 @@ def _stack_modules(modules: Iterable[Module]) -> tuple[Module, int]:
     return stacked, len(modules)
 
 
+def _validate_module_sequence(modules: Sequence[Module]) -> None:
+    if not isinstance(modules, Sequence):
+        raise TypeError(
+            f'modules must be a sequence, got {type(modules).__name__}'
+        )
+    for index, module in enumerate(modules):
+        if not isinstance(module, Module):
+            raise TypeError(
+                f'modules[{index}] must be a Module, got '
+                f'{type(module).__name__}'
+            )
+
 class List(Module):
-    def __init__(self, *modules: Module) -> None:
+    def __init__(self, modules: Sequence[Module]) -> None:
+        _validate_module_sequence(modules)
         self.layers = list(modules)
 
     def __getitem__(self, idx: int) -> Module:
@@ -75,13 +121,67 @@ class List(Module):
     def extra_repr(self) -> str:
         return f"{len(self.layers)}"
 
+class Dict(Module):
+    """A module container indexed by stable string keys."""
 
-class Dict(Module): ...
+    def __init__(self, modules: Mapping[str, Module]) -> None:
+        if not isinstance(modules, Mapping):
+            raise TypeError(
+                f'modules must be a mapping, got {type(modules).__name__}'
+            )
+        for key, module in modules.items():
+            if not isinstance(key, str):
+                raise TypeError(
+                    f'module keys must be strings, got {type(key).__name__}'
+                )
+            if not key:
+                raise ValueError('module keys must not be empty')
+            if '.' in key:
+                raise ValueError("module keys must not contain '.'")
+            if not isinstance(module, Module):
+                raise TypeError(
+                    f'modules[{key!r}] must be a Module, got '
+                    f'{type(module).__name__}'
+                )
+        self.layers = dict(modules)
 
+    def __getitem__(self, key: str) -> Module:
+        return self.layers[key]
+
+    def __contains__(self, key: object) -> bool:
+        return key in self.layers
+
+    def __len__(self) -> int:
+        return len(self.layers)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.layers)
+
+    def keys(self) -> KeysView[str]:
+        return self.layers.keys()
+
+    def values(self) -> ValuesView[Module]:
+        return self.layers.values()
+
+    def items(self) -> ItemsView[str, Module]:
+        return self.layers.items()
+
+    def extra_repr(self) -> str:
+        return f'{len(self.layers)}'
 
 class Sequential(Module):
-    def __init__(self, *modules: Module) -> None:
+    def __init__(self, modules: Sequence[Module]) -> None:
+        _validate_module_sequence(modules)
         self.layers = tuple(modules)
+
+    def __getitem__(self, idx: int) -> Module:
+        return self.layers[idx]
+
+    def __len__(self) -> int:
+        return len(self.layers)
+
+    def __iter__(self) -> Iterator[Module]:
+        return iter(self.layers)
 
     def __call__(self, x: PyTree, *args: Any, **kwargs: Any) -> PyTree:
         for layer in self.layers:
@@ -92,8 +192,31 @@ class Sequential(Module):
         return f"{len(self.layers)}"
 
 class SeqStack(Module):
-    def __init__(self, modules: Iterable[Module]) -> None:
+    def __init__(
+        self,
+        modules: Iterable[Module],
+        *,
+        reverse: bool = False,
+        unroll: int | bool = 1,
+        split_transpose: bool = False,
+    ) -> None:
+        if not isinstance(reverse, bool):
+            raise TypeError('reverse must be a boolean')
+        if not isinstance(unroll, (int, bool)) or (
+            isinstance(unroll, int)
+            and not isinstance(unroll, bool)
+            and unroll <= 0
+        ):
+            raise ValueError('unroll must be a positive integer or boolean')
+        if not isinstance(split_transpose, bool):
+            raise TypeError('split_transpose must be a boolean')
         self.stacked, self.num_stack = _stack_modules(modules)
+        self.reverse = reverse
+        self.unroll = unroll
+        self.split_transpose = split_transpose
+
+    def __len__(self) -> int:
+        return self.num_stack
 
     def __call__(
         self,
@@ -102,7 +225,12 @@ class SeqStack(Module):
         *args: Any,
         **kwargs: Any,
     ) -> tuple[PyTree, PyTree]:
-        @tt.scan()
+        @tt.scan(
+            length=self.num_stack,
+            reverse=self.reverse,
+            unroll=self.unroll,
+            _split_transpose=self.split_transpose,
+        )
         def apply_fn(carry: Any, layer: Any, *broadcast_args: Any) -> Any:
             return f(layer, carry, *broadcast_args, **kwargs)
 
@@ -111,16 +239,26 @@ class SeqStack(Module):
     def extra_repr(self) -> str:
         return f"{self.num_stack}"
 
-
 class Stack(Module):
-    def __init__(self, modules: Iterable[Module]) -> None:
+    def __init__(
+        self,
+        modules: Iterable[Module],
+        *,
+        axis_name: Any | None = None,
+        spmd_axis_name: Any | tuple[Any, ...] | None = None,
+    ) -> None:
         self.stacked, self.num_stack = _stack_modules(modules)
+        self.axis_name = axis_name
+        self.spmd_axis_name = spmd_axis_name
+
+    def __len__(self) -> int:
+        return self.num_stack
 
     def __call__(
         self,
         *args: Any,
-        in_axes: int | tuple[int | None, ...] = 0,
-        out_axes: int | tuple[int | None, ...] = 0,
+        in_axes: int | None | tuple[int | None, ...] = 0,
+        out_axes: Any = 0,
         **kwargs: Any,
     ) -> PyTree:
         if isinstance(in_axes, tuple):
@@ -132,7 +270,13 @@ class Stack(Module):
         else:
             vmap_in_axes = (0,) + (in_axes,) * len(args)
 
-        @tt.vmap(in_axes=vmap_in_axes, out_axes=out_axes)
+        @tt.vmap(
+            in_axes=vmap_in_axes,
+            out_axes=out_axes,
+            axis_name=self.axis_name,
+            axis_size=self.num_stack,
+            spmd_axis_name=self.spmd_axis_name,
+        )
         def apply_fn(layer: Any, *positional_args: Any) -> Any:
             return layer(*positional_args, **kwargs)
 
@@ -141,5 +285,10 @@ class Stack(Module):
     def extra_repr(self) -> str:
         return f"{self.num_stack}"
 
-
-__all__ = ['List', 'Sequential', 'SeqStack', 'Stack']
+__all__ = [
+    'List',
+    'Dict',
+    'Sequential',
+    'SeqStack',
+    'Stack',
+]

@@ -12,104 +12,75 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Deepseek architectures"""
-
 from __future__ import annotations
-from typing import Any
-
+import typing as tp
 
 from taktiny.maestro._livret import repertoire
-from taktiny.cosettes._common import TransformerCausalLM
-
-
+from taktiny.cosettes.common import TransformerCausalLM
 from taktiny.cosettes.transformers.llama import LlamaDecoderLayer
+from taktiny.maestro.config import ModelConfig
 from taktiny import nn
 
 
+# TODO: Deepseek
 class Deepseek(TransformerCausalLM):
-    def __init__(self, config: Any, rngs: nn.Rngs | None = None, mesh: Any=None, sharding_rules: Any=None, **kwargs: Any) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         super().__init__(
             config,
-            rngs=rngs,
             decoder=LlamaDecoderLayer,
             norm=nn.RMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs,
         )
 
-
+# TODO: DeepseekV2
 class DeepseekV2(TransformerCausalLM):
-    def __init__(self, config: Any, rngs: nn.Rngs | None = None, mesh: Any=None, sharding_rules: Any=None, **kwargs: Any) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         super().__init__(
             config,
-            rngs=rngs,
             decoder=LlamaDecoderLayer,
             norm=nn.RMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs,
         )
 
-
+# TODO: DeepseekV3
 class DeepseekV3(TransformerCausalLM):
-    def __init__(self, config: Any, rngs: nn.Rngs | None = None, mesh: Any=None, sharding_rules: Any=None, **kwargs: Any) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         super().__init__(
             config,
-            rngs=rngs,
             decoder=LlamaDecoderLayer,
             norm=nn.RMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs,
         )
 
-
+# TODO: DeepseekV3_2
 class DeepseekV3_2(TransformerCausalLM):
-    def __init__(self, config: Any, rngs: nn.Rngs | None = None, mesh: Any=None, sharding_rules: Any=None, **kwargs: Any) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         super().__init__(
             config,
-            rngs=rngs,
             decoder=LlamaDecoderLayer,
             norm=nn.RMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs,
         )
 
-
+# TODO: DeepseekV4
 class DeepseekV4(TransformerCausalLM):
-    def __init__(self, config: Any, rngs: nn.Rngs | None = None, mesh: Any=None, sharding_rules: Any=None, **kwargs: Any) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
+    def __init__(self, config: ModelConfig, **kwargs) -> None:
         super().__init__(
             config,
-            rngs=rngs,
             decoder=LlamaDecoderLayer,
             norm=nn.RMSNorm,
-            mesh=mesh,
-            sharding_rules=sharding_rules,
             **kwargs,
         )
 
-
-repertoire.register('DeepseekForCausalLM', Deepseek)
-repertoire.register('DeepseekV2ForCausalLM', DeepseekV2)
-repertoire.register('DeepseekV3ForCausalLM', DeepseekV3)
-repertoire.register('DeepseekV32ForCausalLM', DeepseekV3_2)
-repertoire.register('DeepseekV4ForCausalLM', DeepseekV4)
-
-__all__ = [
-    'Deepseek',
-    'DeepseekV2',
-    'DeepseekV3',
-    'DeepseekV3_2',
-    'DeepseekV4',
+class_map = [
+    ('DeepseekForCausalLM', Deepseek),
+    ('DeepseekV2ForCausalLM', DeepseekV2),
+    ('DeepseekV3ForCausalLM', DeepseekV3),
+    ('DeepseekV32ForCausalLM', DeepseekV3_2),
+    ('DeepseekV4ForCausalLM', DeepseekV4),
 ]
+
+__all__ = []
+for name, cls in class_map:
+    repertoire.register(name, cls)
+    __all__.append(cls.__name__)
