@@ -242,7 +242,8 @@ class DatasetUtils:
 
         When ``sampler`` is omitted, an :class:`grain.IndexSampler` is created
         from the remaining sampling arguments. Supplying ``sampler`` transfers
-        sampling and sharding responsibility entirely to that object.
+        sampling and sharding responsibility entirely to that object. The
+        default ``num_epochs=None`` creates an unbounded loader.
         """
         if not hasattr(source, '__getitem__'):
             raise TypeError('source must support random access')

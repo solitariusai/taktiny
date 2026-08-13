@@ -20,7 +20,7 @@ import qwix
 from jax.nn import initializers
 
 from taktiny import nn
-from taktiny.nn.utils import _constrain
+from taktiny.nn._continuo import _constrain
 from taktiny.utils.typing import AxisNames, DType, Initializer, ShardMode
 
 default_embedding_initializer = initializers.normal(0.02)

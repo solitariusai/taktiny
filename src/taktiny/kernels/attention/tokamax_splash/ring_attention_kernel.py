@@ -17,17 +17,15 @@
 
 """Implementation of Ring Attention."""
 from __future__ import annotations
-
-
 import dataclasses
 import functools
 from typing import Any
-
 import jax
 from jax import lax
 from jax import tree_util
 import jax.numpy as jnp
 import numpy as np
+
 from taktiny.kernels.attention.tokamax_splash import base
 from taktiny.kernels.attention.tokamax_splash import ring_attention_utils
 from taktiny.kernels.attention.tokamax_splash import splash_attention_kernel as splash_kernel
@@ -53,14 +51,12 @@ _has_empty_attention_rows = ring_attention_utils.has_empty_attention_rows
 _mask_sparsity = ring_attention_utils.mask_sparsity
 _has_axis = ring_attention_utils.has_axis
 
-
 def _validate_ring_axis_size(ring_axis: str, ring_axis_size: int, expected_ring_size: int) -> None:
   if ring_axis_size != expected_ring_size:
     raise ValueError(
         f"Ring axis {ring_axis} has size {ring_axis_size}, but ring attention "
         f"was built for {expected_ring_size} sequence shards."
     )
-
 
 def _ring_attention_forward(
     fwd_mask_info: MaskInfo,
@@ -184,7 +180,6 @@ def _ring_attention_forward(
 
   return out, (lse, m_final)
 
-
 def _ring_attention_bwd(
     mask_value: float,
     is_mqa: bool,
@@ -300,7 +295,6 @@ def _ring_attention_bwd(
       dsinks,
   )
 
-
 def _ring_attention_fwd(
     fwd_mask_info: MaskInfo,
     dkv_mask_info: MaskInfo | None,
@@ -368,7 +362,6 @@ def _ring_attention_fwd(
   )
   residuals = (q, k, v, segment_ids, sinks, out, logsumexp, dkv_mask_info)
   return out, residuals
-
 
 @partial(
     jax.custom_vjp,
@@ -444,9 +437,7 @@ def _ring_attention_custom(
   )
   return out
 
-
 _ring_attention_custom.defvjp(_ring_attention_fwd, _ring_attention_bwd)
-
 
 @partial(
     jax.jit,
@@ -530,7 +521,6 @@ def _ring_attention(
       ring_axis=ring_axis,
       expected_ring_size=expected_ring_size,
   )
-
 
 @jax.tree_util.register_pytree_node_class
 class RingSplashAttentionKernel:
@@ -634,7 +624,6 @@ class RingSplashAttentionKernel:
         dkv_mask_info,
         **aux_data,
     )
-
 
 def make_ring_attention(
     mask: np.ndarray | mask_lib.Mask,

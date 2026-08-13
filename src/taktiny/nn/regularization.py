@@ -16,35 +16,23 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-import math
-from numbers import Real
 from typing import Literal, TypeAlias
 
 import jax
 import jax.numpy as jnp
 
 from taktiny.nn.module import Module
-from taktiny.nn.utils import (
+from taktiny.nn.rng import Rngs
+from taktiny.nn._continuo import (
     _canonical_axis,
     _canonical_axes,
     _constrain,
-    _resolve_training,
+    _validate_probability,
 )
-from taktiny.utils.typing import Axes, PRNGKey, ShardMode
+from taktiny.utils.typing import Axes, ShardMode
 
 
 StochasticDepthMode: TypeAlias = Literal['batch', 'row']
-
-
-def _probability(value: float, *, allow_one: bool = True) -> float:
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise TypeError('p must be a real number')
-    value = float(value)
-    upper_valid = value <= 1 if allow_one else value < 1
-    if not math.isfinite(value) or value < 0 or not upper_valid:
-        interval = '[0, 1]' if allow_one else '[0, 1)'
-        raise ValueError(f'p must be finite and in {interval}')
-    return value
 
 
 def _mask_shape(
@@ -79,17 +67,27 @@ def _feature_broadcast_axes(
     )
 
 
-def _require_key(key: PRNGKey | None) -> PRNGKey:
-    if key is None:
-        raise ValueError('a key is required in training mode when p is nonzero')
-    return key
+def _next_key(rngs: Rngs | None) -> jax.Array:
+    if rngs is None:
+        raise ValueError('rngs is required in training mode when p is nonzero')
+    return rngs()
+
+
+def _validate_rngs(rngs: Rngs | None) -> Rngs | None:
+    if rngs is None:
+        return None
+    if not isinstance(rngs, Rngs):
+        raise TypeError('rngs must be an Rngs or None')
+    return rngs
 
 
 class Dropout(Module):
     """Randomly zero activation elements and rescale retained values.
 
     ``broadcast_axes`` shares one mask value across selected input dimensions.
-    An empty tuple gives ordinary elementwise dropout.
+    An empty tuple gives ordinary elementwise dropout. Randomness comes from
+    ``rngs`` supplied during construction. :meth:`Module.train` and
+    :meth:`Module.eval` control whether dropout is active.
     """
 
     def __init__(
@@ -97,25 +95,25 @@ class Dropout(Module):
         p: float = 0.5,
         *,
         broadcast_axes: Axes = (),
+        rngs: Rngs | None = None,
         shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
-        self.p = _probability(p)
+        self.p = _validate_probability(p)
         self.broadcast_axes = (
             (broadcast_axes,)
             if isinstance(broadcast_axes, int)
             else tuple(broadcast_axes)
         )
+        self.rngs = _validate_rngs(rngs)
         self.shard_mode = shard_mode
 
     def _apply(
         self,
         x: jax.Array,
         *,
-        key: PRNGKey | None,
-        training: bool,
         broadcast_axes: tuple[int, ...],
     ) -> jax.Array:
-        if not training or self.p == 0:
+        if not self.training or self.p == 0:
             return x
         if self.p == 1:
             return jnp.zeros_like(x)
@@ -123,7 +121,7 @@ class Dropout(Module):
             raise TypeError('Dropout requires a floating-point or complex input')
 
         mask = jax.random.bernoulli(
-            _require_key(key),
+            _next_key(self.rngs),
             p=1.0 - self.p,
             shape=_mask_shape(x.shape, broadcast_axes),
         )
@@ -133,8 +131,6 @@ class Dropout(Module):
         self,
         x: jax.Array,
         *,
-        key: PRNGKey | None = None,
-        training: bool | None = None,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
         x = jnp.asarray(x)
@@ -146,8 +142,6 @@ class Dropout(Module):
         )
         output = self._apply(
             x,
-            key=key,
-            training=_resolve_training(self.training, training),
             broadcast_axes=axes,
         )
         return _constrain(output, out_sharding, self.shard_mode)
@@ -165,9 +159,10 @@ class FeatureDropout(Dropout):
         *,
         channel_axis: int = -1,
         batch_axis: int | None = 0,
+        rngs: Rngs | None = None,
         shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
-        super().__init__(p, shard_mode=shard_mode)
+        super().__init__(p, rngs=rngs, shard_mode=shard_mode)
         self.channel_axis = channel_axis
         self.batch_axis = batch_axis
 
@@ -175,15 +170,11 @@ class FeatureDropout(Dropout):
         self,
         x: jax.Array,
         *,
-        key: PRNGKey | None = None,
-        training: bool | None = None,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
         x = jnp.asarray(x)
         output = self._apply(
             x,
-            key=key,
-            training=_resolve_training(self.training, training),
             broadcast_axes=_feature_broadcast_axes(
                 x.ndim,
                 self.channel_axis,
@@ -209,32 +200,32 @@ class AlphaDropout(Module):
         p: float = 0.5,
         *,
         broadcast_axes: Axes = (),
+        rngs: Rngs | None = None,
         shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
-        self.p = _probability(p, allow_one=False)
+        self.p = _validate_probability(p, allow_one=False)
         self.broadcast_axes = (
             (broadcast_axes,)
             if isinstance(broadcast_axes, int)
             else tuple(broadcast_axes)
         )
+        self.rngs = _validate_rngs(rngs)
         self.shard_mode = shard_mode
 
     def _apply(
         self,
         x: jax.Array,
         *,
-        key: PRNGKey | None,
-        training: bool,
         broadcast_axes: tuple[int, ...],
     ) -> jax.Array:
-        if not training or self.p == 0:
+        if not self.training or self.p == 0:
             return x
         if not jnp.issubdtype(x.dtype, jnp.floating):
             raise TypeError('AlphaDropout requires a floating-point input')
 
         keep_probability = 1.0 - self.p
         mask = jax.random.bernoulli(
-            _require_key(key),
+            _next_key(self.rngs),
             p=keep_probability,
             shape=_mask_shape(x.shape, broadcast_axes),
         )
@@ -254,8 +245,6 @@ class AlphaDropout(Module):
         self,
         x: jax.Array,
         *,
-        key: PRNGKey | None = None,
-        training: bool | None = None,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
         x = jnp.asarray(x)
@@ -267,8 +256,6 @@ class AlphaDropout(Module):
         )
         output = self._apply(
             x,
-            key=key,
-            training=_resolve_training(self.training, training),
             broadcast_axes=axes,
         )
         return _constrain(output, out_sharding, self.shard_mode)
@@ -286,9 +273,10 @@ class FeatureAlphaDropout(AlphaDropout):
         *,
         channel_axis: int = -1,
         batch_axis: int | None = 0,
+        rngs: Rngs | None = None,
         shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
-        super().__init__(p, shard_mode=shard_mode)
+        super().__init__(p, rngs=rngs, shard_mode=shard_mode)
         self.channel_axis = channel_axis
         self.batch_axis = batch_axis
 
@@ -296,15 +284,11 @@ class FeatureAlphaDropout(AlphaDropout):
         self,
         x: jax.Array,
         *,
-        key: PRNGKey | None = None,
-        training: bool | None = None,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
         x = jnp.asarray(x)
         output = self._apply(
             x,
-            key=key,
-            training=_resolve_training(self.training, training),
             broadcast_axes=_feature_broadcast_axes(
                 x.ndim,
                 self.channel_axis,
@@ -329,9 +313,10 @@ class StochasticDepth(Dropout):
         mode: StochasticDepthMode = 'row',
         *,
         batch_axis: int = 0,
+        rngs: Rngs | None = None,
         shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
-        super().__init__(p, shard_mode=shard_mode)
+        super().__init__(p, rngs=rngs, shard_mode=shard_mode)
         if mode not in {'batch', 'row'}:
             raise ValueError("mode must be 'batch' or 'row'")
         self.mode = mode
@@ -341,8 +326,6 @@ class StochasticDepth(Dropout):
         self,
         x: jax.Array,
         *,
-        key: PRNGKey | None = None,
-        training: bool | None = None,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
         x = jnp.asarray(x)
@@ -359,8 +342,6 @@ class StochasticDepth(Dropout):
             )
         output = self._apply(
             x,
-            key=key,
-            training=_resolve_training(self.training, training),
             broadcast_axes=broadcast_axes,
         )
         return _constrain(output, out_sharding, self.shard_mode)

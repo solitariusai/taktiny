@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from taktiny.maestro._livret import repertoire
-from taktiny.cosettes.common import TransformerCausalLM
+from taktiny.cosettes.transformers._ordinario import TransformerCausalLM
 from taktiny.cosettes.transformers.llama import LlamaDecoderLayer
 from taktiny import nn
 

@@ -17,8 +17,6 @@
 
 """Implementation of Sparse Flash Attention, a.k.a. "Splash" attention."""
 from __future__ import annotations
-
-
 from collections.abc import Callable
 import dataclasses
 import enum
@@ -26,7 +24,6 @@ import functools
 import json
 import math
 from typing import Any
-
 import jax
 from jax import ad_checkpoint
 from jax import lax
@@ -35,10 +32,10 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
+
 from taktiny.kernels.attention.tokamax_splash import base
 from taktiny.kernels.attention.tokamax_splash import splash_attention_mask as mask_lib
 from taktiny.kernels.attention.tokamax_splash import splash_attention_mask_info as mask_info_lib
-
 
 P = jax.P
 MaskInfo = mask_info_lib.MaskInfo
@@ -53,13 +50,10 @@ LOG2E = math.log2(math.e)
 LOG2E_INV = 1 / LOG2E
 
 # mypy: ignore-errors
-
-
 def _not(x: jax.Array | bool) -> jax.Array | bool:
   if isinstance(x, jax.Array):
     return jnp.logical_not(x)
   return not x
-
 
 def _base2_stats_to_natural_base(stats: dict[str, jax.Array], mask_value: float) -> dict[str, jax.Array]:
   """Converts base-2 residual stats to natural-base user stats."""
@@ -75,11 +69,8 @@ def _base2_stats_to_natural_base(stats: dict[str, jax.Array], mask_value: float)
   )
   return stats
 
-
 SegmentIds = base.SegmentIds
-
 MaskFunctionType = Callable[..., jax.Array]
-
 
 def get_kernel_name(is_mqa: bool, save_residuals: bool, is_segmented: bool, phase: str) -> str:
   """Returns a unique name for all SplashAttention kernel variants."""
@@ -91,21 +82,16 @@ def get_kernel_name(is_mqa: bool, save_residuals: bool, is_segmented: bool, phas
   segments = "_segmented" if is_segmented else ""
   return f"splash_{attention_type}_{phase}{segments}{residuals}"
 
-
 # Splash attention implementation
-
-
 # We use an IntEnum to make it JSON serializable as regen metadata.
 class QKVLayout(enum.IntEnum):
   HEAD_DIM_MINOR = enum.auto()  # [..., seq_len, head_dim]
   SEQ_MINOR = enum.auto()  # [..., head_dim, seq_len]
 
-
 def from_head_minor(vals: tuple[Any, ...], layout: QKVLayout) -> Any:
   if layout == QKVLayout.HEAD_DIM_MINOR:
     return vals
   return (*vals[:-2], vals[-1], vals[-2])
-
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class SplashConfig:
@@ -188,10 +174,7 @@ class SplashConfig:
         fuse_reciprocal=True,
     )
 
-
 to_i32 = lambda x: x.astype(jnp.int32)
-
-
 def _apply_mask_and_soft_cap(
     qk: jax.Array,
     mask_value: float,
@@ -283,7 +266,6 @@ def _apply_mask_and_soft_cap(
   else:
     qk = cap_logits(qk)
   return qk, None
-
 
 def flash_attention_kernel(
     # Prefetched inputs
@@ -500,13 +482,11 @@ def flash_attention_kernel(
       assert max_logits_ref.shape == (bq, NUM_LANES)
       max_logits_ref[...] = m.astype(max_logits_ref.dtype)
 
-
 def _div(dividend: int, divisor: int) -> Any:
   if divisor == 1:
     return dividend
 
   return lax.div(dividend, divisor)
-
 
 def _bytes(x: jax.Array | jax.ShapeDtypeStruct | None) -> int:
   if x is None:
@@ -519,7 +499,6 @@ def _bytes(x: jax.Array | jax.ShapeDtypeStruct | None) -> int:
   else:
     raise ValueError(f"Unsupported dtype: {x.dtype}")
   return math.ceil(math.prod(x.shape) * info(x.dtype).bits / 8)
-
 
 def _splash_attention_forward(
     mask_info: MaskInfo,
@@ -887,7 +866,6 @@ def _splash_attention_forward(
     return out, stats
   return out
 
-
 @partial(
     jax.custom_vjp,
     nondiff_argnames=(
@@ -997,7 +975,6 @@ def _splash_attention_fwd(
     return (out, stats), residuals
   else:
     return out, residuals
-
 
 def _flash_attention_dq_kernel(
     # Prefetched inputs
@@ -1118,7 +1095,6 @@ def _flash_attention_dq_kernel(
   @pl.when(should_write)
   def end() -> None:
     dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
-
 
 def _flash_attention_dkv_kernel(
     # Prefetched inputs
@@ -1332,7 +1308,6 @@ def _flash_attention_dkv_kernel(
     def _() -> None:
       dk_ref[...] = dk_alias[...] + dk_scratch_ref[...].astype(dk_ref.dtype)
       dv_ref[...] = dv_alias[...] + dv_scratch_ref[...].astype(dv_ref.dtype)
-
 
 def _splash_attention_bwd_dkv(
     q: Any,
@@ -1737,7 +1712,6 @@ def _splash_attention_bwd_dkv(
   dv = dv.astype(v.dtype)
   return dq, dk, dv
 
-
 def _splash_attention_bwd(
     save_residuals: bool,
     mask_value: float,
@@ -1815,10 +1789,7 @@ def _splash_attention_bwd(
       None,  # max_logit_estimate
   )
 
-
 _splash_attention_custom.defvjp(_splash_attention_fwd, _splash_attention_bwd)
-
-
 @partial(
     jax.jit,
     static_argnames=[
@@ -1866,7 +1837,6 @@ def _splash_attention(
       fwd_mask_sparsity=fwd_mask_sparsity,
       dkv_mask_sparsity=dkv_mask_sparsity,
   )
-
 
 @jax.tree_util.register_pytree_node_class
 class SplashAttentionKernel:
@@ -1935,7 +1905,6 @@ class SplashAttentionKernel:
     dkv_mask_info = MaskInfo(*dkv_mask_info) if dkv_mask_info is not None else None
     return SplashAttentionKernel(MaskInfo(*fwd_mask_info), dkv_mask_info, **kwargs)
 
-
 def _make_splash_attention(
     mask: np.ndarray | mask_lib.Mask,
     *,
@@ -1998,7 +1967,6 @@ def _make_splash_attention(
       fwd_mask_sparsity=fwd_mask_sparsity,
       dkv_mask_sparsity=dkv_mask_sparsity,
   )
-
 
 def _make_dynamic_splash_attention(
     mask: jax.Array,
@@ -2088,7 +2056,6 @@ def _make_dynamic_splash_attention(
   kernel_spec = SplashAttentionKernel(*out_specs, **kwargs)
 
   return (kernel, kernel_spec)
-
 
 make_splash_mha = partial(_make_splash_attention, is_mqa=False)
 make_splash_mqa = partial(_make_splash_attention, is_mqa=True)

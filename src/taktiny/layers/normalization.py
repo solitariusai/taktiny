@@ -20,8 +20,7 @@ import jax.numpy as jnp
 
 from taktiny import nn
 from taktiny.nn.linear import default_linear_initializer
-from taktiny.nn.utils import (
-    _canonical_axes,
+from taktiny.nn._continuo import (
     _constrain,
     _normalize_shape,
     _resolve_activation,
@@ -44,6 +43,8 @@ NormModule: TypeAlias = (
 Normalizer: TypeAlias = (
     NormType | NormModule | Callable[[jax.Array], jax.Array]
 )
+
+# TODO: AdaXNorm normalize complex
 class AdaXNorm(nn.Module):
     """
     Normalize activations and project a conditioning tensor.
@@ -68,6 +69,8 @@ class AdaXNorm(nn.Module):
         dtype: DType = jnp.float32,
         rngs: nn.Rngs,
         initializer: Initializer = default_linear_initializer,
+        zero_init: bool = False,
+        project: bool = True,
         quant: Any = None,
         dot_general: Any = None,
         axis_names: AxisNames | None = None,
@@ -88,7 +91,23 @@ class AdaXNorm(nn.Module):
             if normalized_name not in {'layernorm', 'rmsnorm'}:
                 raise ValueError(f'unsupported norm: {norm!r}')
             self.norm_type = normalized_name
-            self.normalizer = None
+            if normalized_name == 'layernorm':
+                self.normalizer = nn.LayerNorm(
+                    None,
+                    eps=eps,
+                    elementwise_affine=False,
+                    bias=False,
+                    axes=axes,
+                    shard_mode=shard_mode,
+                )
+            else:
+                self.normalizer = nn.RMSNorm(
+                    None,
+                    eps=eps,
+                    with_scale=False,
+                    axes=axes,
+                    shard_mode=shard_mode,
+                )
         elif isinstance(norm, nn.Module) or callable(norm):
             self.norm_type = 'custom'
             self.normalizer = norm
@@ -99,37 +118,42 @@ class AdaXNorm(nn.Module):
         self.axes = axes
         self.activation = _resolve_activation(activation, allow_none=True)
         self.shard_mode = shard_mode
-        self.linear = nn.Linear(
-            self.embedding_dim,
-            self.out_dim,
-            bias=bias,
-            dtype=dtype,
-            rngs=rngs,
-            initializer=initializer,
-            quant=quant,
-            dot_general=dot_general,
-            axis_names=axis_names,
-            shard_mode=shard_mode,
-        )
+        if not isinstance(zero_init, bool):
+            raise TypeError('zero_init must be a bool')
+        if not isinstance(project, bool):
+            raise TypeError('project must be a bool')
+        self.zero_init = zero_init
+        self.project = project
+        if project:
+            if zero_init:
+                initializer = jax.nn.initializers.zeros
+            self.linear = nn.Linear(
+                self.embedding_dim,
+                self.out_dim,
+                bias=bias,
+                dtype=dtype,
+                rngs=rngs,
+                initializer=initializer,
+                quant=quant,
+                dot_general=dot_general,
+                axis_names=axis_names,
+                shard_mode=shard_mode,
+            )
+        else:
+            if self.out_dim != (self.embedding_dim,):
+                raise ValueError(
+                    'out_dim must equal embedding_dim when project=False'
+                )
+            self.linear = None
 
     def _normalize(self, x: jax.Array) -> jax.Array:
-        if self.normalizer is not None:
-            normalized = self.normalizer(x)
-            if normalized.shape != x.shape:
-                raise ValueError(
-                    'a custom normalizer must preserve the input shape; '
-                    f'got {x.shape} -> {normalized.shape}'
-                )
-            return normalized
-
-        axes = _canonical_axes(self.axes, x.ndim)
-        if self.norm_type == 'layernorm':
-            mean = jnp.mean(x, axis=axes, keepdims=True)
-            variance = jnp.var(x, axis=axes, keepdims=True)
-            return (x - mean) * jax.lax.rsqrt(variance + self.eps)
-
-        variance = jnp.mean(jnp.square(x), axis=axes, keepdims=True)
-        return x * jax.lax.rsqrt(variance + self.eps)
+        normalized = self.normalizer(x)
+        if normalized.shape != x.shape:
+            raise ValueError(
+                'a normalizer must preserve the input shape; '
+                f'got {x.shape} -> {normalized.shape}'
+            )
+        return normalized
 
     def __call__(
         self,
@@ -154,15 +178,26 @@ class AdaXNorm(nn.Module):
             out_sharding,
             self.shard_mode,
         )
-        modulation = self.linear(
-            self.activation(conditioning),
-            out_sharding=modulation_sharding,
-        )
+        if self.linear is None:
+            modulation = _constrain(
+                conditioning,
+                modulation_sharding,
+                self.shard_mode,
+            )
+        else:
+            modulation = self.linear(
+                self.activation(conditioning),
+                out_sharding=modulation_sharding,
+            )
         return normalized, modulation
 
     def extra_repr(self) -> str:
         output = 'x'.join(map(str, self.out_dim))
-        return f'{self.embedding_dim} -> {output}, norm={self.norm_type}'
+        projection = 'projected' if self.project else 'precomputed'
+        return (
+            f'{self.embedding_dim} -> {output}, norm={self.norm_type}, '
+            f'{projection}'
+        )
 
 
 class SpatialNorm(nn.Module):

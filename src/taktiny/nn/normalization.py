@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 
 from taktiny.nn.module import Module, Parameter
-from taktiny.nn.utils import (
+from taktiny.nn._continuo import (
     _canonical_axis,
     _canonical_axes,
     _constrain,
@@ -105,11 +105,11 @@ class LayerNorm(Module):
 
     def __init__(
         self,
-        normalized_shape: int | Sequence[int],
+        normalized_shape: int | Sequence[int] | None,
         eps: float = 1e-5,
+        *,
         elementwise_affine: bool = True,
         dtype: DType = jnp.float32,
-        *,
         bias: bool = True,
         axes: Axes | None = None,
         initializer: Initializer = jnp.ones,
@@ -117,20 +117,33 @@ class LayerNorm(Module):
         axis_names: AxisNames | None = None,
         shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
-        self.normalized_shape = _normalize_shape(
-            normalized_shape,
-            'normalized_shape',
+        self.normalized_shape = (
+            None
+            if normalized_shape is None
+            else _normalize_shape(normalized_shape, 'normalized_shape')
         )
         self.hidden_size = (
-            self.normalized_shape[0]
-            if len(self.normalized_shape) == 1
-            else self.normalized_shape
+            None
+            if self.normalized_shape is None
+            else (
+                self.normalized_shape[0]
+                if len(self.normalized_shape) == 1
+                else self.normalized_shape
+            )
         )
         self.eps = _validate_positive_float(eps, 'eps')
         self.elementwise_affine = bool(elementwise_affine)
+        if self.normalized_shape is None and self.elementwise_affine:
+            raise ValueError(
+                'normalized_shape is required when elementwise_affine=True'
+            )
         self.has_bias = self.elementwise_affine and bool(bias)
         requested_axes = (
-            _default_axes(len(self.normalized_shape))
+            (
+                -1
+                if self.normalized_shape is None
+                else _default_axes(len(self.normalized_shape))
+            )
             if axes is None
             else axes
         )
@@ -139,14 +152,28 @@ class LayerNorm(Module):
             if isinstance(requested_axes, int)
             else tuple(requested_axes)
         )
-        if len(self.axes) != len(self.normalized_shape):
+        if (
+            self.normalized_shape is not None
+            and len(self.axes) != len(self.normalized_shape)
+        ):
             raise ValueError(
                 'axes and normalized_shape must have the same number '
                 'of dimensions'
             )
         self.shard_mode = shard_mode
 
-        names = _parameter_axis_names(axis_names, len(self.normalized_shape))
+        if self.normalized_shape is None and axis_names is not None:
+            raise ValueError(
+                'axis_names requires a fixed normalized_shape'
+            )
+        names = (
+            None
+            if self.normalized_shape is None
+            else _parameter_axis_names(
+                axis_names,
+                len(self.normalized_shape),
+            )
+        )
         if self.elementwise_affine:
             self.weight = Parameter(
                 initializer(self.normalized_shape, dtype=dtype)
@@ -168,10 +195,10 @@ class LayerNorm(Module):
         x = jnp.asarray(x)
         _validate_floating(x)
         axes = _canonical_axes(self.axes, x.ndim)
-        _validate_input_shape(x, self.normalized_shape, axes)
+        if self.normalized_shape is not None:
+            _validate_input_shape(x, self.normalized_shape, axes)
         input_dtype = x.dtype
         value = _statistics_value(x)
-
         mean = jnp.mean(value, axis=axes, keepdims=True)
         variance = jnp.var(value, axis=axes, keepdims=True)
         output = (value - mean) * jax.lax.rsqrt(variance + self.eps)
@@ -189,12 +216,15 @@ class LayerNorm(Module):
                     axes,
                 )
                 output = output + bias
-
         output = output.astype(input_dtype)
         return _constrain(output, out_sharding, self.shard_mode)
 
     def extra_repr(self) -> str:
-        shape = 'x'.join(map(str, self.normalized_shape))
+        shape = (
+            'dynamic'
+            if self.normalized_shape is None
+            else 'x'.join(map(str, self.normalized_shape))
+        )
         return f'{shape}, eps={self.eps:g}, affine={self.elementwise_affine}'
 
 
@@ -203,29 +233,45 @@ class RMSNorm(Module):
 
     def __init__(
         self,
-        normalized_shape: int | Sequence[int],
+        normalized_shape: int | Sequence[int] | None,
         eps: float = 1e-5,
+        *,
         dtype: DType = jnp.float32,
         with_scale: bool = True,
+        bias: bool = False,
         axis_names: AxisNames | None = None,
         shard_mode: ShardMode = ShardMode.AUTO,
         initializer: Initializer = jnp.ones,
-        *,
+        bias_initializer: Initializer = jnp.zeros,
         axes: Axes | None = None,
     ) -> None:
-        self.normalized_shape = _normalize_shape(
-            normalized_shape,
-            'normalized_shape',
+        self.normalized_shape = (
+            None
+            if normalized_shape is None
+            else _normalize_shape(normalized_shape, 'normalized_shape')
         )
         self.hidden_size = (
-            self.normalized_shape[0]
-            if len(self.normalized_shape) == 1
-            else self.normalized_shape
+            None
+            if self.normalized_shape is None
+            else (
+                self.normalized_shape[0]
+                if len(self.normalized_shape) == 1
+                else self.normalized_shape
+            )
         )
         self.eps = _validate_positive_float(eps, 'eps')
         self.with_scale = bool(with_scale)
+        self.has_bias = bool(bias)
+        if self.normalized_shape is None and (self.with_scale or self.has_bias):
+            raise ValueError(
+                'normalized_shape is required for RMSNorm parameters'
+            )
         requested_axes = (
-            _default_axes(len(self.normalized_shape))
+            (
+                -1
+                if self.normalized_shape is None
+                else _default_axes(len(self.normalized_shape))
+            )
             if axes is None
             else axes
         )
@@ -234,20 +280,40 @@ class RMSNorm(Module):
             if isinstance(requested_axes, int)
             else tuple(requested_axes)
         )
-        if len(self.axes) != len(self.normalized_shape):
+        if (
+            self.normalized_shape is not None
+            and len(self.axes) != len(self.normalized_shape)
+        ):
             raise ValueError(
                 'axes and normalized_shape must have the same number '
                 'of dimensions'
             )
         self.shard_mode = shard_mode
 
-        names = _parameter_axis_names(axis_names, len(self.normalized_shape))
+        if self.normalized_shape is None and axis_names is not None:
+            raise ValueError(
+                'axis_names requires a fixed normalized_shape'
+            )
+        names = (
+            None
+            if self.normalized_shape is None
+            else _parameter_axis_names(
+                axis_names,
+                len(self.normalized_shape),
+            )
+        )
         if self.with_scale:
             self.weight = Parameter(
                 initializer(self.normalized_shape, dtype=dtype)
             )
             if names is not None:
                 self.weight.axis_names = names
+        if self.has_bias:
+            self.bias = Parameter(
+                bias_initializer(self.normalized_shape, dtype=dtype)
+            )
+            if names is not None:
+                self.bias.axis_names = names
 
     def __call__(
         self,
@@ -257,10 +323,10 @@ class RMSNorm(Module):
         x = jnp.asarray(x)
         _validate_floating(x)
         axes = _canonical_axes(self.axes, x.ndim)
-        _validate_input_shape(x, self.normalized_shape, axes)
+        if self.normalized_shape is not None:
+            _validate_input_shape(x, self.normalized_shape, axes)
         input_dtype = x.dtype
         value = _statistics_value(x)
-
         variance = jnp.mean(jnp.square(value), axis=axes, keepdims=True)
         output = value * jax.lax.rsqrt(variance + self.eps)
         if self.with_scale:
@@ -270,13 +336,26 @@ class RMSNorm(Module):
                 axes,
             )
             output = output * weight
-
+        if self.has_bias:
+            bias = _broadcast_parameter(
+                self.bias.value.astype(value.dtype),
+                x.ndim,
+                axes,
+            )
+            output = output + bias
         output = output.astype(input_dtype)
         return _constrain(output, out_sharding, self.shard_mode)
 
     def extra_repr(self) -> str:
-        shape = 'x'.join(map(str, self.normalized_shape))
-        return f'{shape}, eps={self.eps:g}, scale={self.with_scale}'
+        shape = (
+            'dynamic'
+            if self.normalized_shape is None
+            else 'x'.join(map(str, self.normalized_shape))
+        )
+        return (
+            f'{shape}, eps={self.eps:g}, scale={self.with_scale}, '
+            f'bias={self.has_bias}'
+        )
 
 
 class BatchNorm(Module):
@@ -292,11 +371,11 @@ class BatchNorm(Module):
         self,
         num_features: int,
         eps: float = 1e-5,
+        *,
         momentum: float | None = 0.1,
         affine: bool = True,
         track_running_stats: bool = True,
         dtype: DType | None = None,
-        *,
         bias: bool = True,
         channel_axis: int = -1,
         initializer: Initializer = jnp.ones,
@@ -494,9 +573,9 @@ class GroupNorm(Module):
         num_groups: int,
         num_channels: int,
         eps: float = 1e-5,
+        *,
         affine: bool = True,
         dtype: DType | None = None,
-        *,
         bias: bool = True,
         channel_axis: int = -1,
         batch_axis: int | None = 0,

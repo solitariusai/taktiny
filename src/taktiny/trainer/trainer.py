@@ -1841,8 +1841,8 @@ class Trainer:
             progress_columns.append(TimeRemainingColumn())
         progress_columns.append(
             TextColumn(
-                "• [bold magenta]Loss: {task.fields[loss]:.4f}"
-                "[/bold magenta]"
+                "• [dim]Loss:[/dim] "
+                "[bold white]{task.fields[loss]:.4f}[/bold white]"
             )
         )
 
@@ -2019,17 +2019,17 @@ class Trainer:
                         else 'non-finite'
                     )
                     learning_rate_text = (
-                        f' ┃ LR: [bold green]'
-                        f'{learning_rate:.3e}[/bold green]'
+                        f' [dim]┃ LR: {learning_rate:.3e}[/dim]'
                         if learning_rate is not None
                         else ''
                     )
                     progress.console.print(
                         f"[bold cyan]Epoch {current_epoch:<3}[/bold cyan] ┃ "
-                        f"[bold yellow]Step {step:<6}[/bold yellow] ┃ "
-                        f"Loss: [bold magenta]{loss_text}"
-                        f"[/bold magenta]{learning_rate_text} ┃ "
-                        f"[dim]{iteration_time:>11}[/dim]"
+                        f"[bold cyan]Step {step:<6}[/bold cyan] "
+                        f"[dim]┃ Loss:[/dim] "
+                        f"[bold white]{loss_text}[/bold white]"
+                        f"{learning_rate_text} [dim]┃ "
+                        f"{iteration_time:>11}[/dim]"
                     )
                     start_time = time.time()
                     steps_since_log = 0
@@ -2048,10 +2048,11 @@ class Trainer:
                         epoch=current_epoch,
                     )
                     progress.console.print(
-                        f"[bold blue]Evaluation[/bold blue] ┃ "
-                        f"[bold yellow]Step {step:<6}[/bold yellow] ┃ "
-                        f"Loss: [bold magenta]"
-                        f"{metrics['eval_loss']:.4f}[/bold magenta]"
+                        f"[bold cyan]Evaluation[/bold cyan] ┃ "
+                        f"[bold cyan]Step {step:<6}[/bold cyan] "
+                        f"[dim]┃ Loss:[/dim] "
+                        f"[bold white]{metrics['eval_loss']:.4f}"
+                        f"[/bold white]"
                     )
                     if (
                         is_best
@@ -2226,10 +2227,11 @@ class Trainer:
                         epoch=epoch,
                     )
                     progress.console.print(
-                        f"[bold blue]Evaluation[/bold blue] ┃ "
-                        f"[bold yellow]Epoch {epoch:<3}[/bold yellow] ┃ "
-                        f"Loss: [bold magenta]"
-                        f"{metrics['eval_loss']:.4f}[/bold magenta]"
+                        f"[bold cyan]Evaluation[/bold cyan] ┃ "
+                        f"[bold cyan]Epoch {epoch:<3}[/bold cyan] "
+                        f"[dim]┃ Loss:[/dim] "
+                        f"[bold white]{metrics['eval_loss']:.4f}"
+                        f"[/bold white]"
                     )
                     if (
                         is_best
@@ -2279,17 +2281,17 @@ class Trainer:
                     f'{loss:<7.4f}' if loss is not None else 'non-finite'
                 )
                 learning_rate_text = (
-                    f' ┃ LR: [bold green]'
-                    f'{learning_rate:.3e}[/bold green]'
+                    f' [dim]┃ LR: {learning_rate:.3e}[/dim]'
                     if learning_rate is not None
                     else ''
                 )
                 progress.console.print(
                     f"[bold cyan]Epoch {epoch:<3}[/bold cyan] ┃ "
-                    f"[bold yellow]Step {step:<6}[/bold yellow] ┃ "
-                    f"Loss: [bold magenta]{loss_text}"
-                    f"[/bold magenta]{learning_rate_text} ┃ "
-                    f"[dim]{_format_iteration_time(seconds_per_step):>11}"
+                    f"[bold cyan]Step {step:<6}[/bold cyan] "
+                    f"[dim]┃ Loss:[/dim] "
+                    f"[bold white]{loss_text}[/bold white]"
+                    f"{learning_rate_text} [dim]┃ "
+                    f"{_format_iteration_time(seconds_per_step):>11}"
                     f"[/dim]"
                 )
                 if saving_enabled:

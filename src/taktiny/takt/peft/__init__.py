@@ -13,7 +13,7 @@
 # limitations under the License.
 """Parameter-efficient fine-tuning transformations."""
 
-from ._config import LoraConfig, PeftConfig
+from .config import LoraConfig, PeftConfig
 from . import lora as _lora
 
 __all__ = ['PeftConfig', 'LoraConfig']

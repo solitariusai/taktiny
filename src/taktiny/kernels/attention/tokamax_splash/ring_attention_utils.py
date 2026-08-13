@@ -14,10 +14,7 @@
 # limitations under the License.
 """Shared helpers for Tokamax ring-family Splash attention kernels."""
 from __future__ import annotations
-
 from typing import Any
-
-
 import jax
 from jax import lax
 import jax.numpy as jnp
@@ -25,7 +22,6 @@ import numpy as np
 from taktiny.kernels.attention.tokamax_splash import splash_attention_mask_info as mask_info_lib
 
 MaskInfo = mask_info_lib.MaskInfo
-
 
 def dynamic_slice_mask_info(mask_info: MaskInfo, kv_shard_idx: jax.Array, ring_size: int) -> MaskInfo:
   """Slices MaskInfo for the current ring step."""
@@ -48,7 +44,6 @@ def dynamic_slice_mask_info(mask_info: MaskInfo, kv_shard_idx: jax.Array, ring_s
       q_sequence=mask_info.q_sequence,  # Q sequence stays stationary
       kv_sequence=slice_if_exists(mask_info.kv_sequence),
   )
-
 
 def offset_q_sequence_for_kv_shard(mask_info: MaskInfo, kv_shard_idx: jax.Array, kv_seq_len: int) -> MaskInfo:
   """Converts lazy mask Q ids to the current local KV coordinate frame."""
@@ -75,17 +70,14 @@ def has_no_active_blocks(mask_info: MaskInfo) -> jax.Array | bool:
   has_no_compute_blocks = jnp.all(block_mask == 0)
   return jnp.logical_or(has_no_scheduled_blocks, has_no_compute_blocks)
 
-
 def has_empty_attention_rows(logsumexp: jax.Array, max_logits: jax.Array, mask_value: float) -> jax.Array:
   mask_value = jnp.asarray(mask_value, dtype=logsumexp.dtype)
   return jnp.logical_and(logsumexp == mask_value, max_logits == mask_value)
-
 
 def mask_sparsity(mask_info: MaskInfo) -> float:
   if mask_info.block_mask is None:
     return 1.0
   return float(np.mean(mask_info.block_mask > 0))
-
 
 def has_axis(axis_name: str) -> bool:
   try:

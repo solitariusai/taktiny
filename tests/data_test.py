@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 from datasets import Dataset
 
-from taktiny.data_utils.data import BatchMap, DatasetUtils, Map
+from taktiny.data._prelude import BatchMap, DatasetUtils, Map
 
 
 def test_map_requires_callable():

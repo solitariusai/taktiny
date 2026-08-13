@@ -23,7 +23,7 @@ from collections.abc import (
     Sequence,
     ValuesView,
 )
-from typing import Any
+from typing import Any, overload
 import jax
 import jax.numpy as jnp
 from taktiny import transforms as tt
@@ -92,6 +92,46 @@ def _stack_modules(modules: Iterable[Module]) -> tuple[Module, int]:
     return stacked, len(modules)
 
 
+def _stack_compatible(reference: Module, module: Module) -> bool:
+    if type(module) is not type(reference):
+        return False
+    if jax.tree_util.tree_structure(module) != jax.tree_util.tree_structure(
+        reference
+    ):
+        return False
+
+    reference_leaves = jax.tree_util.tree_leaves(reference)
+    leaves = jax.tree_util.tree_leaves(module)
+    if len(reference_leaves) != len(leaves):
+        return False
+    for reference_leaf, leaf in zip(reference_leaves, leaves):
+        if getattr(reference_leaf, 'shape', None) != getattr(
+            leaf,
+            'shape',
+            None,
+        ):
+            return False
+        if getattr(reference_leaf, 'dtype', None) != getattr(
+            leaf,
+            'dtype',
+            None,
+        ):
+            return False
+    return True
+
+
+def _group_stack_compatible(
+    modules: Sequence[Module],
+) -> tuple[tuple[Module, ...], ...]:
+    groups: list[list[Module]] = []
+    for module in modules:
+        if not groups or not _stack_compatible(groups[-1][0], module):
+            groups.append([module])
+        else:
+            groups[-1].append(module)
+    return tuple(tuple(group) for group in groups)
+
+
 def _validate_module_sequence(modules: Sequence[Module]) -> None:
     if not isinstance(modules, Sequence):
         raise TypeError(
@@ -109,7 +149,15 @@ class List(Module):
         _validate_module_sequence(modules)
         self.layers = list(modules)
 
-    def __getitem__(self, idx: int) -> Module:
+    @overload
+    def __getitem__(self, idx: int) -> Module: ...
+
+    @overload
+    def __getitem__(self, idx: slice) -> List: ...
+
+    def __getitem__(self, idx: int | slice) -> Module | List:
+        if isinstance(idx, slice):
+            return List(self.layers[idx])
         return self.layers[idx]
 
     def __len__(self) -> int:
@@ -174,7 +222,15 @@ class Sequential(Module):
         _validate_module_sequence(modules)
         self.layers = tuple(modules)
 
-    def __getitem__(self, idx: int) -> Module:
+    @overload
+    def __getitem__(self, idx: int) -> Module: ...
+
+    @overload
+    def __getitem__(self, idx: slice) -> Sequential: ...
+
+    def __getitem__(self, idx: int | slice) -> Module | Sequential:
+        if isinstance(idx, slice):
+            return Sequential(self.layers[idx])
         return self.layers[idx]
 
     def __len__(self) -> int:
@@ -210,10 +266,30 @@ class SeqStack(Module):
             raise ValueError('unroll must be a positive integer or boolean')
         if not isinstance(split_transpose, bool):
             raise TypeError('split_transpose must be a boolean')
-        self.stacked, self.num_stack = _stack_modules(modules)
+        modules = tuple(modules)
+        _validate_module_sequence(modules)
+        if not modules:
+            raise ValueError('modules must contain at least one Module')
+
+        groups = _group_stack_compatible(modules)
+        self.num_stack = len(modules)
         self.reverse = reverse
         self.unroll = unroll
         self.split_transpose = split_transpose
+        if len(groups) == 1:
+            self.stacked, _ = _stack_modules(groups[0])
+            self.group_sizes = (self.num_stack,)
+        else:
+            self.groups = [
+                SeqStack(
+                    group,
+                    reverse=reverse,
+                    unroll=unroll,
+                    split_transpose=split_transpose,
+                )
+                for group in groups
+            ]
+            self.group_sizes = tuple(len(group) for group in groups)
 
     def __len__(self) -> int:
         return self.num_stack
@@ -225,6 +301,36 @@ class SeqStack(Module):
         *args: Any,
         **kwargs: Any,
     ) -> tuple[PyTree, PyTree]:
+        if hasattr(self, 'groups'):
+            groups = reversed(self.groups) if self.reverse else self.groups
+            group_outputs = []
+            for group in groups:
+                carry, outputs = group(f, carry, *args, **kwargs)
+                group_outputs.append(outputs)
+
+            if all(outputs is None for outputs in group_outputs):
+                return carry, None
+            if any(outputs is None for outputs in group_outputs):
+                raise ValueError(
+                    'all SeqStack groups must return compatible outputs'
+                )
+            reference_structure = jax.tree_util.tree_structure(
+                group_outputs[0]
+            )
+            if any(
+                jax.tree_util.tree_structure(outputs) != reference_structure
+                for outputs in group_outputs[1:]
+            ):
+                raise ValueError(
+                    'all SeqStack groups must return compatible outputs'
+                )
+            if self.reverse:
+                group_outputs.reverse()
+            return carry, jax.tree.map(
+                lambda *values: jnp.concatenate(values, axis=0),
+                *group_outputs,
+            )
+
         @tt.scan(
             length=self.num_stack,
             reverse=self.reverse,
@@ -237,7 +343,10 @@ class SeqStack(Module):
         return apply_fn(carry, self.stacked, *args)
 
     def extra_repr(self) -> str:
-        return f"{self.num_stack}"
+        if hasattr(self, 'groups'):
+            groups = ', '.join(map(str, self.group_sizes))
+            return f'{self.num_stack}, groups=({groups})'
+        return f'{self.num_stack}'
 
 class Stack(Module):
     def __init__(

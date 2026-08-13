@@ -7,7 +7,7 @@ from safetensors.numpy import save_file
 
 from taktiny import Takt, nn
 from taktiny.takt import _prelude as takt_prelude
-from taktiny.cosettes._base import PretrainedModel
+from taktiny.cosettes._overture import PretrainedModel
 from taktiny.peft import LoraConfig
 
 

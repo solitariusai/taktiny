@@ -1,7 +1,3 @@
-from __future__ import annotations
-
-from typing import Any
-
 # Copyright 2026 Shinapri
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,273 +11,484 @@ from typing import Any
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# DEPRECATED / LEGACY
-# TODO(refactor).
+"""FLUX.2 transformer architecture components."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+import typing as tp
+
 import jax
 import jax.numpy as jnp
-from dataclasses import dataclass
 
+from taktiny import layers as ly
 from taktiny import nn
-from taktiny.layers.attention import JointAttention, Attention
-from taktiny.layers.ffn import FusedGateMLP
-from taktiny.layers.positional_embedding import (
-    SinusoidalPositionalEmbedding,
-    rotate_half,
+from taktiny.cosettes._continuo import (
+    _config_value,
+    combine_joint_positions as _combine_positions,
+)
+from taktiny.cosettes.transformers._ordinario import (
+    GatedParallelTransformerLayer,
+    JointTransformerLayer,
+)
+from taktiny.maestro.config import ModelConfig
+from taktiny.utils.typing import (
+    Activation,
+    AxisNames,
+    DType,
+    ShardMode,
+    Sharding,
 )
 
 
-def get_1d_rotary_pos_embed(dim: int, pos: jax.Array, theta: int = 10000) -> tuple[Any, ...]:
-    half_dim = dim // 2
-    inv_freq = 1.0 / (theta ** (jnp.arange(0, half_dim, dtype=jnp.float32) / half_dim))
-    freqs = jnp.einsum("i,j->ij", pos, inv_freq)
-    return jnp.cos(freqs), jnp.sin(freqs)
+def _flux2_dimensions(config: ModelConfig) -> tuple[int, int, int, int]:
+    num_heads = _config_value(config, 'num_attention_heads')
+    head_dim = _config_value(config, 'attention_head_dim', 'head_dim')
+    hidden_size = _config_value(config, 'hidden_size', 'inner_dim', 'dim')
+    if hidden_size is None and num_heads is not None and head_dim is not None:
+        hidden_size = num_heads * head_dim
 
-class Flux2PosEmbed(nn.Module):
-    def __init__(self, theta: int, axes_dim: tuple[int, ...]) -> None:
-        self.theta = theta
-        self.axes_dim = axes_dim
+    dimensions = {
+        'num_attention_heads': num_heads,
+        'attention_head_dim': head_dim,
+        'hidden_size': hidden_size,
+    }
+    missing = [name for name, value in dimensions.items() if value is None]
+    if missing:
+        raise ValueError(
+            'Missing required FLUX.2 config values: ' + ', '.join(missing)
+        )
+    if not all(
+        isinstance(value, int) and value > 0
+        for value in dimensions.values()
+    ):
+        raise ValueError('FLUX.2 dimensions must be positive integers')
+    if hidden_size != num_heads * head_dim:
+        raise ValueError(
+            'hidden_size must equal num_attention_heads * attention_head_dim'
+        )
 
-    def __call__(self, ids: jax.Array) -> tuple[jax.Array, jax.Array]:
-        cos_out = []
-        sin_out = []
-        for i in range(len(self.axes_dim)):
-            cos, sin = get_1d_rotary_pos_embed(
-                self.axes_dim[i],
-                ids[..., i].astype(jnp.float32),
-                theta=self.theta,
-            )
-            cos_out.append(jnp.repeat(cos, 2, axis=-1))
-            sin_out.append(jnp.repeat(sin, 2, axis=-1))
+    intermediate_size = _config_value(config, 'intermediate_size')
+    if intermediate_size is None:
+        intermediate_size = int(
+            hidden_size * _config_value(config, 'mlp_ratio', default=3.0)
+        )
+    if not isinstance(intermediate_size, int) or intermediate_size <= 0:
+        raise ValueError('intermediate_size must be a positive integer')
+    return hidden_size, num_heads, head_dim, intermediate_size
 
-        freqs_cos = jnp.concatenate(cos_out, axis=-1)
-        freqs_sin = jnp.concatenate(sin_out, axis=-1)
-        return freqs_cos, freqs_sin
+
+def _flux2_position_embedding(config: ModelConfig) -> nn.Module | None:
+    configured = _config_value(config, 'pos_emb', 'position_embedding')
+    if configured is not None:
+        if not isinstance(configured, nn.Module):
+            raise TypeError('configured FLUX.2 position embedding must be a Module')
+        return configured
+    axes_dim = _config_value(config, 'axes_dims_rope')
+    if axes_dim is None:
+        return None
+    return Flux2RotaryEmbedding(
+        theta=_config_value(config, 'rope_theta', default=2000.0),
+        axes_dim=axes_dim,
+    )
+
+
+class Flux2RotaryEmbedding(ly.MultiAxisRotaryEmbedding):
+    """Apply FLUX.2 multi-axis rotary embeddings to projected Q and K."""
+
+    def __init__(
+        self,
+        theta: float = 2000.0,
+        axes_dim: Sequence[int] = (32, 32, 32, 32),
+    ) -> None:
+        super().__init__(axes_dim, theta=theta)
+
 
 class Flux2Modulation(nn.Module):
-    def __init__(self, dim: int, mod_param_sets: int = 2, bias: bool = False, seed: nn.Rngs | None = None) -> None:
-        self.mod_param_sets = mod_param_sets
-        self.linear = nn.Linear(dim, dim * 3 * self.mod_param_sets, bias=bias, seed=seed)
+    """Create shared FLUX.2 shift, scale, and gate parameters."""
 
-    def __call__(self, temb: jax.Array) -> tuple[tuple[jax.Array, jax.Array, jax.Array], ...]:
-        mod = jax.nn.silu(temb)
-        mod = self.linear(mod)
-
-        # Split into mod_param_sets
-        # Each set has 3 chunks: shift, scale, gate
-        chunks = tuple(jnp.split(mod, self.mod_param_sets * 3, axis=-1))
-        return tuple(chunks[i * 3 : (i + 1) * 3] for i in range(self.mod_param_sets))
-
-class JointAttentionBlock(nn.Module):
-    def __init__(self, config: Any, seed: nn.Rngs | None = None) -> None:
-        hidden_size = config.num_attention_heads * config.attention_head_dim
-
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=config.eps)
-        self.norm1_context = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=config.eps)
-
-        self.attn = JointAttention(
-            hidden_size1=hidden_size,
-            hidden_size2=hidden_size,
-            num_heads=config.num_attention_heads,
-            head_dim=config.attention_head_dim,
-            use_qkv_norm=True,
-            rngs=seed,
+    def __init__(
+        self,
+        hidden_size: int,
+        modulation_sets: int = 2,
+        *,
+        bias: bool = False,
+        dtype: DType | None = None,
+        rngs: nn.Rngs,
+        axis_names: AxisNames | None = None,
+        shard_mode: ShardMode = ShardMode.AUTO,
+        quant: tp.Any = None,
+        dot_general: tp.Any = None,
+    ) -> None:
+        if not isinstance(modulation_sets, int) or modulation_sets <= 0:
+            raise ValueError('modulation_sets must be a positive integer')
+        self.hidden_size = hidden_size
+        self.modulation_sets = modulation_sets
+        self.linear = nn.Linear(
+            hidden_size,
+            hidden_size * 3 * modulation_sets,
+            bias=bias,
+            dtype=dtype,
+            rngs=rngs,
+            axis_names=axis_names,
+            shard_mode=shard_mode,
+            quant=quant,
+            dot_general=dot_general,
         )
-
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=config.eps)
-        self.img_mlp = FusedGateMLP(
-            hidden_size=hidden_size,
-            intermediate_size=int(hidden_size * config.mlp_ratio),
-            activation=jax.nn.silu,
-            bias=False,
-            seed=seed
-        )
-
-        self.norm2_context = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=config.eps)
-        self.txt_mlp = FusedGateMLP(
-            hidden_size=hidden_size,
-            intermediate_size=int(hidden_size * config.mlp_ratio),
-            activation=jax.nn.silu,
-            bias=False,
-            seed=seed
-        )
-
-    def __call__(self, img: jax.Array, txt: jax.Array, mod_img: Any, mod_txt: Any, rope_cos_sin: Any) -> tuple[jax.Array, jax.Array]:
-        (shift_msa, scale_msa, gate_msa), (shift_mlp, scale_mlp, gate_mlp) = mod_img
-        (c_shift_msa, c_scale_msa, c_gate_msa), (c_shift_mlp, c_scale_mlp, c_gate_mlp) = mod_txt
-
-        img_norm = self.norm1(img)
-        img_norm = img_norm * (1 + scale_msa[:, None, :]) + shift_msa[:, None, :]
-
-        txt_norm = self.norm1_context(txt)
-        txt_norm = txt_norm * (1 + c_scale_msa[:, None, :]) + c_shift_msa[:, None, :]
-
-        cos, sin = rope_cos_sin
-
-        def apply_rope(q: Any, k: Any, position_idx: int | None=None) -> tuple[Any, ...]:
-            q_embed = (q * cos[:, None, None, :]) + (rotate_half(q) * sin[:, None, None, :])
-            k_embed = (k * cos[:, None, None, :]) + (rotate_half(k) * sin[:, None, None, :])
-            return q_embed, k_embed
-
-        self.attn.pos_emb = apply_rope
-
-        img_attn, txt_attn = self.attn(img_norm, txt_norm)
-        img = img + gate_msa[:, None, :] * img_attn
-        txt = txt + c_gate_msa[:, None, :] * txt_attn
-
-        img_norm2 = self.norm2(img)
-        img_norm2 = img_norm2 * (1 + scale_mlp[:, None, :]) + shift_mlp[:, None, :]
-        img = img + gate_mlp[:, None, :] * self.img_mlp(img_norm2)
-
-        txt_norm2 = self.norm2_context(txt)
-        txt_norm2 = txt_norm2 * (1 + c_scale_mlp[:, None, :]) + c_shift_mlp[:, None, :]
-        txt = txt + c_gate_mlp[:, None, :] * self.txt_mlp(txt_norm2)
-
-        return img, txt
-
-class SingleStreamBlock(nn.Module):
-    def __init__(self, config: Any, seed: nn.Rngs | None = None) -> None:
-        hidden_size = config.num_attention_heads * config.attention_head_dim
-        self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=config.eps)
-
-        self.attn = Attention(
-            hidden_size=hidden_size,
-            num_heads=config.num_attention_heads,
-            head_dim=config.attention_head_dim,
-            use_qkv_norm=True,
-            bias=False,
-            seed=seed
-        )
-
-        self.mlp = FusedGateMLP(
-            hidden_size=hidden_size,
-            intermediate_size=int(hidden_size * config.mlp_ratio),
-            activation=jax.nn.silu,
-            bias=False,
-            seed=seed
-        )
-
-    def __call__(self, x: jax.Array, mod: Any, rope_cos_sin: Any) -> jax.Array:
-        # SingleStreamBlock uses only 1 set of modulation parameters
-        shift_msa, scale_msa, gate_msa = mod[0]
-
-        x_norm = self.norm(x)
-        x_norm = x_norm * (1 + scale_msa[:, None, :]) + shift_msa[:, None, :]
-
-        cos, sin = rope_cos_sin
-
-        def apply_rope(q: Any, k: Any, position_idx: int | None=None) -> tuple[Any, ...]:
-            q_embed = (q * cos[:, None, None, :]) + (rotate_half(q) * sin[:, None, None, :])
-            k_embed = (k * cos[:, None, None, :]) + (rotate_half(k) * sin[:, None, None, :])
-            return q_embed, k_embed
-
-        self.attn.pos_emb = apply_rope
-
-        attn_out, _ = self.attn(x_norm)
-        mlp_out = self.mlp(x_norm)
-
-        # Parallel residual: gate applies to both attention and MLP output sum
-        x = x + gate_msa[:, None, :] * (attn_out + mlp_out)
-        return x
-
-class Flux2Transformer2DModel(nn.Module):
-    def __init__(self, config: Any, seed: nn.Rngs | None = None) -> None:
-        self.config = config
-        self.inner_dim = config.num_attention_heads * config.attention_head_dim
-        self.out_channels = config.out_channels or config.in_channels
-
-        # Embeddings
-        self.pos_embed = Flux2PosEmbed(theta=config.rope_theta, axes_dim=config.axes_dims_rope)
-
-        self.time_in = nn.Sequential(
-            [
-                SinusoidalPositionalEmbedding(config.timestep_guidance_channels),
-                nn.Linear(config.timestep_guidance_channels, self.inner_dim, bias=False, seed=seed),
-            ]
-        )
-
-        if config.guidance_embeds:
-            self.guidance_in = nn.Sequential(
-                [
-                    SinusoidalPositionalEmbedding(config.timestep_guidance_channels),
-                    nn.Linear(config.timestep_guidance_channels, self.inner_dim, bias=False, seed=seed),
-                ]
-            )
-        else:
-            self.guidance_in = None
-
-        self.x_embedder = nn.Linear(config.in_channels, self.inner_dim, bias=False, seed=seed)
-        self.context_embedder = nn.Linear(config.joint_attention_dim, self.inner_dim, bias=False, seed=seed)
-
-        # Shared Modulations
-        self.double_stream_modulation_img = Flux2Modulation(self.inner_dim, mod_param_sets=2, bias=False, seed=seed)
-        self.double_stream_modulation_txt = Flux2Modulation(self.inner_dim, mod_param_sets=2, bias=False, seed=seed)
-        self.single_stream_modulation = Flux2Modulation(self.inner_dim, mod_param_sets=1, bias=False, seed=seed)
-
-        # Blocks
-        self.transformer_blocks = nn.SeqStack(
-            JointAttentionBlock(config, seed=seed)
-            for _ in range(config.num_layers)
-        )
-        self.single_transformer_blocks = nn.SeqStack(
-            SingleStreamBlock(config, seed=seed)
-            for _ in range(config.num_single_layers)
-        )
-
-        # Output
-        self.norm_out = nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=config.eps)
-        self.proj_out = nn.Linear(self.inner_dim, self.out_channels, bias=True, seed=seed)
 
     def __call__(
         self,
-        hidden_states: jax.Array,
-        encoder_hidden_states: jax.Array,
-        timestep: jax.Array,
-        guidance: jax.Array | None = None,
-        txt_ids: jax.Array | None = None,
-        img_ids: jax.Array | None = None
+        conditioning: jax.Array,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
+        return self.linear(
+            jax.nn.silu(conditioning),
+            out_sharding=out_sharding,
+        )
 
-        img = self.x_embedder(hidden_states)
-        txt = self.context_embedder(encoder_hidden_states)
+    def split(
+        self,
+        modulation: jax.Array,
+    ) -> tuple[tuple[jax.Array, jax.Array, jax.Array], ...]:
+        modulation = jnp.asarray(modulation)
+        if modulation.ndim == 2:
+            modulation = modulation[:, None, :]
+        expected = self.hidden_size * 3 * self.modulation_sets
+        if modulation.ndim != 3 or modulation.shape[-1] != expected:
+            raise ValueError(
+                f'modulation must end in {expected} features, got '
+                f'{modulation.shape}'
+            )
+        chunks = jnp.split(modulation, 3 * self.modulation_sets, axis=-1)
+        return tuple(
+            tuple(chunks[3 * index:3 * (index + 1)])
+            for index in range(self.modulation_sets)
+        )
 
-        # Timestep / Guidance
-        vec = self.time_in(timestep)
-        if self.guidance_in is not None and guidance is not None:
-            vec = vec + self.guidance_in(guidance)
 
-        # Shared Modulations
-        mod_img = self.double_stream_modulation_img(vec)
-        mod_txt = self.double_stream_modulation_txt(vec)
-        mod_single = self.single_stream_modulation(vec)
+class Flux2FeedForward(nn.Module):
+    """FLUX.2 SwiGLU FFN with its gate and value projections fused."""
 
-        # RoPE
-        ids = jnp.concatenate([txt_ids, img_ids], axis=1)
-        rope_cos_sin = self.pos_embed(ids)
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        *,
+        activation: Activation | None = None,
+        dropout: float = 0.0,
+        bias: bool = False,
+        dtype: DType | None = None,
+        rngs: nn.Rngs,
+        input_axis_names: AxisNames | None = None,
+        output_axis_names: AxisNames | None = None,
+        shard_mode: ShardMode = ShardMode.AUTO,
+        quant: tp.Any = None,
+        dot_general: tp.Any = None,
+    ) -> None:
+        del activation
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        options = {
+            'bias': bias,
+            'dtype': dtype,
+            'rngs': rngs,
+            'shard_mode': shard_mode,
+            'quant': quant,
+            'dot_general': dot_general,
+        }
+        self.linear_in = nn.Linear(
+            hidden_size,
+            intermediate_size * 2,
+            axis_names=input_axis_names,
+            **options,
+        )
+        self.dropout = nn.Dropout(
+            dropout,
+            rngs=rngs,
+            shard_mode=shard_mode,
+        )
+        self.linear_out = nn.Linear(
+            intermediate_size,
+            hidden_size,
+            axis_names=output_axis_names,
+            **options,
+        )
 
-        # Joint Blocks
-        def apply_joint(layer: Any, carry: Any, args: Any) -> tuple[Any, ...]:
-            img, txt = carry
-            out_img, out_txt = layer(img, txt, mod_img, mod_txt, rope_cos_sin)
-            return (out_img, out_txt), None
+    def __call__(
+        self,
+        x: jax.Array,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array:
+        gate, value = jnp.split(self.linear_in(x), 2, axis=-1)
+        x = self.dropout(jax.nn.silu(gate) * value)
+        return self.linear_out(x, out_sharding=out_sharding)
 
-        (img, txt), _ = self.transformer_blocks(apply_joint, (img, txt), None)
 
-        # Single Blocks
-        x = jnp.concatenate([txt, img], axis=1)
+class Flux2JointAttention(ly.JointAttention):
+    """Joint attention with FLUX.2's text-then-image token order."""
 
-        def apply_single(layer: Any, carry: Any, args: Any) -> tuple[Any, ...]:
-            return layer(carry, mod_single, rope_cos_sin), None
+    def __call__(
+        self,
+        x1: jax.Array,
+        x2: jax.Array,
+        attention_mask: jax.Array | None = None,
+        attention_bias: jax.Array | None = None,
+        is_causal: bool = False,
+        position_idx: jax.Array | None = None,
+        out_shardings: tuple[Sharding, Sharding] | None = None,
+        kernel: str = 'dot_product',
+        **kernel_kwargs: tp.Any,
+    ) -> tuple[jax.Array, jax.Array]:
+        x1, x2 = self._validate_inputs(x1, x2)
+        context_length = x2.shape[1]
 
-        x, _ = self.single_transformer_blocks(apply_single, x, None)
+        q1, k1, v1 = self.q_proj_1(x1), self.k_proj_1(x1), self.v_proj_1(x1)
+        q2, k2, v2 = self.q_proj_2(x2), self.k_proj_2(x2), self.v_proj_2(x2)
+        if self.q_norm_1 is not None:
+            q1, k1 = self.q_norm_1(q1), self.k_norm_1(k1)
+            q2, k2 = self.q_norm_2(q2), self.k_norm_2(k2)
 
-        # Extract Image features
-        txt_len = txt.shape[1]
-        img = x[:, txt_len:]
+        query = jnp.concatenate((q2, q1), axis=1)
+        key = jnp.concatenate((k2, k1), axis=1)
+        value = jnp.concatenate((v2, v1), axis=1)
+        if self.pos_emb is not None:
+            query, key = self.pos_emb(query, key, position_idx)
+        output = ly.Attention.apply(
+            query,
+            key,
+            value,
+            kernel=kernel,
+            mask=attention_mask,
+            bias=attention_bias,
+            scale=self.scaling,
+            is_causal=is_causal,
+            **kernel_kwargs,
+        )
+        context_output, image_output = jnp.split(
+            output,
+            (context_length,),
+            axis=1,
+        )
 
-        # Output Modulation
-        (shift_out, scale_out, _) = mod_img[0]
+        if out_shardings is None:
+            image_sharding = context_sharding = None
+        elif len(out_shardings) == 2:
+            image_sharding, context_sharding = out_shardings
+        else:
+            raise ValueError('out_shardings must contain exactly two values')
+        return (
+            self.o_proj_1(image_output, out_sharding=image_sharding),
+            self.o_proj_2(context_output, out_sharding=context_sharding),
+        )
 
-        img_norm = self.norm_out(img)
-        img_norm = img_norm * (1 + scale_out[:, None, :]) + shift_out[:, None, :]
 
-        return self.proj_out(img_norm)
+class Flux2TransformerLayer(JointTransformerLayer):
+    """FLUX.2 double-stream joint-attention transformer layer."""
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        *,
+        rngs: nn.Rngs,
+        layer_idx: int | None = None,
+    ) -> None:
+        hidden_size, _, _, _ = _flux2_dimensions(config)
+        super().__init__(
+            config,
+            rngs=rngs,
+            layer_idx=layer_idx,
+            conditioning_size=hidden_size * 6,
+            context_pre_only=False,
+            dual_attention=False,
+            project_conditioning=False,
+            context_project_conditioning=False,
+            use_qkv_norm=True,
+            qkv_norm_eps=_config_value(config, 'eps', default=1e-6),
+            pos_emb=_flux2_position_embedding(config),
+            input_layernorm=ly.AdaXNorm,
+            context_input_layernorm=ly.AdaXNorm,
+            joint_attention=Flux2JointAttention,
+            post_attention_layernorm=nn.LayerNorm,
+            context_post_attention_layernorm=nn.LayerNorm,
+            mlp=Flux2FeedForward,
+            context_mlp=Flux2FeedForward,
+        )
+
+    def __call__(
+        self,
+        x: jax.Array,
+        enc_x: jax.Array,
+        image_modulation: jax.Array,
+        text_modulation: jax.Array,
+        *,
+        position_idx: jax.Array | None = None,
+        encoder_position_idx: jax.Array | None = None,
+        **attention_kwargs: tp.Any,
+    ) -> tuple[jax.Array, jax.Array]:
+        joint_positions = _combine_positions(
+            encoder_position_idx,
+            position_idx,
+            batch_size=x.shape[0],
+        )
+        enc_x, x = super().__call__(
+            x,
+            enc_x,
+            image_modulation,
+            context_conditioning=text_modulation,
+            position_idx=joint_positions,
+            **attention_kwargs,
+        )
+        return enc_x, x
+
+
+class Flux2ParallelSelfAttention(nn.Module):
+    """Fused parallel attention and SwiGLU path used by FLUX.2."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        head_dim: int,
+        intermediate_size: int,
+        *,
+        pos_emb: nn.Module | None = None,
+        eps: float = 1e-6,
+        bias: bool = False,
+        dtype: DType | None = None,
+        rngs: nn.Rngs,
+        shard_mode: ShardMode = ShardMode.AUTO,
+        quant: tp.Any = None,
+        dot_general: tp.Any = None,
+    ) -> None:
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.intermediate_size = intermediate_size
+        self.pos_emb = pos_emb
+        options = {
+            'bias': bias,
+            'dtype': dtype,
+            'rngs': rngs,
+            'shard_mode': shard_mode,
+            'quant': quant,
+            'dot_general': dot_general,
+        }
+        self.to_qkv_mlp_proj = nn.Linear(
+            hidden_size,
+            3 * hidden_size + 2 * intermediate_size,
+            axis_names=('embed', 'parallel'),
+            **options,
+        )
+        norm_options = {
+            'eps': eps,
+            'dtype': dtype,
+            'axis_names': ('head_dim',),
+            'shard_mode': shard_mode,
+        }
+        self.norm_q = nn.RMSNorm(head_dim, **norm_options)
+        self.norm_k = nn.RMSNorm(head_dim, **norm_options)
+        self.to_out = nn.Linear(
+            hidden_size + intermediate_size,
+            hidden_size,
+            axis_names=('parallel_out', 'embed'),
+            **options,
+        )
+
+    def __call__(
+        self,
+        x: jax.Array,
+        *,
+        attention_mask: jax.Array | None = None,
+        attention_bias: jax.Array | None = None,
+        is_causal: bool = False,
+        position_idx: jax.Array | None = None,
+        out_sharding: jax.sharding.Sharding | None = None,
+        kernel: str = 'dot_product',
+        **kernel_kwargs: tp.Any,
+    ) -> jax.Array:
+        projected = self.to_qkv_mlp_proj(x)
+        qkv, mlp = jnp.split(projected, (3 * self.hidden_size,), axis=-1)
+        query, key, value = jnp.split(qkv, 3, axis=-1)
+        target_shape = (*x.shape[:-1], self.num_heads, self.head_dim)
+        query = self.norm_q(query.reshape(target_shape))
+        key = self.norm_k(key.reshape(target_shape))
+        value = value.reshape(target_shape)
+        if self.pos_emb is not None:
+            query, key = self.pos_emb(query, key, position_idx)
+
+        attention = ly.Attention.apply(
+            query,
+            key,
+            value,
+            kernel=kernel,
+            mask=attention_mask,
+            bias=attention_bias,
+            is_causal=is_causal,
+            **kernel_kwargs,
+        ).reshape(*x.shape[:-1], self.hidden_size)
+        gate, value = jnp.split(mlp, 2, axis=-1)
+        mlp = jax.nn.silu(gate) * value
+        return self.to_out(
+            jnp.concatenate((attention, mlp), axis=-1),
+            out_sharding=out_sharding,
+        )
+
+
+class Flux2SingleTransformerLayer(GatedParallelTransformerLayer):
+    """FLUX.2 concatenated-stream parallel transformer layer."""
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        *,
+        rngs: nn.Rngs,
+        layer_idx: int | None = None,
+    ) -> None:
+        hidden_size, _, _, _ = _flux2_dimensions(config)
+        super().__init__(
+            config,
+            rngs=rngs,
+            layer_idx=layer_idx,
+            conditioning_size=hidden_size * 3,
+            project_conditioning=False,
+            pos_emb=_flux2_position_embedding(config),
+            input_layernorm=ly.AdaXNorm,
+            parallel_path=Flux2ParallelSelfAttention,
+        )
+
+    def __call__(
+        self,
+        x: jax.Array,
+        enc_x: jax.Array | None,
+        modulation: jax.Array,
+        *,
+        position_idx: jax.Array | None = None,
+        encoder_position_idx: jax.Array | None = None,
+        **attention_kwargs: tp.Any,
+    ) -> jax.Array | tuple[jax.Array, jax.Array]:
+        if enc_x is not None:
+            position_idx = _combine_positions(
+                encoder_position_idx,
+                position_idx,
+                batch_size=x.shape[0],
+            )
+        return super().__call__(
+            x,
+            enc_x,
+            modulation,
+            position_idx=position_idx,
+            **attention_kwargs,
+        )
+
+
+__all__ = [
+    'Flux2FeedForward',
+    'Flux2JointAttention',
+    'Flux2Modulation',
+    'Flux2ParallelSelfAttention',
+    'Flux2RotaryEmbedding',
+    'Flux2SingleTransformerLayer',
+    'Flux2TransformerLayer',
+]

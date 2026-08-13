@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TODO: Autoencoder architectures"""
+"""Autoencoder architecture components."""
 
-from ._vae import *
-from .flux import *
+from ._ordinario import *
+from .dc import *

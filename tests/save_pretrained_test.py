@@ -9,8 +9,8 @@ from safetensors import safe_open
 from safetensors.numpy import save_file
 
 from taktiny import Takt, nn
-from taktiny.cosettes import _base as pretrained_base
-from taktiny.cosettes._base import PretrainedModel
+from taktiny.cosettes import _overture as pretrained_base
+from taktiny.cosettes._overture import PretrainedModel
 from taktiny.maestro.config import ModelConfig
 from taktiny.peft import LoraConfig
 
@@ -94,6 +94,28 @@ class TinyStackedLoadableModel(PretrainedModel):
                 yield layer
 
         self.layers = nn.SeqStack(layers())
+
+
+class TinyGroupedStackedLoadableModel(PretrainedModel):
+    def __init__(
+        self,
+        config,
+        rngs,
+        mesh=None,
+        sharding_rules=None,
+    ):
+        self.config = config
+        modes = ('a', 'a', 'b', 'b', 'a', 'a')
+        layers = []
+        for mode in modes:
+            layer = TinyProjectionBlock(0)
+            layer.mode = mode
+            layer.proj.weight.value = jnp.zeros(
+                (4, 3),
+                dtype=config.torch_dtype,
+            )
+            layers.append(layer)
+        self.layers = nn.SeqStack(layers)
 
 
 class FakeRepoUrl:
@@ -431,6 +453,43 @@ def test_from_pretrained_streams_numbered_layers_into_seqstack(tmp_path):
     )
 
 
+def test_from_pretrained_streams_numbered_layers_into_grouped_seqstack(
+    tmp_path,
+):
+    layer_weights = [
+        np.full((3, 4), index, dtype=np.float32)
+        for index in range(6)
+    ]
+    save_file(
+        {
+            f'layers.{index}.proj.weight': weight
+            for index, weight in enumerate(layer_weights)
+        },
+        tmp_path / 'model.safetensors',
+    )
+    config = ModelConfig(
+        num_hidden_layers=6,
+        torch_dtype='float32',
+    )
+
+    restored = TinyGroupedStackedLoadableModel.from_pretrained(
+        tmp_path,
+        config,
+        local=True,
+    )
+
+    assert restored.layers.group_sizes == (2, 2, 2)
+    for group_index, group in enumerate(restored.layers.groups):
+        expected = np.stack(
+            layer_weights[group_index * 2:(group_index + 1) * 2],
+            axis=0,
+        ).transpose(0, 2, 1)
+        np.testing.assert_array_equal(
+            group.stacked.proj.weight.value,
+            expected,
+        )
+
+
 def test_from_pretrained_quantizes_seqstack_layers_while_loading(tmp_path):
     save_file(
         {
@@ -504,6 +563,21 @@ def test_expand_stacked_state_dict_orders_parameters_by_layer():
         'layers.1.norm.weight',
         'layers.1.proj.weight',
         'norm.weight',
+    ]
+
+
+def test_expand_grouped_seqstack_uses_global_layer_indices():
+    state = {
+        'layers.groups.0.stacked.proj.weight': jnp.zeros((2, 4, 3)),
+        'layers.groups.1.stacked.proj.weight': jnp.ones((2, 4, 3)),
+        'layers.groups.2.stacked.proj.weight': jnp.full((2, 4, 3), 2),
+    }
+
+    expanded = PretrainedModel._expand_stacked_state_dict(state)
+
+    assert list(expanded) == [
+        f'layers.{index}.proj.weight'
+        for index in range(6)
     ]
 
 

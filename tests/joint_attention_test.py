@@ -89,7 +89,7 @@ def test_joint_attention_matches_direct_joint_attention():
     assert jnp.allclose(actual[1], expected[1], rtol=1e-5, atol=1e-5)
 
 
-def test_joint_attention_combines_per_stream_positions():
+def test_joint_attention_passes_combined_positions_to_positional_embedding():
     module = JointAttention(
         8,
         6,
@@ -100,19 +100,46 @@ def test_joint_attention_combines_per_stream_positions():
         rngs=nn.Rngs(0),
     )
     x1, x2 = _inputs()
-    positions1 = jnp.asarray([0.0, 1.0, 2.0])
-    positions2 = jnp.asarray([10.0, 11.0])
+    positions = jnp.asarray([0.0, 1.0, 2.0, 10.0, 11.0])
 
-    actual = module(x1, x2, position_idx=(positions1, positions2))
+    actual = module(x1, x2, position_idx=positions)
 
     q = jnp.concatenate((module.q_proj_1(x1), module.q_proj_2(x2)), axis=1)
     k = jnp.concatenate((module.k_proj_1(x1), module.k_proj_2(x2)), axis=1)
     v = jnp.concatenate((module.v_proj_1(x1), module.v_proj_2(x2)), axis=1)
-    positions = jnp.concatenate((positions1, positions2))
     q, k = module.pos_emb(q, k, positions)
     attended = jax.nn.dot_product_attention(q, k, v)
     expected1, expected2 = jnp.split(attended, (3,), axis=1)
     expected = module.o_proj_1(expected1), module.o_proj_2(expected2)
+
+    assert jnp.allclose(actual[0], expected[0], rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(actual[1], expected[1], rtol=1e-5, atol=1e-5)
+
+
+def test_joint_attention_infers_packed_segments_from_reset_positions():
+    module = JointAttention(
+        8,
+        6,
+        2,
+        4,
+        dtype='float32',
+        rngs=nn.Rngs(0),
+    )
+    x1, x2 = _inputs()
+    position_idx = jnp.asarray(
+        [
+            [0, 1, 2, 0, 1],
+            [0, 1, 2, 0, 1],
+        ]
+    )
+    segments = jnp.cumsum(position_idx == 0, axis=-1)
+    segment_mask = (
+        segments[:, None, :, None]
+        == segments[:, None, None, :]
+    )
+
+    actual = module(x1, x2, position_idx=position_idx)
+    expected = _manual(module, x1, x2, mask=segment_mask)
 
     assert jnp.allclose(actual[0], expected[0], rtol=1e-5, atol=1e-5)
     assert jnp.allclose(actual[1], expected[1], rtol=1e-5, atol=1e-5)

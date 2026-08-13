@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import pytest
 
 from taktiny import nn
-from taktiny.cosettes.common import TransformerCausalLM, TransformerModel
+from taktiny.cosettes.transformers._ordinario import TransformerCausalLM, TransformerModel
 from taktiny.maestro.config import ModelConfig
 
 

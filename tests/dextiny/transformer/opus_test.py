@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import pytest
 
 from taktiny import nn
-from taktiny.cosettes.common import (
+from taktiny.cosettes.transformers._ordinario import (
     TransformerCausalLM,
     TransformerConditionalGeneration,
 )

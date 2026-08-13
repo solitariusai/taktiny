@@ -46,6 +46,22 @@ def test_list_is_a_jax_pytree():
     assert all(isinstance(leaf, jax.Array) for leaf in leaves)
 
 
+def test_list_slice_preserves_container_and_parameter_paths():
+    class Model(nn.Module):
+        def __init__(self):
+            self.layers = nn.List([Add(1), Add(2), Add(3)])
+
+    model = Model()
+    model.layers = model.layers[:2]
+
+    assert isinstance(model.layers, nn.List)
+    assert len(model.layers) == 2
+    assert set(model.flat_parameter_dict()) == {
+        'layers.0.value',
+        'layers.1.value',
+    }
+
+
 def test_list_rejects_non_sequence_and_non_module_elements():
     with pytest.raises(TypeError, match='must be a sequence'):
         nn.List(Add(index) for index in range(2))
@@ -62,6 +78,14 @@ def test_sequential_accepts_one_module_sequence():
     assert len(modules) == 2
     assert list(modules) == list(modules.layers)
     assert modules[0] is modules.layers[0]
+
+
+def test_sequential_slice_preserves_container_behavior():
+    modules = nn.Sequential([Add(1), Add(2), Add(3)])[:2]
+
+    assert isinstance(modules, nn.Sequential)
+    assert len(modules) == 2
+    assert jax.jit(modules)(jnp.asarray(3)) == 6
 
 
 def test_sequential_rejects_non_sequence_and_non_module_elements():
@@ -159,9 +183,30 @@ def test_stack_exposes_vmap_axis_controls_and_broadcast_axes():
     assert jnp.array_equal(output, jnp.asarray([36, 36, 36]))
 
 
-def test_stacks_report_static_configuration_and_leaf_shape_mismatches():
-    with pytest.raises(ValueError, match='static configuration'):
-        nn.SeqStack([ConfiguredAdd(1, 'a'), ConfiguredAdd(2, 'b')])
+def test_seq_stack_groups_contiguous_static_configurations():
+    modules = nn.SeqStack(
+        [
+            ConfiguredAdd(1, 'a'),
+            ConfiguredAdd(2, 'a'),
+            ConfiguredAdd(3, 'b'),
+            ConfiguredAdd(4, 'b'),
+            ConfiguredAdd(5, 'a'),
+            ConfiguredAdd(6, 'a'),
+        ]
+    )
+
+    def apply(layer, carry):
+        output = layer(carry)
+        return output, output
+
+    final, outputs = modules(apply, jnp.asarray(0))
+
+    assert modules.group_sizes == (2, 2, 2)
+    assert final == 21
+    assert jnp.array_equal(outputs, jnp.asarray([1, 3, 6, 10, 15, 21]))
+
+
+def test_parallel_stack_reports_leaf_shape_mismatches():
     with pytest.raises(ValueError, match='same shape'):
         nn.Stack([Add(jnp.ones(2)), Add(jnp.ones(3))])
 

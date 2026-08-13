@@ -39,3 +39,9 @@ dev = [
 
 [tool.uv.sources]
 dextiny = { git = "https://github.com/solitariusai/dextiny" }
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: requires a JAX GPU backend",
+    "tpu: requires a JAX TPU backend",
+]

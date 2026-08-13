@@ -9,26 +9,21 @@ from taktiny.utils.typing import ShardMode
 
 
 def test_dropout_respects_train_and_eval_modes():
-    layer = nn.Dropout(0.5)
+    layer = nn.Dropout(0.5, rngs=nn.Rngs(0))
     x = jnp.ones((128,), dtype=jnp.float32)
 
-    training_output = layer(x, key=jax.random.key(0))
+    training_output = layer(x)
     layer.eval()
     evaluation_output = layer(x)
 
     assert set(np.asarray(jnp.unique(training_output))) <= {0.0, 2.0}
     assert jnp.array_equal(evaluation_output, x)
-    assert jnp.array_equal(layer(x, training=False), x)
-    assert jnp.array_equal(
-        layer(x, key=jax.random.key(0), training=True),
-        training_output,
-    )
 
 
-def test_dropout_requires_a_key_only_for_stochastic_training():
+def test_dropout_requires_rngs_only_for_stochastic_training():
     x = jnp.ones((4,))
 
-    with pytest.raises(ValueError, match='key is required'):
+    with pytest.raises(ValueError, match='rngs is required'):
         nn.Dropout(0.5)(x)
 
     assert jnp.array_equal(nn.Dropout(0)(x), x)
@@ -36,11 +31,25 @@ def test_dropout_requires_a_key_only_for_stochastic_training():
     assert jnp.array_equal(nn.Dropout(0.5).eval()(x), x)
 
 
+def test_dropout_can_own_and_advance_an_rng_stream():
+    layer = nn.Dropout(0.5, rngs=nn.Rngs(0))
+    x = jnp.ones((128,))
+
+    first = layer(x)
+    second = layer(x)
+
+    assert not jnp.array_equal(first, second)
+
+
 def test_dropout_broadcast_axes_share_mask_values():
-    layer = nn.Dropout(0.5, broadcast_axes=(1, 2))
+    layer = nn.Dropout(
+        0.5,
+        broadcast_axes=(1, 2),
+        rngs=nn.Rngs(0),
+    )
     x = jnp.ones((8, 4, 5, 3))
 
-    output = jax.jit(layer)(x, key=jax.random.key(0))
+    output = jax.jit(layer)(x)
 
     assert jnp.all(output == output[:, :1, :1, :])
 
@@ -62,10 +71,11 @@ def test_feature_dropout_supports_arbitrary_layouts(
         0.5,
         channel_axis=channel_axis,
         batch_axis=batch_axis,
+        rngs=nn.Rngs(1),
     )
     x = jnp.ones(shape)
 
-    output = jax.jit(layer)(x, key=jax.random.key(1))
+    output = jax.jit(layer)(x)
 
     canonical_channel = channel_axis % len(shape)
     canonical_batch = None if batch_axis is None else batch_axis % len(shape)
@@ -80,9 +90,9 @@ def test_feature_dropout_supports_arbitrary_layouts(
 
 def test_alpha_dropout_approximately_preserves_unit_normal_statistics():
     x = jax.random.normal(jax.random.key(0), (200_000,))
-    layer = nn.AlphaDropout(0.3)
+    layer = nn.AlphaDropout(0.3, rngs=nn.Rngs(1))
 
-    output = jax.jit(layer)(x, key=jax.random.key(1))
+    output = jax.jit(layer)(x)
 
     assert output.dtype == x.dtype
     assert jnp.isclose(jnp.mean(output), 0, atol=1e-2)
@@ -90,20 +100,20 @@ def test_alpha_dropout_approximately_preserves_unit_normal_statistics():
 
 
 def test_feature_alpha_dropout_shares_spatial_mask():
-    layer = nn.FeatureAlphaDropout(0.5)
+    layer = nn.FeatureAlphaDropout(0.5, rngs=nn.Rngs(0))
     x = jnp.ones((8, 4, 5, 6))
 
-    output = jax.jit(layer)(x, key=jax.random.key(0))
+    output = jax.jit(layer)(x)
 
     assert jnp.all(output == output[:, :1, :1, :])
 
 
 @pytest.mark.parametrize('mode', ['batch', 'row'])
 def test_stochastic_depth_drops_complete_residual_branches(mode):
-    layer = nn.StochasticDepth(0.5, mode=mode)
+    layer = nn.StochasticDepth(0.5, mode=mode, rngs=nn.Rngs(0))
     x = jnp.ones((32, 4, 5))
 
-    output = jax.jit(layer)(x, key=jax.random.key(0))
+    output = jax.jit(layer)(x)
 
     if mode == 'batch':
         assert jnp.all(output == output.reshape(-1)[0])
@@ -113,14 +123,12 @@ def test_stochastic_depth_drops_complete_residual_branches(mode):
 
 
 def test_dropout_preserves_bfloat16_and_has_finite_gradients():
-    layer = nn.Dropout(0.25)
+    layer = nn.Dropout(0.25, rngs=nn.Rngs(0))
     x = jnp.ones((64,), dtype=jnp.bfloat16)
 
-    output = layer(x, key=jax.random.key(0))
+    output = layer(x)
     gradient = jax.grad(
-        lambda value: jnp.sum(
-            layer(value, key=jax.random.key(0)).astype(jnp.float32)
-        )
+        lambda value: jnp.sum(layer(value).astype(jnp.float32))
     )(x)
 
     assert output.dtype == jnp.bfloat16
@@ -131,15 +139,18 @@ def test_dropout_preserves_bfloat16_and_has_finite_gradients():
 def test_dropout_explicit_sharding_covers_output():
     mesh = Mesh(np.asarray(jax.devices()[:1]), ('data',))
     sharding = NamedSharding(mesh, P())
-    layer = nn.Dropout(0.5, shard_mode=ShardMode.EXPLICIT)
+    layer = nn.Dropout(
+        0.5,
+        rngs=nn.Rngs(0),
+        shard_mode=ShardMode.EXPLICIT,
+    )
 
     output = jax.jit(
-        lambda value, key: layer(
+        lambda value: layer(
             value,
-            key=key,
             out_sharding=sharding,
         )
-    )(jnp.ones((16,)), jax.random.key(0))
+    )(jnp.ones((16,)))
 
     assert output.sharding.is_equivalent_to(sharding, output.ndim)
 
@@ -162,10 +173,8 @@ def test_feature_dropout_validates_axes_and_dropout_validates_dtype():
     with pytest.raises(ValueError, match='must be different'):
         nn.FeatureDropout(0.5, channel_axis=0, batch_axis=0)(
             jnp.ones((2, 3)),
-            key=jax.random.key(0),
         )
     with pytest.raises(TypeError, match='floating-point or complex'):
-        nn.Dropout(0.5)(
+        nn.Dropout(0.5, rngs=nn.Rngs(0))(
             jnp.ones((4,), dtype=jnp.int32),
-            key=jax.random.key(0),
         )

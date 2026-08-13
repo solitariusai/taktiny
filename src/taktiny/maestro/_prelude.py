@@ -18,12 +18,10 @@ if implemented in this library.
 
 from __future__ import annotations
 from collections.abc import Mapping
-from typing import Any
+import typing as tp
 import jax
 from jax.sharding import Mesh
 from jax.experimental import mesh_utils
-from huggingface_hub import hf_hub_download
-import json
 
 from taktiny.maestro._livret import repertoire
 from taktiny.maestro.config import ModelConfig
@@ -102,6 +100,44 @@ class Maestro:
         return True if model_class in repertoire.available() else False
 
     @classmethod
+    def _get_architecture_class(
+        cls,
+        repo_or_path: PathLike,
+        config: ModelConfig | tp.Dict | None,
+        config_filename: str,
+        local: bool,
+        subfolder: str | None = None,
+    ):
+        if isinstance(config, dict):
+            config = ModelConfig(**config)
+        if config is None:
+            config = ModelConfig.load_config(
+                repo_or_path,
+                config_filename,
+                subfolder=subfolder,
+                local=local,
+            )
+        if config is None:
+            raise ValueError(f'Unable to load config from {repo_or_path}')
+
+        architectures = getattr(config, 'architectures', None) or []
+        if not architectures:
+            class_name = getattr(config, '_class_name', None)
+            architectures = [class_name] if class_name else []
+        if len(architectures) != 1:
+            raise ValueError(
+                'Expected config.architectures to contain exactly one architecture'
+            )
+
+        architecture = architectures[0]
+        if not repertoire.get(architecture):
+            raise NotImplementedError(
+                f'Unsupported architecture: {architecture}'
+            )
+        model_cls = repertoire.get(architecture)
+        return model_cls, config
+
+    @classmethod
     def from_pretrained(
         cls,
         repo_or_path: PathLike,
@@ -109,9 +145,9 @@ class Maestro:
         sharding_rules: LogicalRules | None = None,
         local: bool = False,
         dtype: DType | str | None = None,
-        quant: Any = None,
+        quant: tp.Any = None,
         use_list: bool = False,
-        **kwargs: Any
+        **kwargs: tp.Any
     ) -> Module:
         """
         Load a registered model and materialize its checkpoint weights.
@@ -150,25 +186,16 @@ class Maestro:
             NotImplementedError: If the declared architecture is not
                 registered.
         """
-        try:
-            config_path = hf_hub_download(repo_or_path, 'config.json')
-            with open(config_path, 'r') as config_file:
-                config_dict = json.load(config_file)
-
-        except Exception as e:
-            print(f'{e}')
-            exit(0)
-
-        keys = config_dict.get('architectures', [])
-
-        assert len(keys) == 1, \
-            'Unsupported architectures.'
-
-        key = keys[0]
-        if key not in repertoire.available():
-            raise NotImplementedError("Unsupported architectures.")
-
-        model_cls = repertoire.get(key)
+        kwargs = dict(kwargs)
+        config_filename = kwargs.pop('config_filename', 'config.json')
+        config = kwargs.pop('config', None)
+        model_cls, config = Maestro._get_architecture_class(
+            repo_or_path,
+            config,
+            config_filename,
+            local,
+            kwargs.get('subfolder'),
+        )
 
         # Parse Mesh if provided as a dict (e.g. {'data': 4, 'model': 2})
         if isinstance(mesh, dict):
@@ -188,6 +215,7 @@ class Maestro:
             dtype=dtype,
             quant=quant,
             use_list=use_list,
+            config=config,
             **kwargs
         )
 
@@ -195,11 +223,12 @@ class Maestro:
     def eval_shape(
         cls,
         repo_or_path: PathLike,
+        *,
         mesh: Mesh | Mapping[str, int] | None = None,
         sharding_rules: LogicalRules | None = None,
         local: bool = False,
         use_list: bool = False,
-        **kwargs: Any,
+        **kwargs: tp.Any,
     ) -> Module:
         """
         Construct an abstract registered model without loading its weights.
@@ -232,24 +261,16 @@ class Maestro:
             NotImplementedError: If the declared architecture is not
                 registered.
         """
+        kwargs = dict(kwargs)
+        config_filename = kwargs.pop('config_filename', 'config.json')
         config = kwargs.pop('config', None)
-        if config is None:
-            config = ModelConfig.load_config(repo_or_path, local=local)
-        if config is None:
-            raise ValueError(f'Unable to load config from {repo_or_path}')
-
-        architectures = getattr(config, 'architectures', None) or []
-        if len(architectures) != 1:
-            raise ValueError(
-                'Expected config.architectures to contain exactly one architecture'
-            )
-
-        architecture = architectures[0]
-        if not repertoire.get(architecture):
-            raise NotImplementedError(
-                f'Unsupported architecture: {architecture}'
-            )
-        model_cls = repertoire.get(architecture)
+        model_cls, config = Maestro._get_architecture_class(
+            repo_or_path,
+            config,
+            config_filename,
+            local,
+            kwargs.get('subfolder'),
+        )
 
         if isinstance(mesh, dict):
             axis_names = tuple(mesh)

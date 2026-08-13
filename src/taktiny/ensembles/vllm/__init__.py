@@ -13,7 +13,7 @@
 # limitations under the License.
 """vLLM inference and rollout integration (Exp)"""
 
-from ._base import VLLM, VLLMEngine
+from ._ordinario import VLLM, VLLMEngine
 from ._local import LocalVLLMEngine
 from ._sync import (
     GPUWeightSync,

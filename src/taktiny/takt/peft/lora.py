@@ -28,7 +28,7 @@ from taktiny.nn.lora import LoRALinear
 from taktiny.nn.module import Module, iter_children
 from taktiny.nn.rng import Rngs
 from taktiny.takt._prelude import Takt, _replace_child
-from taktiny.takt.peft._config import LoraConfig
+from taktiny.takt.peft.config import LoraConfig
 from taktiny.utils.quantization import (
     quantize_linear_weight,
     resolve_quantization_rule,

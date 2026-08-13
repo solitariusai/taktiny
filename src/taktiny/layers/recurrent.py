@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from jax.nn.initializers import lecun_uniform
 
 from taktiny import nn
-from taktiny.nn.utils import _constrain, _validate_integer
+from taktiny.nn._continuo import _constrain, _validate_integer
 from taktiny.utils.typing import AxisName, AxisNames, DType, Initializer, ShardMode
 
 

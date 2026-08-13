@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any
+import typing as tp
 
 import grain.python as grain
 import numpy as np
@@ -26,9 +27,9 @@ class PackSequences:
     """Greedily concatenate token sequences into fixed-length records.
 
     This is a Grain iterator operation and must run before ``grain.Batch``.
-    Every output record includes reset ``position_ids`` so a later
-    model-specific operation can preserve boundaries between independent
-    examples without materializing a dense attention mask.
+    Tokenizer padding identified by an input ``attention_mask`` is removed
+    before packing. Every output record includes reset ``position_ids`` and a
+    fresh attention mask for the packed tokens.
 
     Args:
         sequence_length: Number of tokens in every packed record.
@@ -37,8 +38,12 @@ class PackSequences:
         padding_values: Optional padding value for each sequence field.
         position_key: Output field containing positions within each source
             example.
-        overflow: Handle source records longer than ``sequence_length`` by
-            splitting them into chunks or truncating them.
+        attention_mask_key: Optional input and output field containing one for
+            valid tokens and zero for padding. Set to ``None`` to disable
+            mask-aware input trimming and output mask generation.
+        overflow: With ``'split'``, fill each output record and carry any
+            remaining source tokens into the next record. With ``'truncate'``,
+            fill the current output record and discard remaining source tokens.
         drop_remainder: Drop the final partially filled packed record instead
             of padding it.
     """
@@ -50,7 +55,8 @@ class PackSequences:
         sequence_keys: Sequence[str] = ('input_ids', 'labels'),
         padding_values: Mapping[str, Any] | None = None,
         position_key: str = 'position_ids',
-        overflow: str = 'split',
+        attention_mask_key: str | None = 'attention_mask',
+        overflow: tp.Literal['split', 'truncate'] = 'split',
         drop_remainder: bool = False,
     ) -> None:
         if (
@@ -75,6 +81,18 @@ class PackSequences:
         if not isinstance(position_key, str) or not position_key:
             raise TypeError('position_key must be a non-empty string')
         if position_key in sequence_keys:
+            raise ValueError('packing output field names must be unique')
+        if attention_mask_key is not None and (
+            not isinstance(attention_mask_key, str)
+            or not attention_mask_key
+        ):
+            raise TypeError(
+                'attention_mask_key must be a non-empty string or None'
+            )
+        if attention_mask_key is not None and attention_mask_key in {
+            position_key,
+            *sequence_keys,
+        }:
             raise ValueError('packing output field names must be unique')
         if overflow not in {'split', 'truncate'}:
             raise ValueError('overflow must be "split" or "truncate"')
@@ -101,6 +119,7 @@ class PackSequences:
         self.sequence_keys = tuple(sequence_keys)
         self.padding_values = defaults
         self.position_key = position_key
+        self.attention_mask_key = attention_mask_key
         self.overflow = overflow
         self.drop_remainder = drop_remainder
 
@@ -130,7 +149,31 @@ class PackSequences:
                 )
             arrays[key] = array
 
-        return arrays, length or 0
+        length = length or 0
+        if (
+            self.attention_mask_key is not None
+            and self.attention_mask_key in value
+        ):
+            attention_mask = np.asarray(value[self.attention_mask_key])
+            if attention_mask.ndim != 1:
+                raise ValueError(
+                    f'{self.attention_mask_key!r} must be one-dimensional '
+                    f'before packing; got shape {attention_mask.shape}'
+                )
+            if len(attention_mask) != length:
+                raise ValueError(
+                    f'{self.attention_mask_key!r} and packed sequence fields '
+                    'must have equal lengths'
+                )
+
+            valid_tokens = attention_mask.astype(bool, copy=False)
+            arrays = {
+                key: array[valid_tokens]
+                for key, array in arrays.items()
+            }
+            length = int(np.count_nonzero(valid_tokens))
+
+        return arrays, length
 
     def _finish_pack(
         self,
@@ -161,6 +204,11 @@ class PackSequences:
             np.asarray(position_ids, dtype=np.int32),
             (0, padding),
         )
+        if self.attention_mask_key is not None:
+            packed[self.attention_mask_key] = np.pad(
+                np.ones(valid_length, dtype=np.int32),
+                (0, padding),
+            )
         return packed
 
     def __call__(
@@ -181,62 +229,61 @@ class PackSequences:
         for record in input_iterator:
             arrays, record_length = self._normalize_record(record.data)
             metadata = record.metadata
-            if self.overflow == 'truncate':
-                fragments = [(0, min(record_length, self.sequence_length))]
-            else:
-                fragments = [
-                    (offset, min(offset + self.sequence_length, record_length))
-                    for offset in range(0, record_length, self.sequence_length)
-                ]
+            if self.overflow == 'split':
+                offset = 0
+                while offset < record_length:
+                    available = self.sequence_length - len(position_ids)
+                    stop = min(offset + available, record_length)
+                    fragment_length = stop - offset
 
-            for offset, stop in fragments:
-                fragment_length = stop - offset
-                if fragment_length == 0:
-                    continue
+                    for key in self.sequence_keys:
+                        values[key].append(arrays[key][offset:stop])
+                    position_ids.extend(range(offset, stop))
+                    pack_metadata = metadata
+                    offset = stop
 
-                # Keep ordinary source records intact. Only an explicitly
-                # split overlength record may produce multiple fragments.
-                if (
-                    position_ids
-                    and len(position_ids) + fragment_length
-                    > self.sequence_length
-                ):
-                    packed = self._finish_pack(
-                        values,
-                        position_ids,
-                        drop_incomplete=False,
-                    )
-                    yield grain.Record(
-                        metadata=pack_metadata.remove_record_key(),
-                        data=packed,
-                    )
-                    reset()
+                    if len(position_ids) == self.sequence_length:
+                        packed = self._finish_pack(
+                            values,
+                            position_ids,
+                            drop_incomplete=False,
+                        )
+                        yield grain.Record(
+                            metadata=metadata.remove_record_key(),
+                            data=packed,
+                        )
+                        reset()
+                continue
 
-                for key in self.sequence_keys:
-                    values[key].append(arrays[key][offset:stop])
-                position_ids.extend(range(fragment_length))
-                pack_metadata = metadata
+            available = self.sequence_length - len(position_ids)
+            fragment_length = min(record_length, available)
+            if fragment_length == 0:
+                continue
+            for key in self.sequence_keys:
+                values[key].append(arrays[key][:fragment_length])
+            position_ids.extend(range(fragment_length))
+            pack_metadata = metadata
 
-                if len(position_ids) == self.sequence_length:
-                    packed = self._finish_pack(
-                        values,
-                        position_ids,
-                        drop_incomplete=False,
-                    )
-                    yield grain.Record(
-                        metadata=metadata.remove_record_key(),
-                        data=packed,
-                    )
-                    reset()
+            if len(position_ids) == self.sequence_length:
+                packed = self._finish_pack(
+                    values,
+                    position_ids,
+                    drop_incomplete=False,
+                )
+                yield grain.Record(
+                    metadata=metadata.remove_record_key(),
+                    data=packed,
+                )
+                reset()
 
         packed = self._finish_pack(
             values,
             position_ids,
             drop_incomplete=self.drop_remainder,
         )
-        if packed is not None and metadata is not None:
+        if packed is not None and pack_metadata is not None:
             yield grain.Record(
-                metadata=metadata.remove_record_key(),
+                metadata=pack_metadata.remove_record_key(),
                 data=packed,
             )
 

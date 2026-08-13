@@ -13,6 +13,12 @@
 # limitations under the License.
 """Transformer architectures"""
 
+from .allegro import *
+from .chroma import *
 from .gemma import *
+from .flux import *
 from .llama import *
+from .longcat import *
 from .qwen import *
+from .sana import *
+from .sd import *

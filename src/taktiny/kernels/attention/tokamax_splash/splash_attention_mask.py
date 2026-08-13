@@ -17,17 +17,12 @@
 
 """Mini-mask creation library."""
 from __future__ import annotations
-
-
 from collections.abc import Callable
 import dataclasses
 from typing import Any, Self
-
 import numpy as np
 
 # mypy: ignore-errors
-
-
 class Mask:
   """A base class for splash attention masks."""
 
@@ -53,7 +48,6 @@ class Mask:
       raise ValueError(f"Invalid shape for other: {other.shape}, expected: {self.shape}")
     return LogicalAnd(self, other)
 
-
 def make_causal_mask(shape: tuple[int, int], offset: int = 0) -> np.ndarray:
   """Makes a causal attention mask.
 
@@ -71,7 +65,6 @@ def make_causal_mask(shape: tuple[int, int], offset: int = 0) -> np.ndarray:
   q_idx = np.arange(q_seq_len, dtype=np.int32)
   kv_idx = np.arange(kv_seq_len, dtype=np.int32)
   return (q_idx[:, None] + offset >= kv_idx[None, :]).astype(np.bool_)
-
 
 def make_local_attention_mask(
     shape: tuple[int, int],

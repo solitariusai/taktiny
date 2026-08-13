@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 from datasets import Dataset
 
-from taktiny.data_utils import (
+from taktiny.data import (
     ApplyTemplate,
     CausalLMBatch,
     DatasetUtils,
@@ -91,7 +91,10 @@ def test_packing_pipeline_produces_isolated_causal_lm_batch():
         [-100, 11, 12, -100, 21],
         [-100, 31, 32, 33, -100],
     ])
-    assert 'attention_mask' not in batch
+    np.testing.assert_array_equal(batch['attention_mask'], [
+        [1, 1, 1, 1, 1],
+        [1, 1, 1, 1, 0],
+    ])
     assert 'segment_ids' not in batch
     assert batch['position_ids'].shape == (2, 5)
 
@@ -108,7 +111,84 @@ def test_pack_sequences_splits_long_records_without_losing_tokens():
 
     np.testing.assert_array_equal(records[0]['input_ids'], [1, 2, 3, 4])
     np.testing.assert_array_equal(records[1]['input_ids'], [5, 6, 0, 0])
-    np.testing.assert_array_equal(records[1]['position_ids'], [0, 1, 0, 0])
+    np.testing.assert_array_equal(records[1]['position_ids'], [4, 5, 0, 0])
+    np.testing.assert_array_equal(records[1]['attention_mask'], [1, 1, 0, 0])
+
+
+def test_pack_sequences_removes_tokenizer_padding_using_attention_mask():
+    source = Dataset.from_dict({
+        'input_ids': [[10, 11, 0, 0], [20, 21, 22, 0]],
+        'labels': [[10, 11, -100, -100], [20, 21, 22, -100]],
+        'attention_mask': [[1, 1, 0, 0], [1, 1, 1, 0]],
+    })
+    dataloader = DatasetUtils.from_datasets(
+        source,
+        num_epochs=1,
+        operations=[PackSequences(8)],
+    )
+
+    record = next(iter(dataloader))
+
+    np.testing.assert_array_equal(
+        record['input_ids'],
+        [10, 11, 20, 21, 22, 0, 0, 0],
+    )
+    np.testing.assert_array_equal(
+        record['labels'],
+        [10, 11, 20, 21, 22, -100, -100, -100],
+    )
+    np.testing.assert_array_equal(
+        record['position_ids'],
+        [0, 1, 0, 1, 2, 0, 0, 0],
+    )
+    np.testing.assert_array_equal(
+        record['attention_mask'],
+        [1, 1, 1, 1, 1, 0, 0, 0],
+    )
+
+
+def test_pack_sequences_supports_left_padded_tokenizer_output():
+    source = Dataset.from_dict({
+        'input_ids': [[0, 0, 10, 11]],
+        'labels': [[-100, -100, 10, 11]],
+        'attention_mask': [[0, 0, 1, 1]],
+    })
+    dataloader = DatasetUtils.from_datasets(
+        source,
+        num_epochs=1,
+        operations=[PackSequences(4)],
+    )
+
+    record = next(iter(dataloader))
+
+    np.testing.assert_array_equal(record['input_ids'], [10, 11, 0, 0])
+    np.testing.assert_array_equal(record['position_ids'], [0, 1, 0, 0])
+    np.testing.assert_array_equal(record['attention_mask'], [1, 1, 0, 0])
+
+
+def test_pack_sequences_validates_attention_mask_shape_and_length():
+    packer = PackSequences(4)
+    metadata = grain.RecordMetadata(index=0)
+
+    with pytest.raises(ValueError, match='one-dimensional before packing'):
+        list(packer(iter([grain.Record(
+            metadata=metadata,
+            data={
+                'input_ids': np.asarray([1, 2]),
+                'labels': np.asarray([1, 2]),
+                'attention_mask': np.asarray([[1, 1]]),
+            },
+        )])))
+
+    with pytest.raises(ValueError, match='must have equal lengths'):
+        list(packer(iter([grain.Record(
+            metadata=metadata,
+            data={
+                'input_ids': np.asarray([1, 2]),
+                'labels': np.asarray([1, 2]),
+                'attention_mask': np.asarray([1]),
+            },
+        )])))
 
 
 def test_pack_sequences_can_truncate_long_records():
@@ -128,7 +208,7 @@ def test_pack_sequences_can_truncate_long_records():
     np.testing.assert_array_equal(records[0]['input_ids'], [1, 2, 3, 4])
 
 
-def test_pack_sequences_does_not_split_regular_records_between_packs():
+def test_pack_sequences_fills_packs_by_splitting_the_next_record():
     source = Dataset.from_dict({'tokens': [[1, 2, 3], [4, 5, 6]]})
     dataloader = DatasetUtils.from_datasets(
         source,
@@ -138,8 +218,31 @@ def test_pack_sequences_does_not_split_regular_records_between_packs():
 
     records = list(dataloader)
 
-    np.testing.assert_array_equal(records[0]['input_ids'], [1, 2, 3, 0, 0])
-    np.testing.assert_array_equal(records[1]['input_ids'], [4, 5, 6, 0, 0])
+    np.testing.assert_array_equal(records[0]['input_ids'], [1, 2, 3, 4, 5])
+    np.testing.assert_array_equal(records[0]['position_ids'], [0, 1, 2, 0, 1])
+    np.testing.assert_array_equal(records[0]['attention_mask'], [1, 1, 1, 1, 1])
+    np.testing.assert_array_equal(records[1]['input_ids'], [6, 0, 0, 0, 0])
+    np.testing.assert_array_equal(records[1]['position_ids'], [2, 0, 0, 0, 0])
+    np.testing.assert_array_equal(records[1]['attention_mask'], [1, 0, 0, 0, 0])
+
+
+def test_pack_sequences_truncate_mode_drops_tokens_beyond_pack_boundary():
+    source = Dataset.from_dict({'tokens': [[1, 2, 3], [4, 5, 6]]})
+    dataloader = DatasetUtils.from_datasets(
+        source,
+        num_epochs=1,
+        operations=[
+            Map(tokenize),
+            PackSequences(5, overflow='truncate'),
+        ],
+    )
+
+    records = list(dataloader)
+
+    assert len(records) == 1
+    np.testing.assert_array_equal(records[0]['input_ids'], [1, 2, 3, 4, 5])
+    np.testing.assert_array_equal(records[0]['position_ids'], [0, 1, 2, 0, 1])
+    np.testing.assert_array_equal(records[0]['attention_mask'], [1, 1, 1, 1, 1])
 
 
 def test_pack_sequences_validates_overflow_mode():

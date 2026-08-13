@@ -24,7 +24,8 @@ from dataclasses import replace
 from functools import partial
 
 from taktiny import nn
-from taktiny.cosettes._base import PretrainedModel
+from taktiny.cosettes._continuo import _approximate_gelu
+from taktiny.cosettes._overture import PretrainedModel
 from taktiny.maestro.config import ModelConfig
 from taktiny.utils.typing import (
     ArrayLike,
@@ -34,7 +35,27 @@ from taktiny.utils.typing import (
     ShardMode,
 )
 from taktiny.utils.sharding import create_sharding
-from taktiny.layers import RotaryEmbedding, GateMLP, Attention
+from taktiny.layers import (
+    AdaXNorm,
+    Attention,
+    ConditionalTransformerLayer as _ConditionalTransformerLayer,
+    FeedForward,
+    GLUMBConv,
+    GateMLP,
+    JointAttention,
+    JointTransformerLayer as _JointTransformerLayer,
+    GatedParallelTransformerLayer as _GatedParallelTransformerLayer,
+    RotaryEmbedding,
+)
+from taktiny.cosettes._continuo import (
+    _activation,
+    _config_value,
+    _hidden_size,
+    _model_dtype,
+    _positive_int,
+    _shard_mode,
+)
+from taktiny.nn._continuo import _constrain
 
 
 KVCache = tuple[jax.Array, jax.Array]
@@ -47,17 +68,13 @@ DecodeCarry = tuple[
     jax.Array,
     jax.Array,
 ]
-GenerationSettings = tuple[int, jax.Array, int]
-
-
-def _approximate_gelu(x: jax.Array) -> jax.Array:
-    return jax.nn.gelu(x, approximate=True)
+GenerationSettings = tuple[int, jax.Array, int, str]
 
 
 @partial(
     jax.tree_util.register_dataclass,
     data_fields=['key_cache', 'value_cache', 'position_idx'],
-    meta_fields=['is_causal'],
+    meta_fields=['is_causal', 'attention_kernel'],
 )
 @dataclass(frozen=True)
 class TransformerContext:
@@ -65,6 +82,8 @@ class TransformerContext:
     value_cache: tp.Optional[jax.Array] = None
     position_idx: tp.Optional[jax.Array] = None
     is_causal: tp.Optional[bool] = None
+    attention_kernel: str = 'dot_product'
+
 
 class TransformerDecoderLayer(nn.Module):
     """An ordered transformer decoder block assembled from module types.
@@ -359,6 +378,7 @@ class TransformerDecoderLayer(nn.Module):
         position_idx: jax.Array | None = None,
         is_causal: bool = False,
         out_sharding: jax.sharding.Sharding | None = None,
+        attention_kernel: str = 'dot_product',
     ) -> tuple[jax.Array, KVCache | None]:
         residual = x
         pending = None
@@ -409,6 +429,7 @@ class TransformerDecoderLayer(nn.Module):
                     kv_cache=kv_cache,
                     position_idx=position_idx,
                     out_sharding=out_sharding,
+                    kernel=attention_kernel,
                 )
             else:
                 pending = module(x, out_sharding=out_sharding)
@@ -417,6 +438,1093 @@ class TransformerDecoderLayer(nn.Module):
             x = residual + pending
 
         return x, new_cache
+
+
+class ConditionalTransformerLayer(_ConditionalTransformerLayer):
+    """Config-driven single-stream conditional transformer layer.
+
+    The hidden stream is updated by modulated self-attention, read-only
+    cross-attention context, and a modulated spatial feed-forward branch.
+    Architectures may replace each compatible component while preserving this
+    topology.
+    """
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        *,
+        rngs: nn.Rngs,
+        layer_idx: int | None = None,
+        activation: str | Callable[[jax.Array], jax.Array] | None = None,
+        ffn_dropout: float | None = None,
+        attention_bias: bool | None = None,
+        attention_out_bias: bool | None = None,
+        cross_attention_bias: bool | None = None,
+        mlp_bias: bool | None = None,
+        pos_emb: nn.Module | None = None,
+        cross_pos_emb: nn.Module | None = None,
+        input_layernorm: nn.Module | type[nn.Module] = nn.LayerNorm,
+        self_attention: nn.Module | type[nn.Module] = Attention,
+        cross_attention: nn.Module | type[nn.Module] | None = Attention,
+        cross_attention_layernorm: (
+            nn.Module | type[nn.Module] | None
+        ) = None,
+        post_attention_layernorm: (
+            nn.Module | type[nn.Module]
+        ) = nn.LayerNorm,
+        mlp: nn.Module | type[nn.Module] = GLUMBConv,
+    ) -> None:
+        hidden_size = _hidden_size(config)
+        num_heads = _config_value(config, 'num_attention_heads')
+        head_dim = _config_value(
+            config,
+            'head_dim',
+            'attention_head_dim',
+        )
+        if not isinstance(num_heads, int) or num_heads <= 0:
+            raise ValueError('config must define num_attention_heads')
+
+        context_size = _config_value(
+            config,
+            'cross_attention_dim',
+            'context_dim',
+            default=hidden_size,
+        )
+        cross_num_heads = _config_value(
+            config,
+            'num_cross_attention_heads',
+            default=num_heads,
+        )
+        cross_head_dim = _config_value(
+            config,
+            'cross_attention_head_dim',
+            default=head_dim,
+        )
+        intermediate_size = _config_value(config, 'intermediate_size')
+        if intermediate_size is None:
+            ratio = _config_value(
+                config,
+                'mlp_ratio',
+                'expand_ratio',
+                default=4.0,
+            )
+            intermediate_size = int(hidden_size * ratio)
+
+        qk_norm = _config_value(config, 'qk_norm')
+        dropout = _config_value(config, 'dropout', default=0.0)
+        if ffn_dropout is None:
+            ffn_dropout = _config_value(
+                config,
+                'ffn_dropout',
+                default=0.0,
+            )
+        if attention_bias is None:
+            attention_bias = bool(
+                _config_value(config, 'attention_bias', default=False)
+            )
+        if attention_out_bias is None:
+            attention_out_bias = bool(
+                _config_value(config, 'attention_out_bias', default=True)
+            )
+        if cross_attention_bias is None:
+            cross_attention_bias = bool(
+                _config_value(config, 'cross_attention_bias', default=True)
+            )
+        if mlp_bias is None:
+            mlp_bias = bool(
+                _config_value(
+                    config,
+                    'glumbconv_bias',
+                    'mlp_bias',
+                    default=True,
+                )
+            )
+        super().__init__(
+            hidden_size=hidden_size,
+            context_size=context_size,
+            num_heads=num_heads,
+            intermediate_size=intermediate_size,
+            head_dim=head_dim,
+            cross_num_heads=cross_num_heads,
+            cross_head_dim=cross_head_dim,
+            dropout=dropout,
+            ffn_dropout=ffn_dropout,
+            activation=(
+                _activation(config, default='gelu')
+                if activation is None
+                else activation
+            ),
+            norm_eps=_config_value(config, 'norm_eps', default=1e-6),
+            norm_elementwise_affine=bool(
+                _config_value(
+                    config,
+                    'norm_elementwise_affine',
+                    default=False,
+                )
+            ),
+            bias=attention_bias,
+            attention_out_bias=attention_out_bias,
+            cross_attention_bias=cross_attention_bias,
+            mlp_bias=mlp_bias,
+            use_qkv_norm=bool(
+                _config_value(
+                    config,
+                    'use_qkv_norm',
+                    default=qk_norm is not None,
+                )
+            ),
+            qkv_norm_across_heads=(qk_norm == 'rms_norm_across_heads'),
+            qkv_norm_eps=_config_value(
+                config,
+                'qkv_norm_eps',
+                'norm_eps',
+                default=1e-5,
+            ),
+            pos_emb=pos_emb,
+            cross_pos_emb=cross_pos_emb,
+            dtype=_model_dtype(config),
+            rngs=rngs,
+            shard_mode=_shard_mode(config),
+            quant=_config_value(config, 'quant'),
+            dot_general=_config_value(config, 'dot_general'),
+            input_layernorm=input_layernorm,
+            self_attention=self_attention,
+            cross_attention=cross_attention,
+            cross_attention_layernorm=cross_attention_layernorm,
+            post_attention_layernorm=post_attention_layernorm,
+            mlp=mlp,
+        )
+        self.layer_idx = layer_idx
+
+
+class JointTransformerLayer(_JointTransformerLayer):
+    """A config-driven, composable two-stream transformer layer.
+
+    This is the joint-attention counterpart to
+    :class:`TransformerDecoderLayer`. It translates architecture config values
+    into the general two-stream implementation in :mod:`taktiny.layers`, while
+    allowing architectures to replace each compatible component with a module
+    subclass or initialized instance.
+
+    ``layer_idx`` selects layer-dependent topology. The final layer defaults to
+    context-pre-only behavior, and indices listed in
+    ``config.dual_attention_layers`` receive a second hidden-stream attention.
+    """
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        *,
+        rngs: nn.Rngs,
+        layer_idx: int | None = None,
+        conditioning_size: int | None = None,
+        context_pre_only: bool | None = None,
+        dual_attention: bool | None = None,
+        project_conditioning: bool = True,
+        context_project_conditioning: bool | None = None,
+        use_qkv_norm: bool | None = None,
+        qkv_norm_eps: float | None = None,
+        context_first: bool = False,
+        bias: bool | None = None,
+        pos_emb: nn.Module | None = None,
+        activation: str | Callable[[jax.Array], jax.Array] | None = None,
+        input_layernorm: nn.Module | type[nn.Module] = AdaXNorm,
+        context_input_layernorm: nn.Module | type[nn.Module] = AdaXNorm,
+        joint_attention: nn.Module | type[nn.Module] = JointAttention,
+        second_attention: nn.Module | type[nn.Module] = Attention,
+        post_attention_layernorm: nn.Module | type[nn.Module] | None = None,
+        context_post_attention_layernorm: (
+            nn.Module | type[nn.Module] | None
+        ) = None,
+        mlp: nn.Module | type[nn.Module] = FeedForward,
+        context_mlp: nn.Module | type[nn.Module] = FeedForward,
+    ) -> None:
+        num_heads = _config_value(config, 'num_attention_heads')
+        head_dim = _config_value(config, 'head_dim', 'attention_head_dim')
+        hidden_size = _config_value(config, 'hidden_size', 'inner_dim', 'dim')
+        if hidden_size is None and num_heads is not None and head_dim is not None:
+            hidden_size = num_heads * head_dim
+
+        required = {
+            'hidden size': hidden_size,
+            'num_attention_heads': num_heads,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise ValueError(
+                'Missing required joint transformer config values: '
+                + ', '.join(missing)
+            )
+
+        context_size = _config_value(
+            config,
+            'context_size',
+            'context_dim',
+            'caption_projection_dim',
+            default=hidden_size,
+        )
+        intermediate_size = _config_value(config, 'intermediate_size')
+        if intermediate_size is None:
+            mlp_ratio = _config_value(config, 'mlp_ratio', default=4.0)
+            intermediate_size = int(hidden_size * mlp_ratio)
+        context_intermediate_size = _config_value(
+            config,
+            'context_intermediate_size',
+            default=intermediate_size,
+        )
+        if conditioning_size is None:
+            conditioning_size = _config_value(
+                config,
+                'conditioning_size',
+                'time_embed_dim',
+                default=hidden_size,
+            )
+
+        num_layers = _config_value(
+            config,
+            'num_hidden_layers',
+            'num_layers',
+        )
+        if context_pre_only is None:
+            configured_context_pre_only = _config_value(
+                config,
+                'context_pre_only',
+            )
+            context_pre_only = (
+                bool(configured_context_pre_only)
+                if configured_context_pre_only is not None
+                else (
+                    layer_idx is not None
+                    and num_layers is not None
+                    and layer_idx == num_layers - 1
+                )
+            )
+        if dual_attention is None:
+            dual_layers = _config_value(
+                config,
+                'dual_attention_layers',
+                default=(),
+            )
+            dual_attention = layer_idx is not None and layer_idx in dual_layers
+
+        qk_norm = _config_value(config, 'qk_norm')
+        if use_qkv_norm is None:
+            use_qkv_norm = bool(
+                _config_value(
+                    config,
+                    'use_qkv_norm',
+                    default=qk_norm is not None,
+                )
+            )
+        if qkv_norm_eps is None:
+            qkv_norm_eps = _config_value(
+                config,
+                'qkv_norm_eps',
+                'norm_eps',
+                default=1e-6,
+            )
+        if pos_emb is None:
+            pos_emb = _config_value(
+                config,
+                'pos_emb',
+                'position_embedding',
+            )
+        norm_type = _config_value(config, 'norm_type', default='layernorm')
+        norm_type = str(norm_type).lower().replace('_', '')
+        if norm_type in {'layer', 'layernormalization'}:
+            norm_type = 'layernorm'
+        elif norm_type in {'rms', 'rmsnormalization'}:
+            norm_type = 'rmsnorm'
+
+        super().__init__(
+            hidden_size=hidden_size,
+            context_size=context_size,
+            num_heads=num_heads,
+            intermediate_size=intermediate_size,
+            context_intermediate_size=context_intermediate_size,
+            conditioning_size=conditioning_size,
+            head_dim=head_dim,
+            dropout=_config_value(
+                config,
+                'dropout',
+                'attention_dropout',
+                default=0.0,
+            ),
+            activation=(
+                activation
+                if activation is not None
+                else _config_value(
+                    config,
+                    'hidden_act',
+                    'hidden_activation',
+                    'activation',
+                    default='gelu',
+                )
+            ),
+            norm=norm_type,
+            norm_eps=_config_value(
+                config,
+                'norm_eps',
+                'layer_norm_eps',
+                'rms_norm_eps',
+                default=1e-6,
+            ),
+            context_pre_only=context_pre_only,
+            dual_attention=dual_attention,
+            bias=(
+                bool(
+                    _config_value(
+                        config,
+                        'projection_bias',
+                        'attention_bias',
+                        default=True,
+                    )
+                )
+                if bias is None
+                else bias
+            ),
+            use_qkv_norm=use_qkv_norm,
+            qkv_norm_eps=qkv_norm_eps,
+            context_first=context_first,
+            scaling=_config_value(config, 'attention_scaling'),
+            pos_emb=pos_emb,
+            second_pos_emb=_config_value(config, 'second_pos_emb'),
+            dtype=_model_dtype(config),
+            rngs=rngs,
+            shard_mode=_shard_mode(config),
+            quant=_config_value(config, 'quant'),
+            dot_general=_config_value(config, 'dot_general'),
+            project_conditioning=project_conditioning,
+            context_project_conditioning=context_project_conditioning,
+            input_layernorm=input_layernorm,
+            context_input_layernorm=context_input_layernorm,
+            joint_attention=joint_attention,
+            second_attention=second_attention,
+            post_attention_layernorm=post_attention_layernorm,
+            context_post_attention_layernorm=(
+                context_post_attention_layernorm
+            ),
+            mlp=mlp,
+            context_mlp=context_mlp,
+        )
+        self.layer_idx = layer_idx
+
+
+class GatedParallelTransformerLayer(_GatedParallelTransformerLayer):
+    """A config-driven transformer layer with parallel attention and FFN."""
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        *,
+        rngs: nn.Rngs,
+        parallel_path: nn.Module | type[nn.Module],
+        layer_idx: int | None = None,
+        conditioning_size: int | None = None,
+        project_conditioning: bool = True,
+        pos_emb: nn.Module | None = None,
+        activation: str | Callable[[jax.Array], jax.Array] | None = None,
+        use_qkv_norm: bool | None = None,
+        bias: bool | None = None,
+        input_layernorm: nn.Module | type[nn.Module] = AdaXNorm,
+    ) -> None:
+        num_heads = _config_value(config, 'num_attention_heads')
+        head_dim = _config_value(config, 'head_dim', 'attention_head_dim')
+        hidden_size = _config_value(config, 'hidden_size', 'inner_dim', 'dim')
+        if hidden_size is None and num_heads is not None and head_dim is not None:
+            hidden_size = num_heads * head_dim
+        if not isinstance(hidden_size, int) or hidden_size <= 0:
+            raise ValueError('config must define a positive hidden size')
+        if not isinstance(num_heads, int) or num_heads <= 0:
+            raise ValueError('config must define num_attention_heads')
+
+        intermediate_size = _config_value(config, 'intermediate_size')
+        if intermediate_size is None:
+            intermediate_size = int(
+                hidden_size
+                * _config_value(config, 'mlp_ratio', default=4.0)
+            )
+        if conditioning_size is None:
+            conditioning_size = _config_value(
+                config,
+                'conditioning_size',
+                'time_embed_dim',
+                default=hidden_size,
+            )
+        qk_norm = _config_value(config, 'qk_norm')
+        if use_qkv_norm is None:
+            use_qkv_norm = bool(
+                _config_value(
+                    config,
+                    'use_qkv_norm',
+                    default=qk_norm is not None,
+                )
+            )
+        if pos_emb is None:
+            pos_emb = _config_value(
+                config,
+                'pos_emb',
+                'position_embedding',
+            )
+        norm_type = _config_value(config, 'norm_type', default='layernorm')
+        norm_type = str(norm_type).lower().replace('_', '')
+        if norm_type in {'layer', 'layernormalization'}:
+            norm_type = 'layernorm'
+        elif norm_type in {'rms', 'rmsnormalization'}:
+            norm_type = 'rmsnorm'
+
+        super().__init__(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            intermediate_size=intermediate_size,
+            conditioning_size=conditioning_size,
+            parallel_path=parallel_path,
+            head_dim=head_dim,
+            dropout=_config_value(
+                config,
+                'dropout',
+                'attention_dropout',
+                default=0.0,
+            ),
+            activation=(
+                activation
+                if activation is not None
+                else _activation(config, default='gelu')
+            ),
+            norm=norm_type,
+            norm_eps=_config_value(
+                config,
+                'eps',
+                'norm_eps',
+                'layer_norm_eps',
+                default=1e-6,
+            ),
+            bias=(
+                bool(
+                    _config_value(
+                        config,
+                        'projection_bias',
+                        'attention_bias',
+                        default=False,
+                    )
+                )
+                if bias is None
+                else bias
+            ),
+            pos_emb=pos_emb,
+            dtype=_model_dtype(config),
+            rngs=rngs,
+            shard_mode=_shard_mode(config),
+            quant=_config_value(config, 'quant'),
+            dot_general=_config_value(config, 'dot_general'),
+            project_conditioning=project_conditioning,
+            use_qkv_norm=use_qkv_norm,
+            scaling=_config_value(config, 'attention_scaling'),
+            input_layernorm=input_layernorm,
+        )
+        self.use_qkv_norm = use_qkv_norm
+        self.layer_idx = layer_idx
+
+
+DiffusionComponent: tp.TypeAlias = nn.Module | type[nn.Module]
+
+
+class DiffusionTransformerModel(PretrainedModel):
+    """Composable patch-based diffusion transformer backbone.
+
+    The class owns the model-level mechanics shared by denoising transformers:
+    component construction, repeated transformer layers, rematerialization,
+    optional layer skipping, ControlNet residual routing, and patch
+    reconstruction. Concrete Maestro architectures select compatible
+    component types while Cosette layer classes define their mathematics.
+
+    Component types follow role-specific constructor contracts. Initialized
+    module instances may be supplied when an architecture requires a different
+    constructor. Subclasses can override the preparation and finalization
+    hooks without reimplementing layer iteration. ``use_list=False`` stores
+    layers in an ``nn.SeqStack``. Depth-dependent topologies are partitioned
+    into maximal contiguous stack-compatible groups while preserving one
+    carry and the original execution order.
+    """
+
+    default_sharding_rules = (
+        ('batch', 'fsdp'),
+        ('height', None),
+        ('width', None),
+        ('sequence', None),
+        ('embed', None),
+        ('context_embed', None),
+        ('heads', 'tp'),
+        ('head_dim', None),
+        ('mlp', 'tp'),
+        ('channel', None),
+    )
+    _component_names = frozenset(
+        {
+            'patch_embedding',
+            'condition_embedding',
+            'context_embedding',
+            'output_norm',
+            'output_projection',
+        }
+    )
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        *,
+        rngs: nn.Rngs,
+        transformer_layer: type[nn.Module],
+        patch_embedding: DiffusionComponent,
+        condition_embedding: DiffusionComponent,
+        context_embedding: DiffusionComponent | None,
+        output_norm: DiffusionComponent | None,
+        output_projection: DiffusionComponent,
+        component_kwargs: Mapping[str, Mapping[str, tp.Any]] | None = None,
+        mesh: jax.sharding.Mesh | None = None,
+        sharding_rules: LogicalRules | None = None,
+        use_list: bool = True,
+    ) -> None:
+        if (
+            not isinstance(transformer_layer, type)
+            or not issubclass(transformer_layer, nn.Module)
+        ):
+            raise TypeError('transformer_layer must be an nn.Module subclass')
+        if not isinstance(use_list, bool):
+            raise TypeError('use_list must be a boolean')
+
+        self.config = config
+        self.num_layers = _positive_int(
+            _config_value(config, 'num_layers', 'num_hidden_layers'),
+            'num_layers',
+        )
+        self.num_attention_heads = _positive_int(
+            _config_value(config, 'num_attention_heads'),
+            'num_attention_heads',
+        )
+        self.attention_head_dim = _positive_int(
+            _config_value(config, 'attention_head_dim', 'head_dim'),
+            'attention_head_dim',
+        )
+        self.inner_dim = self.num_attention_heads * self.attention_head_dim
+        self.in_channels = _positive_int(config.in_channels, 'in_channels')
+        self.out_channels = _positive_int(
+            _config_value(config, 'out_channels', default=self.in_channels),
+            'out_channels',
+        )
+        self.patch_size = self._spatial_pair(
+            _config_value(config, 'patch_size', default=2),
+            'patch_size',
+        )
+        self.shard_mode = _shard_mode(config)
+        self.dtype = _model_dtype(config)
+        self.quant = _config_value(config, 'quant')
+        self.dot_general = _config_value(config, 'dot_general')
+
+        options = self._component_options(component_kwargs)
+        sample_size = _config_value(config, 'sample_size', default=128)
+        self.patch_embedding = self._instantiate_component(
+            patch_embedding,
+            name='patch_embedding',
+            options={
+                'sample_size': sample_size,
+                'patch_size': self.patch_size,
+                'in_channels': self.in_channels,
+                'embedding_dim': self.inner_dim,
+                'dtype': self.dtype,
+                'rngs': rngs,
+                'shard_mode': self.shard_mode,
+                **options['patch_embedding'],
+            },
+        )
+
+        if isinstance(condition_embedding, nn.Module):
+            self.condition_embedding = condition_embedding
+        else:
+            pooled_projection_dim = _positive_int(
+                config.pooled_projection_dim,
+                'pooled_projection_dim',
+            )
+            self.condition_embedding = self._instantiate_component(
+                condition_embedding,
+                name='condition_embedding',
+                options={
+                    'embedding_dim': self.inner_dim,
+                    'pooled_projection_dim': pooled_projection_dim,
+                    'dtype': self.dtype,
+                    'rngs': rngs,
+                    'quant': self.quant,
+                    'dot_general': self.dot_general,
+                    'shard_mode': self.shard_mode,
+                    **options['condition_embedding'],
+                },
+            )
+
+        if context_embedding is None:
+            self.context_embedding = None
+        elif isinstance(context_embedding, nn.Module):
+            self.context_embedding = context_embedding
+        else:
+            joint_attention_dim = _positive_int(
+                config.joint_attention_dim,
+                'joint_attention_dim',
+            )
+            caption_projection_dim = _positive_int(
+                _config_value(
+                    config,
+                    'caption_projection_dim',
+                    default=self.inner_dim,
+                ),
+                'caption_projection_dim',
+            )
+            self.context_embedding = self._instantiate_component(
+                context_embedding,
+                name='context_embedding',
+                options={
+                    'in_features': joint_attention_dim,
+                    'out_features': caption_projection_dim,
+                    'bias': True,
+                    'dtype': self.dtype,
+                    'rngs': rngs,
+                    'quant': self.quant,
+                    'dot_general': self.dot_general,
+                    'axis_names': ('joint_embed', 'context_embed'),
+                    'shard_mode': self.shard_mode,
+                    **options['context_embedding'],
+                },
+            )
+
+        layers = [
+            transformer_layer(config, rngs=rngs, layer_idx=index)
+            for index in range(self.num_layers)
+        ]
+        self.requested_use_list = use_list
+        if use_list:
+            self.layers = nn.List(layers)
+        else:
+            for layer in layers:
+                if hasattr(layer, 'layer_idx'):
+                    layer.layer_idx = None
+            self.layers = nn.SeqStack(layers)
+        self.use_list = isinstance(self.layers, nn.List)
+
+        if output_norm is None:
+            self.output_norm = None
+        else:
+            self.output_norm = self._instantiate_component(
+                output_norm,
+                name='output_norm',
+                options={
+                    'embedding_dim': self.inner_dim,
+                    'out_dim': 2 * self.inner_dim,
+                    'norm': 'layernorm',
+                    'eps': 1e-6,
+                    'activation': 'silu',
+                    'bias': True,
+                    'dtype': self.dtype,
+                    'rngs': rngs,
+                    'quant': self.quant,
+                    'dot_general': self.dot_general,
+                    'axis_names': ('conditioning', 'output_modulation'),
+                    'shard_mode': self.shard_mode,
+                    **options['output_norm'],
+                },
+            )
+
+        self.output_projection = self._instantiate_component(
+            output_projection,
+            name='output_projection',
+            options={
+                'in_features': self.inner_dim,
+                'out_features': (
+                    self.patch_size[0]
+                    * self.patch_size[1]
+                    * self.out_channels
+                ),
+                'bias': True,
+                'dtype': self.dtype,
+                'rngs': rngs,
+                'quant': self.quant,
+                'dot_general': self.dot_general,
+                'axis_names': ('embed', 'patch'),
+                'shard_mode': self.shard_mode,
+                **options['output_projection'],
+            },
+        )
+
+        if sharding_rules is None:
+            sharding_rules = self.default_sharding_rules
+        self.output_sharding = None
+        if mesh is not None and self.shard_mode == ShardMode.EXPLICIT:
+            self.output_sharding = create_sharding(
+                mesh,
+                ('batch', 'height', 'width', 'channel'),
+                rules=sharding_rules,
+            )
+        self.remat = False
+
+    @classmethod
+    def _instantiate_component(
+        cls,
+        component: DiffusionComponent,
+        *,
+        name: str,
+        options: Mapping[str, tp.Any],
+    ) -> nn.Module:
+        if isinstance(component, nn.Module):
+            return component
+        if not isinstance(component, type) or not issubclass(component, nn.Module):
+            raise TypeError(f'{name} must be an nn.Module subclass or instance')
+        return component(**options)
+
+    @classmethod
+    def _component_options(
+        cls,
+        component_kwargs: Mapping[str, Mapping[str, tp.Any]] | None,
+    ) -> dict[str, dict[str, tp.Any]]:
+        supplied = dict(component_kwargs or {})
+        unknown = supplied.keys() - cls._component_names
+        if unknown:
+            raise ValueError(
+                'unknown diffusion component options: '
+                + ', '.join(sorted(unknown))
+            )
+        result = {name: {} for name in cls._component_names}
+        for name, values in supplied.items():
+            if not isinstance(values, Mapping):
+                raise TypeError(f'component_kwargs[{name!r}] must be a mapping')
+            result[name] = dict(values)
+        return result
+
+    @staticmethod
+    def _spatial_pair(
+        value: int | Sequence[int],
+        name: str,
+    ) -> tuple[int, int]:
+        values = (value, value) if isinstance(value, int) else tuple(value)
+        if len(values) != 2:
+            raise ValueError(f'{name} must contain exactly two dimensions')
+        for index, size in enumerate(values):
+            _positive_int(size, f'{name}[{index}]')
+        return tp.cast(tuple[int, int], values)
+
+    def enable_remat(self) -> None:
+        """Rematerialize transformer blocks during differentiation."""
+        self.remat = True
+
+    def disable_remat(self) -> None:
+        """Disable transformer-block rematerialization."""
+        self.remat = False
+
+    def _prepare_conditioning(
+        self,
+        timestep: jax.Array,
+        pooled_projection: jax.Array,
+    ) -> jax.Array:
+        return self.condition_embedding(timestep, pooled_projection)
+
+    def _prepare_context(self, encoder_hidden_states: jax.Array) -> jax.Array:
+        if self.context_embedding is None:
+            return encoder_hidden_states
+        return self.context_embedding(encoder_hidden_states)
+
+    def _call_transformer_layer(
+        self,
+        layer: nn.Module,
+        hidden_states: jax.Array,
+        encoder_hidden_states: jax.Array,
+        conditioning: jax.Array,
+        **layer_kwargs: tp.Any,
+    ) -> tuple[jax.Array, jax.Array]:
+        result = layer(
+            hidden_states,
+            encoder_hidden_states,
+            conditioning,
+            **layer_kwargs,
+        )
+        if isinstance(result, tuple):
+            if len(result) != 2:
+                raise ValueError(
+                    'a diffusion transformer layer tuple must contain '
+                    '(context, hidden_states)'
+                )
+            next_context, next_hidden = result
+            if next_context is None:
+                next_context = encoder_hidden_states
+            return next_context, next_hidden
+        return encoder_hidden_states, result
+
+    @staticmethod
+    def _validate_skip_layers(
+        skip_layers: Sequence[int] | None,
+        num_layers: int,
+    ) -> frozenset[int]:
+        if skip_layers is None:
+            return frozenset()
+        result = frozenset(skip_layers)
+        if any(
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 0
+            or index >= num_layers
+            for index in result
+        ):
+            raise ValueError('skip_layers contains an invalid layer index')
+        return result
+
+    def _apply_transformer_layers(
+        self,
+        hidden_states: jax.Array,
+        encoder_hidden_states: jax.Array,
+        conditioning: jax.Array,
+        *,
+        control_residuals: Sequence[jax.Array] | None,
+        skip_layers: Sequence[int] | None,
+        layer_kwargs: Mapping[str, tp.Any],
+    ) -> tuple[jax.Array, jax.Array]:
+        skipped = self._validate_skip_layers(skip_layers, self.num_layers)
+        controls = () if control_residuals is None else tuple(control_residuals)
+        if control_residuals is not None and not controls:
+            raise ValueError('control_residuals must not be empty')
+
+        call_layer = self._call_transformer_layer
+        if self.remat:
+            call_layer = jax.checkpoint(
+                call_layer,
+                prevent_cse=self.use_list,
+            )
+
+        if not self.use_list:
+            control_stack = None
+            if controls:
+                for control in controls:
+                    if control.shape != hidden_states.shape:
+                        raise ValueError(
+                            'each control residual must match the hidden token '
+                            f'shape {hidden_states.shape}; got {control.shape}'
+                        )
+                control_stack = jnp.stack(
+                    tuple(jnp.asarray(control) for control in controls)
+                )
+
+            skipped_indices = None
+            if skipped:
+                skipped_indices = jnp.asarray(
+                    tuple(sorted(skipped)),
+                    dtype=jnp.int32,
+                )
+
+            def apply_layer(
+                layer: nn.Module,
+                carry: tuple[jax.Array, jax.Array, jax.Array],
+            ) -> tuple[
+                tuple[jax.Array, jax.Array, jax.Array],
+                None,
+            ]:
+                context, hidden, layer_index = carry
+
+                def apply(
+                    operands: tuple[jax.Array, jax.Array],
+                ) -> tuple[jax.Array, jax.Array]:
+                    current_context, current_hidden = operands
+                    return call_layer(
+                        layer,
+                        current_hidden,
+                        current_context,
+                        conditioning,
+                        **layer_kwargs,
+                    )
+
+                if skipped_indices is None:
+                    context, hidden = apply((context, hidden))
+                else:
+                    should_skip = jnp.any(layer_index == skipped_indices)
+                    context, hidden = jax.lax.cond(
+                        should_skip,
+                        lambda operands: operands,
+                        apply,
+                        (context, hidden),
+                    )
+
+                if (
+                    control_stack is not None
+                    and not getattr(layer, 'context_pre_only', False)
+                ):
+                    control_index = jnp.minimum(
+                        layer_index * len(controls) // self.num_layers,
+                        len(controls) - 1,
+                    )
+                    hidden = hidden + jax.lax.dynamic_index_in_dim(
+                        control_stack,
+                        control_index,
+                        axis=0,
+                        keepdims=False,
+                    )
+
+                return (context, hidden, layer_index + 1), None
+
+            (encoder_hidden_states, hidden_states, _), _ = self.layers(
+                apply_layer,
+                (
+                    encoder_hidden_states,
+                    hidden_states,
+                    jnp.asarray(0, dtype=jnp.int32),
+                ),
+            )
+            return encoder_hidden_states, hidden_states
+
+        for index, layer in enumerate(self.layers):
+            if index not in skipped:
+                encoder_hidden_states, hidden_states = call_layer(
+                    layer,
+                    hidden_states,
+                    encoder_hidden_states,
+                    conditioning,
+                    **layer_kwargs,
+                )
+
+            if controls and not getattr(layer, 'context_pre_only', False):
+                control_index = min(
+                    int(index * len(controls) / self.num_layers),
+                    len(controls) - 1,
+                )
+                control = jnp.asarray(controls[control_index])
+                if control.shape != hidden_states.shape:
+                    raise ValueError(
+                        'each control residual must match the hidden token '
+                        f'shape {hidden_states.shape}; got {control.shape}'
+                    )
+                hidden_states = hidden_states + control
+        return encoder_hidden_states, hidden_states
+
+    def _finalize_tokens(
+        self,
+        hidden_states: jax.Array,
+        conditioning: jax.Array,
+    ) -> jax.Array:
+        if self.output_norm is not None:
+            normalized = self.output_norm(hidden_states, conditioning)
+            if isinstance(normalized, tuple):
+                if len(normalized) != 2:
+                    raise ValueError(
+                        'output_norm tuple must contain normalized activations '
+                        'and modulation'
+                    )
+                hidden_states, modulation = normalized
+                if modulation.shape[-1] != 2 * hidden_states.shape[-1]:
+                    raise ValueError(
+                        'output modulation must contain one scale and shift '
+                        'value per hidden feature'
+                    )
+                scale, shift = jnp.split(modulation, 2, axis=-1)
+                hidden_states = hidden_states * (1.0 + scale[:, None, :])
+                hidden_states = hidden_states + shift[:, None, :]
+            else:
+                hidden_states = normalized
+        return self.output_projection(hidden_states)
+
+    @staticmethod
+    def _unpatchify(
+        tokens: jax.Array,
+        grid_size: tuple[int, int],
+        patch_size: tuple[int, int],
+        out_channels: int,
+    ) -> jax.Array:
+        batch = tokens.shape[0]
+        grid_height, grid_width = grid_size
+        patch_height, patch_width = patch_size
+        tokens = tokens.reshape(
+            batch,
+            grid_height,
+            grid_width,
+            patch_height,
+            patch_width,
+            out_channels,
+        )
+        tokens = jnp.transpose(tokens, (0, 1, 3, 2, 4, 5))
+        return tokens.reshape(
+            batch,
+            grid_height * patch_height,
+            grid_width * patch_width,
+            out_channels,
+        )
+
+    def __call__(
+        self,
+        x: jax.Array,
+        encoder_hidden_states: jax.Array,
+        pooled_projection: jax.Array,
+        timestep: jax.Array,
+        *,
+        control_residuals: Sequence[jax.Array] | None = None,
+        layer_kwargs: Mapping[str, tp.Any] | None = None,
+        skip_layers: Sequence[int] | None = None,
+        return_dict: bool = True,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array | tuple[jax.Array]:
+        x = jnp.asarray(x)
+        encoder_hidden_states = jnp.asarray(encoder_hidden_states)
+        pooled_projection = jnp.asarray(pooled_projection)
+        timestep = jnp.asarray(timestep)
+        if x.ndim != 4 or x.shape[-1] != self.in_channels:
+            raise ValueError(
+                'x must have shape [batch, height, width, in_channels]'
+            )
+        if not jnp.issubdtype(x.dtype, jnp.floating):
+            raise TypeError('x must have a floating-point dtype')
+        if encoder_hidden_states.ndim != 3:
+            raise ValueError(
+                'encoder_hidden_states must have shape '
+                '[batch, sequence, hidden]'
+            )
+        if pooled_projection.ndim != 2:
+            raise ValueError(
+                'pooled_projection must have shape [batch, hidden]'
+            )
+        batch = x.shape[0]
+        if (
+            encoder_hidden_states.shape[0] != batch
+            or pooled_projection.shape[0] != batch
+        ):
+            raise ValueError('all inputs must share the same batch size')
+        if timestep.ndim == 0:
+            timestep = jnp.broadcast_to(timestep, (batch,))
+        if timestep.shape != (batch,):
+            raise ValueError('timestep must be a scalar or have shape [batch]')
+
+        height, width = x.shape[1:3]
+        patch_height, patch_width = self.patch_size
+        if height % patch_height or width % patch_width:
+            raise ValueError('latent dimensions must be divisible by patch_size')
+        grid_size = (height // patch_height, width // patch_width)
+
+        hidden_states = self.patch_embedding(x)
+        conditioning = self._prepare_conditioning(
+            timestep,
+            pooled_projection,
+        )
+        encoder_hidden_states = self._prepare_context(
+            encoder_hidden_states,
+        )
+        _, hidden_states = self._apply_transformer_layers(
+            hidden_states,
+            encoder_hidden_states,
+            conditioning,
+            control_residuals=control_residuals,
+            skip_layers=skip_layers,
+            layer_kwargs=dict(layer_kwargs or {}),
+        )
+        output = self._unpatchify(
+            self._finalize_tokens(hidden_states, conditioning),
+            grid_size,
+            self.patch_size,
+            self.out_channels,
+        )
+        target_sharding = (
+            self.output_sharding if out_sharding is None else out_sharding
+        )
+        output = _constrain(output, target_sharding, self.shard_mode)
+        return output if return_dict else (output,)
 
 
 class TransformerModel(nn.Module):
@@ -557,6 +1665,7 @@ class TransformerModel(nn.Module):
         position_idx: jax.Array | None = None,
         is_causal: bool = False,
         out_sharding: jax.sharding.Sharding | None = None,
+        attention_kernel: str = 'dot_product',
     ) -> tuple[jax.Array, KVCache | None]:
         if not jnp.issubdtype(x.dtype, jnp.inexact):
             if isinstance(self.embed_tokens, nn.Embedding):
@@ -572,6 +1681,7 @@ class TransformerModel(nn.Module):
                 position_idx=position_idx,
                 is_causal=is_causal,
                 out_sharding=out_sharding,
+                attention_kernel=attention_kernel,
             )
 
         if self.remat:
@@ -585,11 +1695,12 @@ class TransformerModel(nn.Module):
                 raise ValueError('kv_cache should contain key and value caches')
 
             key_cache, value_cache = kv_cache
-            if key_cache.shape[0] != self.num_hidden_layers:
+            layer_count = len(self.layers)
+            if key_cache.shape[0] != layer_count:
                 raise ValueError(
                     'key cache should have one entry for each transformer layer'
                 )
-            if value_cache.shape[0] != self.num_hidden_layers:
+            if value_cache.shape[0] != layer_count:
                 raise ValueError(
                     'value cache should have one entry for each transformer layer'
                 )
@@ -824,9 +1935,11 @@ class TransformerCausalLM(PretrainedModel):
         kv_cache = None
         position_idx = None
         is_causal = False
+        attention_kernel = 'dot_product'
         if ctx is not None:
             position_idx = ctx.position_idx
             is_causal = ctx.is_causal
+            attention_kernel = ctx.attention_kernel
             if (ctx.key_cache is None) != (ctx.value_cache is None):
                 raise ValueError(
                     'TransformerContext should contain both key and value caches'
@@ -849,6 +1962,7 @@ class TransformerCausalLM(PretrainedModel):
             position_idx=position_idx,
             is_causal=is_causal,
             out_sharding=self.model_out_sharding,
+            attention_kernel=attention_kernel,
         )
 
         if isinstance(logits_to_keep, int):
@@ -908,15 +2022,12 @@ class TransformerCausalLM(PretrainedModel):
     def _load_from_pretrained(
         cls,
         path_or_repo: PathLike,
+        *,
         config: ModelConfig,
-        module_map: Mapping[str, str] | Sequence[tuple[str, str]] | None,
+        module_map: tp.List | None,
         **kwargs: tp.Any,
     ) -> tp.Self:
         module_map = module_map or []
-        if isinstance(module_map, dict):
-            module_map = list(module_map.items())
-
-        new_module_map = list(module_map)
         tied = config.tie_word_embeddings or False
         if tied:
             embedding_target = None
@@ -931,14 +2042,14 @@ class TransformerCausalLM(PretrainedModel):
                     embedding_target = target
                     break
             if embedding_target is not None:
-                new_module_map.append(
+                module_map.append(
                     ('lm_head.weight', embedding_target)
                 )
 
         return super().from_pretrained(
             path_or_repo,
             config=config,
-            module_map=new_module_map,
+            module_map=module_map,
             **kwargs
         )
 
@@ -946,10 +2057,12 @@ class TransformerCausalLM(PretrainedModel):
     def from_pretrained(
         cls,
         path_or_repo: PathLike,
+        *,
         mesh: jax.sharding.Mesh | None = None,
         sharding_rules: LogicalRules | None = None,
         local: bool = False,
-        **kwargs: tp.Any,
+        module_map: tp.List | None = None,
+        **kwargs,
     ) -> tp.Self:
         # Load config
         if 'config' in kwargs:
@@ -958,16 +2071,17 @@ class TransformerCausalLM(PretrainedModel):
             config = ModelConfig.load_config(path_or_repo, local=local)
 
         # Define how HuggingFace weights map to components using new Tuple format
-        module_map = [
+        module_map = module_map or []
+        module_map.extend([
             ("model.embed_tokens.weight", "model.embed_tokens.embedding"),
-        ]
+        ])
 
         # Call the base class safetensors loader
         # TODO: PretrainedModel.from_pretrained will need to be updated to pass mesh and sharding_rules down
         return cls._load_from_pretrained(
             path_or_repo,
-            config,
-            module_map,
+            config=config, # pyright: ignore
+            module_map=module_map,
             local=local,
             mesh=mesh,
             sharding_rules=sharding_rules,
@@ -1023,7 +2137,139 @@ class TransformerCausalLM(PretrainedModel):
         sampled_tokens = jax.random.categorical(key, logits)[:, None]
         return jnp.where(temperature <= 0, greedy_tokens, sampled_tokens)
 
-    @partial(jax.jit, static_argnames=['max_seq_len', 'top_k', 'top_p'])
+    @staticmethod
+    def _canonical_attention_kernel(kernel: str) -> str:
+        if not isinstance(kernel, str):
+            raise TypeError('attention kernel names must be strings')
+        normalized = kernel.lower()
+        aliases = {
+            'standard': 'dot_product',
+            'jax': 'dot_product',
+            'flash_attention': 'flash',
+            'ragged_attention': 'ragged',
+            'splash_attention': 'splash',
+            'ring_attention': 'ring',
+        }
+        normalized = aliases.get(normalized, normalized)
+        supported = {
+            'auto',
+            'dot_product',
+            'flash',
+            'ragged',
+            'splash',
+            'ring',
+        }
+        if normalized not in supported:
+            choices = ', '.join(sorted(supported))
+            raise ValueError(
+                f'unsupported attention kernel {kernel!r}; choose from '
+                f'{choices}'
+            )
+        return normalized
+
+    def _resolve_generation_attention_kernels(
+        self,
+        attention_kernel: str | Mapping[str, str],
+    ) -> tuple[str, str]:
+        if isinstance(attention_kernel, str):
+            prefill = decode = self._canonical_attention_kernel(
+                attention_kernel
+            )
+        elif isinstance(attention_kernel, Mapping):
+            unknown = set(attention_kernel) - {'prefill', 'decode'}
+            if unknown:
+                names = ', '.join(sorted(map(str, unknown)))
+                raise ValueError(
+                    f'unknown attention_kernel phase keys: {names}'
+                )
+            prefill = self._canonical_attention_kernel(
+                attention_kernel.get('prefill', 'auto')
+            )
+            decode = self._canonical_attention_kernel(
+                attention_kernel.get('decode', 'auto')
+            )
+        else:
+            raise TypeError(
+                'attention_kernel must be a string or a mapping with '
+                'prefill and decode keys'
+            )
+
+        softcap = getattr(self.config, 'attn_logit_softcapping', None)
+        backend = jax.default_backend()
+        layer_types = getattr(self.config, 'layer_types', None) or ()
+        use_sliding_window = getattr(
+            self.config,
+            'use_sliding_window',
+            None,
+        )
+        has_sliding_window = bool(
+            use_sliding_window is True
+            or (
+                use_sliding_window is None
+                and getattr(self.config, 'sliding_window', None)
+            )
+            or any(
+                layer_type in ('sliding_attention', 'sliding')
+                for layer_type in layer_types
+            )
+        )
+
+        if prefill == 'auto':
+            prefill = 'dot_product' if softcap is not None else 'flash'
+        if decode == 'auto':
+            decode = (
+                'ragged'
+                if (
+                    backend == 'tpu'
+                    and softcap is None
+                    and not has_sliding_window
+                )
+                else 'dot_product'
+            )
+
+        if prefill == 'ragged':
+            raise ValueError(
+                'ragged attention is decode-only; select it only for the '
+                'decode phase'
+            )
+        if 'ring' in (prefill, decode):
+            raise ValueError(
+                'ring attention requires a prebuilt topology-specific kernel '
+                'and cannot be selected directly by generate'
+            )
+        if softcap is not None:
+            unsupported = {
+                kernel
+                for kernel in (prefill, decode)
+                if kernel != 'dot_product'
+            }
+            if unsupported:
+                names = ', '.join(sorted(unsupported))
+                raise ValueError(
+                    f'{names} attention does not support the model attention '
+                    'softcap; use dot_product'
+                )
+        if decode == 'ragged' and has_sliding_window:
+            raise ValueError(
+                'ragged attention cannot represent sliding-window decode '
+                'masks; use dot_product, flash, or splash'
+            )
+        if decode == 'ragged' and backend not in {'cpu', 'tpu'}:
+            raise ValueError(
+                'ragged attention currently requires a TPU backend; CPU is '
+                'supported only through the reference interpreter'
+            )
+        return prefill, decode
+
+    @partial(
+        jax.jit,
+        static_argnames=[
+            'max_seq_len',
+            'top_k',
+            'top_p',
+            'attention_kernel',
+        ],
+    )
     def _decode_step(
         self,
         carry: DecodeCarry,
@@ -1034,6 +2280,7 @@ class TransformerCausalLM(PretrainedModel):
         repetition_penalty: float = 1.0,
         eos_token_ids: jax.Array | None = None,
         pad_token_id: int = 0,
+        attention_kernel: str = 'dot_product',
     ) -> tuple[DecodeCarry, jax.Array]:
         (
             token,
@@ -1049,7 +2296,8 @@ class TransformerCausalLM(PretrainedModel):
             key_cache=k_cache,
             value_cache=v_cache,
             position_idx=pos,
-            is_causal=False
+            is_causal=False,
+            attention_kernel=attention_kernel,
         )
 
         mask = jnp.arange(max_seq_len)[None, :] <= pos[:, None]
@@ -1117,6 +2365,7 @@ class TransformerCausalLM(PretrainedModel):
         eos_token_id: int | Sequence[int] | None,
         pad_token_id: int | None,
         seed: int,
+        attention_kernel: str | Mapping[str, str],
     ) -> tuple[jax.Array, DecodeCarry, GenerationSettings]:
         if not isinstance(max_new_tokens, int) or max_new_tokens < 1:
             raise ValueError('max_new_tokens should be a positive integer')
@@ -1126,6 +2375,9 @@ class TransformerCausalLM(PretrainedModel):
             raise ValueError('top_p should be in the interval (0, 1]')
         if repetition_penalty <= 0:
             raise ValueError('repetition_penalty should be positive')
+        prefill_kernel, decode_kernel = (
+            self._resolve_generation_attention_kernels(attention_kernel)
+        )
 
         input_ids = jnp.asarray(input_ids)
         if input_ids.ndim != 2:
@@ -1186,12 +2438,10 @@ class TransformerCausalLM(PretrainedModel):
             raise TypeError('seed should be an integer')
         key = jax.random.key(seed)
 
-        num_layers = getattr(self.config, 'num_hidden_layers', None)
+        num_layers = len(self.model.layers)
         num_heads = getattr(self.config, 'num_attention_heads', None)
         num_kv_heads = getattr(self.config, 'num_key_value_heads', None)
         hidden_size = getattr(self.config, 'hidden_size', None)
-        if num_layers is None:
-            raise ValueError('config.num_hidden_layers is required')
         if num_heads is None:
             raise ValueError('config.num_attention_heads is required')
         if num_kv_heads is None:
@@ -1225,6 +2475,7 @@ class TransformerCausalLM(PretrainedModel):
             value_cache=value_cache,
             position_idx=jnp.asarray(0, dtype=jnp.int32),
             is_causal=True,
+            attention_kernel=prefill_kernel,
         )
         prefill_mask = (
             jnp.arange(max_seq_len)[None, :]
@@ -1287,6 +2538,7 @@ class TransformerCausalLM(PretrainedModel):
             max_seq_len,
             eos_token_ids,
             pad_token_id,
+            decode_kernel,
         )
         return input_ids, carry, settings
 
@@ -1303,7 +2555,16 @@ class TransformerCausalLM(PretrainedModel):
         eos_token_id: int | Sequence[int] | None = None,
         pad_token_id: int | None = None,
         streamer: tp.Any = None,
+        attention_kernel: str | Mapping[str, str] = 'auto',
     ) -> jax.Array:
+        """Generate tokens with phase-aware attention kernel selection.
+
+        ``attention_kernel`` may be one kernel name for both generation phases,
+        or a mapping such as ``{'prefill': 'flash', 'decode': 'ragged'}``.
+        ``'auto'`` selects Flash Attention for prefill and TPU Ragged Attention
+        for compatible cached decoding. Other backends, attention softcaps,
+        and sliding-window decoding use dot-product attention.
+        """
         if not isinstance(max_new_tokens, int) or max_new_tokens < 0:
             raise ValueError('max_new_tokens should be a non-negative integer')
 
@@ -1328,6 +2589,7 @@ class TransformerCausalLM(PretrainedModel):
                     repetition_penalty=repetition_penalty,
                     eos_token_id=eos_token_id,
                     pad_token_id=pad_token_id,
+                    attention_kernel=attention_kernel,
                 ):
                     streamer.put(jax.device_get(token_ids))
                     generated.append(token_ids)
@@ -1355,8 +2617,14 @@ class TransformerCausalLM(PretrainedModel):
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
             seed=seed,
+            attention_kernel=attention_kernel,
         )
-        max_seq_len, eos_token_ids, pad_token_id = settings
+        (
+            max_seq_len,
+            eos_token_ids,
+            pad_token_id,
+            decode_kernel,
+        ) = settings
         batch_size = input_ids.shape[0]
         generated = jnp.full(
             (batch_size, max_new_tokens),
@@ -1384,6 +2652,7 @@ class TransformerCausalLM(PretrainedModel):
                 repetition_penalty=repetition_penalty,
                 eos_token_ids=eos_token_ids,
                 pad_token_id=pad_token_id,
+                attention_kernel=decode_kernel,
             )
             tokens = tokens.at[:, step].set(next_token[:, 0])
             return step + 1, decode_carry, tokens
@@ -1411,8 +2680,9 @@ class TransformerCausalLM(PretrainedModel):
         repetition_penalty: float = 1.0,
         eos_token_id: int | Sequence[int] | None = None,
         pad_token_id: int | None = None,
+        attention_kernel: str | Mapping[str, str] = 'auto',
     ) -> Iterator[jax.Array]:
-        """Yield one generated token per batch row at each decode step."""
+        """Yield generated tokens using the same kernel policy as ``generate``."""
         if max_new_tokens == 0:
             return
 
@@ -1427,8 +2697,14 @@ class TransformerCausalLM(PretrainedModel):
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
             seed=seed,
+            attention_kernel=attention_kernel,
         )
-        max_seq_len, eos_token_ids, pad_token_id = settings
+        (
+            max_seq_len,
+            eos_token_ids,
+            pad_token_id,
+            decode_kernel,
+        ) = settings
         yield carry[0]
 
         for _ in range(max_new_tokens - 1):
@@ -1443,6 +2719,7 @@ class TransformerCausalLM(PretrainedModel):
                 repetition_penalty=repetition_penalty,
                 eos_token_ids=eos_token_ids,
                 pad_token_id=pad_token_id,
+                attention_kernel=decode_kernel,
             )
             yield next_token
 
@@ -1758,6 +3035,7 @@ class TransformerConditionalGeneration(PretrainedModel):
         eos_token_id: int | list[int] | tuple[int, ...] | None = None,
         pad_token_id: int | None = None,
         seed: int = 42,
+        attention_kernel: str | Mapping[str, str] = 'auto',
     ) -> jax.Array:
         """Autoregressively generate tokens conditioned on text and optional multimodal inputs."""
         if self.language_model is not None and hasattr(self.language_model, 'generate'):
@@ -1779,33 +3057,20 @@ class TransformerConditionalGeneration(PretrainedModel):
                 eos_token_id=eos_token_id,
                 pad_token_id=pad_token_id,
                 seed=seed,
+                attention_kernel=attention_kernel,
             )
         else:
             raise NotImplementedError("Generation requires a configured language_model")
 
 
-class DiffusionIM(PretrainedModel):
-    """Base class for Diffusion Image Models (e.g., Flux, DiT, Stable Diffusion)."""
-    def __init__(self, config: tp.Any=None, *, rngs: nn.Rngs | None = None, **kwargs: tp.Any) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
-        self.config = config
-
-
-class DiffusionLM(PretrainedModel):
-    """Base class for Diffusion Language Models (e.g., Diffusion Gemma, Discrete Diffusion LM)."""
-    def __init__(self, config: tp.Any=None, *, rngs: nn.Rngs | None = None, **kwargs: tp.Any) -> None:
-        if rngs is None:
-            rngs = nn.Rngs(42)
-        self.config = config
-
-
 __all__ = [
-    'TransformerContext',
     'TransformerDecoderLayer',
+    'ConditionalTransformerLayer',
+    'JointTransformerLayer',
+    'GatedParallelTransformerLayer',
+    'DiffusionTransformerModel',
+    'TransformerContext',
     'TransformerModel',
     'TransformerCausalLM',
     'TransformerConditionalGeneration',
-    'DiffusionLM',
-    'DiffusionIM',
 ]

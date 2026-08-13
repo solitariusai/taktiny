@@ -66,6 +66,22 @@ def _validate_positive_float(value: float, name: str) -> float:
     return float(value)
 
 
+def _validate_probability(
+    value: float,
+    name: str = 'p',
+    *,
+    allow_one: bool = True,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f'{name} must be a real number')
+    value = float(value)
+    upper_valid = value <= 1 if allow_one else value < 1
+    if not math.isfinite(value) or value < 0 or not upper_valid:
+        interval = '[0, 1]' if allow_one else '[0, 1)'
+        raise ValueError(f'{name} must be finite and in {interval}')
+    return value
+
+
 def _resolve_training(default: bool, training: bool | None) -> bool:
     if training is None:
         return default
@@ -126,7 +142,20 @@ def _resolve_activation(
     if not isinstance(activation, str):
         expected = 'a string, callable, or None' if allow_none else 'a string or callable'
         raise TypeError(f'activation must be {expected}')
-    function = getattr(jax.nn, activation.lower(), None)
+    normalized = activation.lower().replace('-', '_')
+    compact = normalized.replace('_', '')
+    if compact == 'relu6':
+        return lambda value: jnp.minimum(jax.nn.relu(value), 6)
+    if compact in {
+        'gelupytorchtanh',
+        'gelunew',
+        'gelufast',
+        'geluapproximate',
+    }:
+        return lambda value: jax.nn.gelu(value, approximate=True)
+    if compact == 'swish':
+        return jax.nn.silu
+    function = getattr(jax.nn, normalized, None)
     if function is None or not callable(function):
         raise ValueError(f'unsupported activation: {activation!r}')
     return function

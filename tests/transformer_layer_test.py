@@ -1,3 +1,5 @@
+import inspect
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -36,11 +38,9 @@ class _CustomEncoder(nn.Module):
         mask=None,
         is_causal=False,
         *,
-        key=None,
-        training=None,
         out_sharding=None,
     ):
-        del mask, is_causal, key, training, out_sharding
+        del mask, is_causal, out_sharding
         return source + 1
 
 
@@ -54,8 +54,6 @@ class _CustomDecoder(nn.Module):
         target_is_causal=False,
         memory_is_causal=False,
         *,
-        key=None,
-        training=None,
         out_sharding=None,
     ):
         del (
@@ -63,8 +61,6 @@ class _CustomDecoder(nn.Module):
             memory_mask,
             target_is_causal,
             memory_is_causal,
-            key,
-            training,
             out_sharding,
         )
         return target + (0 if memory is None else jnp.mean(memory, axis=1, keepdims=True))
@@ -204,7 +200,7 @@ def test_transformer_padding_masks_hide_changed_source_tokens():
     assert jnp.allclose(original, modified, atol=1e-5)
 
 
-def test_transformer_dropout_uses_module_mode_and_explicit_key():
+def test_transformer_dropout_uses_recursive_module_mode():
     layer = _transformer(
         num_encoder_layers=1,
         num_decoder_layers=1,
@@ -214,16 +210,23 @@ def test_transformer_dropout_uses_module_mode_and_explicit_key():
     source = jnp.ones((2, 3, 8))
     target = jnp.ones((2, 2, 8))
 
-    with pytest.raises(ValueError, match='key is required'):
-        layer(source, target)
-
-    first = layer(source, target, key=jax.random.key(1))
-    second = layer(source, target, key=jax.random.key(1))
+    first = layer(source, target)
+    second = layer(source, target)
     layer.eval()
     evaluation = layer(source, target)
 
-    assert jnp.array_equal(first, second)
+    assert not jnp.array_equal(first, second)
     assert jnp.all(jnp.isfinite(evaluation))
+    for module in (
+        layer,
+        layer.encoder,
+        layer.encoder.layers[0],
+        layer.decoder,
+        layer.decoder.layers[0],
+    ):
+        parameters = inspect.signature(module.__call__).parameters
+        assert 'key' not in parameters
+        assert 'training' not in parameters
 
 
 def test_transformer_explicit_sharding_constrains_returned_layout():

@@ -18,3 +18,4 @@ from .qwen import *
 from .deepseek import *
 from .gemma import *
 from .gpt import *
+from .sd import *

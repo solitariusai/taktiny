@@ -79,6 +79,28 @@ def test_rms_norm_supports_multiple_dimensions_and_bfloat16_statistics():
     assert jnp.allclose(output.astype(jnp.float32), expected, atol=1e-2)
 
 
+def test_rms_norm_supports_learned_bias_and_parameter_axes():
+    x = jax.random.normal(jax.random.key(1), (2, 3, 4))
+    layer = nn.RMSNorm(
+        4,
+        eps=1e-6,
+        bias=True,
+        axis_names=('feature',),
+    )
+    layer.weight.value = jnp.asarray([1.0, 2.0, 3.0, 4.0])
+    layer.bias.value = jnp.asarray([-1.0, 0.0, 1.0, 2.0])
+
+    output = jax.jit(layer)(x)
+    expected = x * jax.lax.rsqrt(
+        jnp.mean(jnp.square(x), axis=-1, keepdims=True) + 1e-6
+    )
+    expected = expected * layer.weight.value + layer.bias.value
+
+    assert layer.weight.axis_names == ('feature',)
+    assert layer.bias.axis_names == ('feature',)
+    assert jnp.allclose(output, expected, atol=1e-6)
+
+
 def _group_norm_reference(
     x,
     *,

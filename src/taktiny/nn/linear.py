@@ -22,7 +22,7 @@ import warnings
 
 from taktiny.nn.module import Module, Parameter
 from taktiny.nn.rng import Rngs
-from taktiny.nn.utils import _constrain, _normalize_shape
+from taktiny.nn._continuo import _constrain, _normalize_shape
 from taktiny.utils.typing import AxisNames, DType, Initializer, ShardMode
 
 default_linear_initializer = lecun_uniform()

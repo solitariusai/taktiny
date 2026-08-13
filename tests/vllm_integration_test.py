@@ -14,7 +14,7 @@ from taktiny.ensembles.vllm import (
 from taktiny.ensembles.vllm import _local as vllm_local
 from taktiny.ensembles.vllm import _sync as vllm_sync
 from taktiny.ensembles.vllm._weights import iter_checkpoint_weights
-from taktiny.cosettes._base import PretrainedModel
+from taktiny.cosettes._overture import PretrainedModel
 from taktiny.nn.lora import LoRALinear
 
 

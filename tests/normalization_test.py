@@ -98,6 +98,40 @@ def test_adaptive_norm_chunks_returns_equal_chunks():
 
 
 @pytest.mark.parametrize(
+    ('norm', 'module_type'),
+    [('layernorm', nn.LayerNorm), ('rmsnorm', nn.RMSNorm)],
+)
+def test_adaptive_norm_uses_parameter_free_nn_normalizer(norm, module_type):
+    layer = AdaXNorm(5, 12, norm=norm, rngs=nn.Rngs(0))
+
+    assert isinstance(layer.normalizer, module_type)
+    assert layer.normalizer.normalized_shape is None
+    assert not hasattr(layer.normalizer, 'weight')
+
+
+def test_adaptive_norm_zero_init_zeros_modulation_projection():
+    layer = AdaXNorm(
+        5,
+        12,
+        zero_init=True,
+        rngs=nn.Rngs(0),
+    )
+    x = jax.random.normal(jax.random.key(1), (2, 3, 6))
+    conditioning = jax.random.normal(jax.random.key(2), (2, 5))
+
+    _, modulation = layer(x, conditioning)
+
+    assert layer.zero_init is True
+    assert jnp.all(layer.linear.weight.value == 0)
+    assert jnp.all(modulation == 0)
+
+
+def test_adaptive_norm_zero_init_requires_boolean():
+    with pytest.raises(TypeError, match='zero_init must be a bool'):
+        AdaXNorm(5, 12, zero_init=1, rngs=nn.Rngs(0))
+
+
+@pytest.mark.parametrize(
     ('feature_shape', 'conditioning_shape'),
     [
         ((2, 7, 8), (2, 3, 4)),

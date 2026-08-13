@@ -16,23 +16,18 @@
 # ==============================================================================
 """Base functionality for Sparse Flash Attention."""
 from __future__ import annotations
-
 from typing import Any
-
-
 import functools
 from typing import Final, NamedTuple, TypeAlias
 import jax
 import jax.numpy as jnp
 import numpy as np
-from taktiny.kernels.attention.tokamax_splash import splash_attention_mask_info as mask_info_lib
 
+from taktiny.kernels.attention.tokamax_splash import splash_attention_mask_info as mask_info_lib
 
 MaskInfo = mask_info_lib.MaskInfo
 
-
 DEFAULT_MASK_VALUE: Final[float] = -0.7 * float(np.finfo(np.dtype("float32")).max)
-
 
 class SegmentIds(NamedTuple):
   """SegmentIds for Q and KV sequences.
@@ -54,7 +49,6 @@ class SegmentIds(NamedTuple):
 
   q: jax.Array | jax.sharding.PartitionSpec  # [q_seq_len]
   kv: jax.Array | jax.sharding.PartitionSpec  # [kv_seq_len]
-
 
 # Return type of SplashAttention function that implements the custom vjp rule.
 SplashCustomReturnType: TypeAlias = jax.Array | tuple[jax.Array, dict[str, jax.Array]]

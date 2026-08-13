@@ -2,8 +2,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from taktiny.cosettes.common import TransformerContext
-from taktiny.trainer.loss import causal_lm_loss, cross_entropy_loss
+from taktiny.cosettes.transformers._ordinario import TransformerContext
+from taktiny.trainer.loss import Loss, causal_lm_loss, cross_entropy_loss
 
 
 class FixedLogitModel:
@@ -26,6 +26,42 @@ class FixedLogitModel:
             'ctx': ctx,
         }
         return self.logits, ctx
+
+
+def test_loss_preserves_standard_model_batch_contract_by_default():
+    batch = {'value': 3}
+
+    loss = Loss(lambda model, received: model + received['value'])
+
+    assert loss(4, batch) == 7
+
+
+def test_loss_prepares_positional_and_keyword_arguments():
+    def prepare(batch):
+        return (batch['value'],), {'scale': batch['scale']}
+
+    def calculate(model, value, *, scale):
+        return model + value * scale
+
+    loss = Loss(calculate, prepare)
+
+    assert loss(1, {'value': 3, 'scale': 2}) == 7
+
+
+@pytest.mark.parametrize(
+    ('prepare', 'message'),
+    [
+        (lambda batch: None, r'an \(args, kwargs\) tuple'),
+        (lambda batch: ([batch], {}), 'args must be a tuple'),
+        (lambda batch: ((batch,), []), 'kwargs must be a mapping'),
+        (lambda batch: ((), {1: batch}), 'names must be strings'),
+    ],
+)
+def test_loss_validates_prepared_arguments(prepare, message):
+    loss = Loss(lambda model: model, prepare)
+
+    with pytest.raises(TypeError, match=message):
+        loss(None, {'value': 1})
 
 
 def test_cross_entropy_loss_masks_ignored_targets_and_uses_valid_mean():
