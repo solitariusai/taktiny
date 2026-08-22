@@ -10,9 +10,9 @@ import typing as tp
 
 import jax
 
-from taktiny import layers as ly
+from taktiny.cosettes import layers as ly
 from taktiny import nn
-from taktiny.cosettes._continuo import (
+from taktiny.cosettes.continuo import (
     _approximate_gelu,
     combine_joint_positions,
     flatten_modulation,
@@ -20,7 +20,7 @@ from taktiny.cosettes._continuo import (
     multi_axis_position_embedding,
     pairwise_attention_mask,
 )
-from taktiny.cosettes.transformers._ordinario import (
+from taktiny.cosettes.transformers.ordinario import (
     GatedParallelTransformerLayer,
     JointTransformerLayer,
 )

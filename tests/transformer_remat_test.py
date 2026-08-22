@@ -3,13 +3,13 @@ import jax.numpy as jnp
 import pytest
 
 from taktiny import nn
-from taktiny.cosettes.transformers._ordinario import TransformerCausalLM, TransformerModel
+from taktiny.cosettes.transformers.ordinario import TransformerCausalLM, TransformerModel
 from taktiny.maestro.config import ModelConfig
 
 
 class RematTestLayer(nn.Module):
-    def __init__(self, config, rngs, layer_idx=None):
-        self.layer_idx = layer_idx
+    def __init__(self, config, rngs, layer_idx=None, **kwargs):
+        del layer_idx, kwargs
         self.proj = nn.Linear(
             config.hidden_size,
             config.hidden_size,
@@ -23,41 +23,59 @@ class RematTestLayer(nn.Module):
 
 
 class PositionTestLayer(nn.Module):
-    def __init__(self, config, rngs, layer_idx=None):
-        del config, rngs
-        self.layer_idx = layer_idx
+    def __init__(self, config, rngs, layer_idx=None, **kwargs):
+        del config, rngs, layer_idx, kwargs
 
-    def __call__(self, x, position_idx=None, **kwargs):
+    def __call__(self, x, position_ids=None, **kwargs):
         del kwargs
-        return x + position_idx[..., None], None
+        return x + position_ids[..., None], None
 
 
-@pytest.mark.parametrize('use_list', [True, False])
-def test_transformer_remat_preserves_forward_and_backward(use_list):
+class IdentityNorm(nn.Module):
+    def __init__(self, *args, **kwargs):
+        del args, kwargs
+
+    def __call__(self, x, **kwargs):
+        del kwargs
+        return x
+
+
+class RematTransformerModel(TransformerModel):
+    _layer_type = RematTestLayer
+
+
+class PositionTransformerModel(TransformerModel):
+    _layer_type = PositionTestLayer
+    _norm = IdentityNorm
+
+
+class PositionCausalLM(TransformerCausalLM):
+    _model_type = PositionTransformerModel
+
+
+@pytest.mark.parametrize('stack_type', ['list', 'stack'])
+def test_transformer_remat_preserves_forward_and_backward(stack_type):
     config = ModelConfig(
         num_hidden_layers=2,
         vocab_size=8,
         hidden_size=4,
+        num_attention_heads=1,
+        max_position_embeddings=16,
+        rms_norm_eps=1e-6,
         dtype='float32',
+        stack_type=stack_type,
     )
-    model = TransformerModel(
-        config,
-        rngs=nn.Rngs(0),
-        module=RematTestLayer,
-        embedding=nn.Embedding,
-        use_list=use_list,
-    )
+    model = RematTransformerModel(config, rngs=nn.Rngs(0))
     input_ids = jnp.asarray([[1, 2, 3]])
 
-    expected, _ = model(input_ids)
+    expected = model(input_ids).x
     model.enable_remat()
-    actual, _ = model(input_ids)
+    actual = model(input_ids).x
 
     assert jnp.allclose(actual, expected)
 
     def loss(candidate):
-        output, _ = candidate(input_ids)
-        return jnp.sum(output)
+        return jnp.sum(candidate(input_ids).x)
 
     gradients = jax.grad(loss)(model)
     assert all(
@@ -89,20 +107,21 @@ def test_transformer_model_forwards_per_token_position_ids():
         num_hidden_layers=1,
         vocab_size=8,
         hidden_size=2,
+        num_attention_heads=1,
+        max_position_embeddings=16,
+        rms_norm_eps=1e-6,
         dtype='float32',
+        stack_type='stack',
     )
-    model = TransformerModel(
-        config,
-        rngs=nn.Rngs(0),
-        module=PositionTestLayer,
-        embedding=nn.Embedding,
-    )
-    hidden_states = jnp.zeros((2, 3, 2), dtype=jnp.float32)
+    model = PositionTransformerModel(config, rngs=nn.Rngs(0))
+    input_ids = jnp.asarray([[1, 2, 3], [4, 5, 6]], dtype=jnp.int32)
     position_ids = jnp.asarray([[0, 1, 0], [0, 1, 2]])
 
-    output, _ = model(hidden_states, position_idx=position_ids)
+    output = model(input_ids, position_ids=position_ids).x
 
+    hidden_states = model.token_embedding(input_ids)
     expected = jnp.broadcast_to(position_ids[..., None], hidden_states.shape)
+    expected = hidden_states + expected
     assert jnp.array_equal(output, expected)
 
 
@@ -111,21 +130,23 @@ def test_transformer_causal_lm_accepts_position_ids():
         num_hidden_layers=1,
         vocab_size=8,
         hidden_size=2,
+        num_attention_heads=1,
+        max_position_embeddings=16,
+        rms_norm_eps=1e-6,
+        tie_word_embeddings=False,
         dtype='float32',
+        stack_type='stack',
     )
-    model = TransformerCausalLM(
-        config,
-        rngs=nn.Rngs(0),
-        decoder=PositionTestLayer,
-    )
-    hidden_states = jnp.zeros((1, 3, 2), dtype=jnp.float32)
+    model = PositionCausalLM(config, rngs=nn.Rngs(0))
+    input_ids = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
     position_ids = jnp.asarray([[0, 1, 0]])
 
-    logits, _ = model(hidden_states, position_ids=position_ids)
+    logits = model(input_ids, position_ids=position_ids).logits
+    hidden_states = model.model.token_embedding(input_ids)
     expected_hidden = jnp.broadcast_to(
         position_ids[..., None],
         hidden_states.shape,
-    )
+    ) + hidden_states
     expected = model.lm_head(expected_hidden)
 
     assert jnp.allclose(logits, expected)

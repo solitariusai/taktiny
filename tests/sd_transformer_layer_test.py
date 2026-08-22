@@ -1,9 +1,9 @@
 import jax
 import jax.numpy as jnp
 
-from taktiny import layers as ly
+from taktiny.cosettes import layers as ly
 from taktiny import nn
-from taktiny.cosettes.transformers._ordinario import JointTransformerLayer
+from taktiny.cosettes.transformers.ordinario import JointTransformerLayer
 from taktiny.cosettes.transformers.sd import SD3TransformerLayer
 from taktiny.maestro.config import ModelConfig
 
@@ -42,7 +42,7 @@ def test_sd3_layer_declares_mmdit_components_and_topology():
     assert isinstance(regular.norm2, nn.LayerNorm)
     assert isinstance(regular.ff, ly.FeedForward)
     assert dual.dual_attention
-    assert isinstance(dual.attn2, ly.Attention)
+    assert isinstance(dual.attn2, ly.AttentionLegacy)
     assert final.context_pre_only
     assert final.norm2_context is None
     assert final.ff_context is None

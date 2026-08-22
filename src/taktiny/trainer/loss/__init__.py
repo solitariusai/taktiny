@@ -13,7 +13,23 @@
 # limitations under the License.
 
 from ._overture import Loss
-from .classification import cross_entropy_loss
+from .classification import cross_entropy_loss, focal_loss
 from .causal import causal_lm_loss
+from .contrastive import infonce_loss
+from .distribution import kl_divergence
+from .preference import dpo_loss, ipo_loss
+from .regression import mae_loss, mse_loss, smooth_l1_loss
 
-__all__ = ['Loss', 'cross_entropy_loss', 'causal_lm_loss']
+__all__ = [
+    'Loss',
+    'causal_lm_loss',
+    'cross_entropy_loss',
+    'dpo_loss',
+    'focal_loss',
+    'infonce_loss',
+    'ipo_loss',
+    'kl_divergence',
+    'mae_loss',
+    'mse_loss',
+    'smooth_l1_loss',
+]

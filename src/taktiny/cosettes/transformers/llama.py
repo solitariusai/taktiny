@@ -13,25 +13,13 @@
 # limitations under the License.
 
 from __future__ import annotations
-from typing import Any
+from taktiny.cosettes.transformers.ordinario import TransformerDecoderLayer
 
 
-from taktiny import nn
-from taktiny.cosettes.transformers._ordinario import TransformerDecoderLayer
-from taktiny.layers import GateMLP, Attention
-
-
+# ╻  ╻  ┏━┓┏┳┓┏━┓
+# ┃  ┃  ┣━┫┃┃┃┣━┫
+# ┗━╸┗━╸╹ ╹╹ ╹╹ ╹
 class LlamaDecoderLayer(TransformerDecoderLayer):
-    def __init__(self, config: Any, rngs: nn.Rngs, layer_idx: int | None=None) -> None:
-        super().__init__(
-            config,
-            rngs=rngs,
-            layer_idx=layer_idx,
-            input_layernorm=nn.RMSNorm,
-            self_attn=Attention,
-            post_attention_layernorm=nn.RMSNorm,
-            mlp=GateMLP,
-        )
-
+    pass
 
 __all__ = ['LlamaDecoderLayer']

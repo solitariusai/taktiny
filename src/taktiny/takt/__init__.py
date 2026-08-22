@@ -13,7 +13,7 @@
 # limitations under the License.
 """Transformations for existing model instances."""
 
-from ._prelude import Takt
+from .prelude import Takt
 from .peft import LoraConfig, PeftConfig
 
 __all__ = ['Takt', 'PeftConfig', 'LoraConfig']

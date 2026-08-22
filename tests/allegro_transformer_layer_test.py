@@ -1,9 +1,9 @@
 import jax
 import jax.numpy as jnp
 
-from taktiny import layers as ly
+from taktiny.cosettes import layers as ly
 from taktiny import nn
-from taktiny.cosettes.transformers._ordinario import (
+from taktiny.cosettes.transformers.ordinario import (
     ConditionalTransformerLayer,
 )
 from taktiny.cosettes.transformers.allegro import (
@@ -45,8 +45,8 @@ def test_allegro_layer_declares_conditional_topology():
 
     assert isinstance(layer, ConditionalTransformerLayer)
     assert isinstance(layer.norm1, nn.LayerNorm)
-    assert isinstance(layer.attn1, ly.Attention)
-    assert isinstance(layer.attn2, ly.Attention)
+    assert isinstance(layer.attn1, ly.AttentionLegacy)
+    assert isinstance(layer.attn2, ly.AttentionLegacy)
     assert layer.norm_cross is None
     assert isinstance(layer.norm2, nn.LayerNorm)
     assert isinstance(layer.ff, ly.FeedForward)

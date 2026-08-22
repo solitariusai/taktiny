@@ -81,32 +81,138 @@ def _parameter_labels(params: PyTree) -> PyTree:
 
 
 def _partition_params(params: PyTree, labels: PyTree) -> tuple[PyTree, PyTree]:
+    def label_value(label: PyTree) -> PyTree:
+        return label.value if isinstance(label, Parameter) else label
+
+    def empty_value(value: PyTree) -> PyTree:
+        if isinstance(value, Parameter):
+            empty = object.__new__(type(value))
+            empty.__dict__.update(value.__dict__)
+            empty.value = None
+            return empty
+        return None
+
     trainable = jax.tree.map(
         lambda value, label: (
-            value if label == 'trainable' else None
+            value
+            if label_value(label) == 'trainable'
+            else empty_value(value)
         ),
         params,
         labels,
+        is_leaf=lambda value: isinstance(value, Parameter),
     )
     frozen = jax.tree.map(
         lambda value, label: (
-            None if label == 'trainable' else value
+            empty_value(value)
+            if label_value(label) == 'trainable'
+            else value
         ),
         params,
         labels,
+        is_leaf=lambda value: isinstance(value, Parameter),
     )
     return trainable, frozen
 
 
 def _combine_params(trainable: PyTree, frozen: PyTree) -> PyTree:
+    def combine_value(
+        trainable_value: PyTree,
+        frozen_value: PyTree,
+    ) -> PyTree:
+        if isinstance(trainable_value, Parameter):
+            if trainable_value.value is None:
+                return frozen_value
+            return trainable_value
+        return frozen_value if trainable_value is None else trainable_value
+
     return jax.tree.map(
-        lambda trainable_value, frozen_value: (
-            frozen_value
-            if trainable_value is None
-            else trainable_value
-        ),
+        combine_value,
         trainable,
         frozen,
+        is_leaf=lambda value: value is None or isinstance(value, Parameter),
+    )
+
+
+def _global_grad_norm(grads: PyTree) -> jax.Array:
+    """Compute the L2 norm of a gradient tree without full-size copies.
+
+    Each leaf is contracted with itself through ``jnp.vdot``, which XLA lowers
+    to a fused dot with float32 accumulation; only a per-leaf scalar is
+    produced. No squared or cast copy of the gradient tree is ever allocated,
+    so the peak memory of the norm is negligible even for huge models.
+    Frozen leaves (``None``) are skipped.
+    """
+    norm_sq = jax.tree.reduce(
+        lambda acc, grad: (
+            acc
+            if grad is None
+            else acc + jnp.vdot(grad, grad).astype(jnp.float32)
+        ),
+        grads,
+        initializer=jnp.asarray(0.0, dtype=jnp.float32),
+        is_leaf=lambda value: value is None,
+    )
+    return jnp.sqrt(norm_sq)
+
+
+def _zeros_like_grads(params: PyTree) -> PyTree:
+    """Build a zero gradient accumulator matching a trainable parameter tree.
+
+    Frozen (``None``) leaves are preserved so the accumulator mirrors the
+    gradient tree returned by ``jax.value_and_grad``.
+    """
+    return jax.tree.map(
+        lambda value: (
+            None if value is None else jnp.zeros_like(value)
+        ),
+        params,
+        is_leaf=lambda value: value is None,
+    )
+
+
+def _accumulate_grads(total: PyTree, value: PyTree) -> PyTree:
+    """Sum two gradient trees, preserving frozen (``None``) leaves."""
+    return jax.tree.map(
+        lambda a, b: (
+            None if a is None or b is None else a + b
+        ),
+        total,
+        value,
+        is_leaf=lambda value: value is None,
+    )
+
+
+def _copy_tree(tree: PyTree) -> PyTree:
+    """Return a fresh structure with independent array leaves."""
+    return jax.tree.map(
+        lambda value: (
+            value.copy()
+            if hasattr(value, 'dtype')
+            else copy.deepcopy(value)
+        ),
+        tree,
+    )
+
+
+def _ema_update(
+    ema: PyTree,
+    params: PyTree,
+    decay: float,
+) -> PyTree:
+    """Blend the EMA tree toward the current weights, in the weights' dtype.
+
+    Frozen (``None``) leaves are passed through unchanged.
+    """
+    def blend(ema_value: Any, param_value: Any) -> Any:
+        if ema_value is None or param_value is None:
+            return param_value
+        return ema_value * decay + param_value * (1.0 - decay)
+
+    return jax.tree.map(
+        blend,
+        ema,
+        params,
         is_leaf=lambda value: value is None,
     )
 
@@ -419,6 +525,7 @@ class Trainer:
         self.micro_step = 0
         self.last_grad_norm = None
         self.last_update_skipped = False
+        self._ema = None
         self._active_data_iterator = None
         self.rngs = Rngs(self.training_config.seed)
         self._loss_accepts_rng = self._callable_accepts_rng(loss_fn)
@@ -711,6 +818,28 @@ class Trainer:
         else:
             raise ValueError("Unsupported model type")
 
+    @property
+    def ema(self) -> Module:
+        """A fresh model holding the EMA weights, without touching ``self.model``.
+
+        Only available when ``TrainingConfig.ema_decay`` is set. Each access
+        returns an independent copy, so callers can evaluate or save it freely.
+        """
+        if self._ema is None:
+            raise RuntimeError(
+                'EMA is disabled; set TrainingConfig.ema_decay to enable it'
+            )
+        return _copy_tree(self._ema)
+
+    def _ema_snapshot(self) -> dict[str, Any] | None:
+        """A host copy of the EMA leaves, or ``None`` when EMA is disabled."""
+        if self._ema is None:
+            return None
+        return {
+            name: np.array(jax.device_get(value), copy=True)
+            for name, value in self._ema.flat_state_dict().items()
+        }
+
     def _setup_optimizer(self, params: PyTree) -> optax.GradientTransformation:
         """Configure an optimizer for the trainable parameter partition."""
         base_opt = self.training_config.optimizer
@@ -910,7 +1039,6 @@ class Trainer:
         metrics = self._evaluate_params(params)
         record = {
             'step': step,
-            'epoch': epoch,
             **metrics,
         }
         self.log_history.append(record)
@@ -1103,6 +1231,7 @@ class Trainer:
                 checkpointer.close()
 
             self.model.load_flat_state_dict(restored)
+            self._load_ema(checkpoint_path)
             return
 
         adapter_config = os.path.join(
@@ -1146,6 +1275,7 @@ class Trainer:
                 checkpoint_path,
                 local=True,
             )
+            self._load_ema(checkpoint_path)
             return
 
         if not has_model:
@@ -1162,6 +1292,112 @@ class Trainer:
             )
 
         load_pretrained(checkpoint_path)
+        self._load_ema(checkpoint_path)
+
+    def _load_ema(self, checkpoint_path: str) -> None:
+        """Restore the EMA tree from a checkpoint, if present and enabled."""
+        if self.training_config.ema_decay is None:
+            return
+        if self.model_type != 'taktiny':
+            raise TypeError('EMA checkpoints require a Taktiny Module')
+
+        self._ema = _copy_tree(self.extract_params())
+
+        single_path = os.path.join(
+            checkpoint_path,
+            'model-ema.safetensors',
+        )
+        index_path = os.path.join(
+            checkpoint_path,
+            'model-ema.safetensors.index.json',
+        )
+
+        from safetensors.numpy import load_file
+
+        if os.path.isfile(index_path):
+            with open(index_path) as f:
+                weight_map = json.load(f).get('weight_map', {})
+            flat: dict[str, Any] = {}
+            for shard in sorted(set(weight_map.values())):
+                shard_path = os.path.join(checkpoint_path, shard)
+                if not os.path.isfile(shard_path):
+                    raise FileNotFoundError(
+                        f'EMA shard not found: {shard_path}'
+                    )
+                flat.update(load_file(shard_path))
+        elif os.path.isfile(single_path):
+            flat = load_file(single_path)
+        else:
+            # Checkpoint predates EMA support; start the EMA from the
+            # restored weights.
+            return
+
+        self._ema.load_flat_state_dict({
+            name: jnp.asarray(value)
+            for name, value in flat.items()
+        })
+
+    def _write_ema_checkpoint(
+        self,
+        temporary_path: str,
+        ema_snapshot: dict[str, Any],
+    ) -> None:
+        """Write the EMA weights using the model's sharded checkpoint layout.
+
+        The EMA files mirror the model's own ``model*.safetensors`` naming
+        with an ``-ema`` suffix, so a sharded model produces e.g.
+        ``model-00001-of-00002-ema.safetensors`` plus a
+        ``model-ema.safetensors.index.json`` index. A single-shard model
+        writes ``model-ema.safetensors``.
+        """
+        if self.model_type != 'taktiny':
+            raise TypeError('EMA checkpoints require a Taktiny Module')
+
+        staging = os.path.join(temporary_path, '_ema_staging')
+        ema_model = _copy_tree(self.model)
+        ema_model.load_flat_state_dict({
+            name: jnp.asarray(value)
+            for name, value in ema_snapshot.items()
+        })
+        ema_model.save_pretrained(
+            staging,
+            max_shard_size=self.training_config.max_shard_size,
+        )
+
+        # Move only the model weight files, renamed with an -ema suffix; the
+        # config and other files are already written by the main model save.
+        for name in os.listdir(staging):
+            if not name.startswith('model'):
+                continue
+            renamed = name
+            if name == 'model.safetensors':
+                renamed = 'model-ema.safetensors'
+            elif name.startswith('model-') and name.endswith('.safetensors'):
+                renamed = name[:-len('.safetensors')] + '-ema.safetensors'
+            elif name == 'model.safetensors.index.json':
+                renamed = 'model-ema.safetensors.index.json'
+            else:
+                continue
+            os.replace(
+                os.path.join(staging, name),
+                os.path.join(temporary_path, renamed),
+            )
+        shutil.rmtree(staging, ignore_errors=True)
+
+        # Point the index's weight_map at the -ema shard filenames.
+        index_path = os.path.join(
+            temporary_path,
+            'model-ema.safetensors.index.json',
+        )
+        if os.path.isfile(index_path):
+            with open(index_path) as f:
+                index = json.load(f)
+            index['weight_map'] = {
+                key: value[:-len('.safetensors')] + '-ema.safetensors'
+                for key, value in index.get('weight_map', {}).items()
+            }
+            with open(index_path, 'w') as f:
+                json.dump(index, f)
 
     def _write_trainer_state(
         self,
@@ -1267,6 +1503,7 @@ class Trainer:
         *,
         model_snapshot: Any,
         optimizer_state: PyTree,
+        ema_snapshot: dict[str, Any] | None = None,
         dataloader_state: tuple[str, Any] | None,
         rng_state: Mapping[str, Any],
         trainer_state: Mapping[str, Any],
@@ -1326,6 +1563,12 @@ class Trainer:
                         max_shard_size=(
                             self.training_config.max_shard_size
                         ),
+                    )
+
+                if ema_snapshot is not None:
+                    self._write_ema_checkpoint(
+                        temporary_path,
+                        ema_snapshot,
                     )
 
             self._sync_hosts(f'taktiny-checkpoint-model-{barrier_name}')
@@ -1468,6 +1711,7 @@ class Trainer:
                 )
             model_snapshot = snapshot()
             optimizer_state = self._host_snapshot(opt_state)
+            ema_snapshot = self._ema_snapshot()
             if self._checkpoint_executor is None:
                 self._checkpoint_executor = ThreadPoolExecutor(
                     max_workers=1,
@@ -1479,6 +1723,7 @@ class Trainer:
                 checkpoint_path,
                 model_snapshot=model_snapshot,
                 optimizer_state=optimizer_state,
+                ema_snapshot=ema_snapshot,
                 dataloader_state=dataloader_state,
                 rng_state=rng_state,
                 trainer_state=trainer_state,
@@ -1491,6 +1736,7 @@ class Trainer:
             checkpoint_path,
             model_snapshot=None,
             optimizer_state=opt_state,
+            ema_snapshot=self._ema_snapshot(),
             dataloader_state=dataloader_state,
             rng_state=rng_state,
             trainer_state=trainer_state,
@@ -1561,7 +1807,6 @@ class Trainer:
             f'[cyan]{self.model_type.upper()}[/cyan] model[/bold green]'
         )
         console.print(
-            f'Epochs: [bold]{self.training_config.epochs}[/bold] | '
             f'Max Steps: [bold]{self.training_config.max_steps}[/bold]'
         )
 
@@ -1665,9 +1910,16 @@ class Trainer:
             self._mesh,
         )
         if self.model_type == 'taktiny':
-            self._inject_params(
-                _combine_params(trainable_params, frozen_params)
+            initial_params = _combine_params(
+                trainable_params,
+                frozen_params,
             )
+            self._inject_params(initial_params)
+            if (
+                self.training_config.ema_decay is not None
+                and self._ema is None
+            ):
+                self._ema = _copy_tree(initial_params)
 
         optimizer = self._setup_optimizer(trainable_params)
         opt_state = optimizer.init(trainable_params)
@@ -1750,8 +2002,7 @@ class Trainer:
             if use_loss_scaling:
                 grads = jax.tree.map(
                     lambda grad: (
-                        grad.astype(jnp.float32)
-                        / current_loss_scale.astype(jnp.float32)
+                        grad / current_loss_scale.astype(grad.dtype)
                     ),
                     grads,
                 )
@@ -1792,15 +2043,28 @@ class Trainer:
             ),
             None,
         )
+        loss_window = deque(
+            maxlen=self.training_config.log_interval,
+        )
+
+        def moving_average_loss() -> float | None:
+            finite_losses = [
+                value
+                for value in loss_window
+                if value is not None and math.isfinite(value)
+            ]
+            if not finite_losses:
+                return None
+            return sum(finite_losses) / len(finite_losses)
+
         grad_norm = None
         update_skipped = False
-        start_epoch = resume_state['epoch'] if resume_state else 0
         resume_step_in_epoch = (
             resume_state['step_in_epoch']
             if resume_state
             else 0
         )
-        epoch = start_epoch
+        epoch = 0
         step_in_epoch = resume_step_in_epoch
         accumulation_steps = (
             self.training_config.gradient_accumulation_steps
@@ -1817,11 +2081,8 @@ class Trainer:
             except TypeError:
                 dataloader_length = None
             if dataloader_length is not None:
-                updates_per_epoch = math.ceil(
+                total_steps = math.ceil(
                     dataloader_length / accumulation_steps
-                )
-                total_steps = (
-                    updates_per_epoch * self.training_config.epochs
                 )
         if self.training_config.max_steps is not None:
             total_steps = self.training_config.max_steps
@@ -1878,20 +2139,39 @@ class Trainer:
                     accumulated_microbatches,
                     dtype=jnp.float32,
                 )
+                # Divide in each gradient's own dtype: the previous float32
+                # divisor promoted every bf16 gradient to a full float32 copy.
+                # Integer microbatch counts are exact in bf16, so averaging
+                # stays exact for power-of-two counts and adds at most one
+                # bf16 rounding step otherwise.
                 averaged_grads = jax.tree.map(
-                    lambda value: value / divisor,
+                    lambda value: (
+                        None
+                        if value is None
+                        else value / divisor.astype(value.dtype)
+                    ),
                     accumulated_grads,
+                    is_leaf=lambda value: value is None,
                 )
                 averaged_loss = accumulated_loss / divisor
-                norm_grads = jax.tree.map(
-                    lambda value: value.astype(jnp.float32),
-                    averaged_grads,
+                # The grad norm is only computed when it is needed: to clip
+                # with max_grad_norm, or to track/report it. Computing it reads
+                # every gradient leaf and keeps the averaged tree alive while
+                # the reduction runs, so disabling it saves that pass entirely
+                # (a further ~2.7% of the gradient tree).
+                track_grad_norm = (
+                    self.training_config.compute_grad_norm
+                    or self.training_config.max_grad_norm is not None
                 )
-                current_grad_norm = optax.tree.norm(norm_grads)
-                finite = (
-                    jnp.isfinite(averaged_loss)
-                    & jnp.isfinite(current_grad_norm)
-                )
+                if track_grad_norm:
+                    current_grad_norm = _global_grad_norm(averaged_grads)
+                    finite = (
+                        jnp.isfinite(averaged_loss)
+                        & jnp.isfinite(current_grad_norm)
+                    )
+                else:
+                    current_grad_norm = None
+                    finite = jnp.isfinite(averaged_loss)
 
                 if self.training_config.max_grad_norm is not None:
                     clip_scale = jnp.minimum(
@@ -1902,15 +2182,24 @@ class Trainer:
                         ),
                     )
                     averaged_grads = jax.tree.map(
-                        lambda value: value * clip_scale.astype(value.dtype),
+                        lambda value: (
+                            None
+                            if value is None
+                            else value * clip_scale.astype(value.dtype)
+                        ),
                         averaged_grads,
+                        is_leaf=lambda value: value is None,
                     )
 
                 loss_value, grad_norm_value, finite_value = jax.device_get(
                     (averaged_loss, current_grad_norm, finite)
                 )
                 loss_value = float(loss_value)
-                grad_norm_value = float(grad_norm_value)
+                grad_norm_value = (
+                    None
+                    if grad_norm_value is None
+                    else float(grad_norm_value)
+                )
                 finite_value = bool(finite_value)
                 update_skipped = (
                     not finite_value
@@ -1933,7 +2222,10 @@ class Trainer:
                                 _tree_shardings(trainable_params),
                                 _tree_shardings(opt_state),
                             ),
-                            donate_argnums=(0, 1),
+                            # Donating averaged_grads lets XLA reuse its buffer
+                            # for the updates instead of allocating a fresh
+                            # full-size gradient tree inside the optimizer step.
+                            donate_argnums=(0, 1, 2),
                         )
                     update_fn = (
                         compiled_optimizer_step or optimizer_step
@@ -1943,6 +2235,18 @@ class Trainer:
                         opt_state,
                         averaged_grads,
                     )
+                    if (
+                        self._ema is not None
+                        and self.training_config.ema_decay is not None
+                    ):
+                        self._ema = _ema_update(
+                            self._ema,
+                            _combine_params(
+                                trainable_params,
+                                frozen_params,
+                            ),
+                            self.training_config.ema_decay,
+                        )
                 else:
                     self.skipped_updates += 1
 
@@ -1962,17 +2266,21 @@ class Trainer:
                 step += 1
                 self.global_step = step
                 self.last_grad_norm = (
-                    grad_norm_value if math.isfinite(grad_norm_value) else None
+                    grad_norm_value
+                    if grad_norm_value is not None
+                    and math.isfinite(grad_norm_value)
+                    else None
                 )
                 self.last_update_skipped = update_skipped
                 loss = loss_value if math.isfinite(loss_value) else None
+                loss_window.append(loss)
+                smoothed_loss = moving_average_loss()
                 grad_norm = self.last_grad_norm
                 steps_run_this_call += 1
                 steps_since_log += 1
                 learning_rate = self._learning_rate_at_step(step)
                 step_logs = {
                     'step': step,
-                    'epoch': current_epoch,
                     'loss': loss,
                     'learning_rate': learning_rate,
                     'grad_norm': grad_norm,
@@ -1994,7 +2302,11 @@ class Trainer:
                 progress.update(
                     task_id,
                     advance=1,
-                    loss=loss_value,
+                    loss=(
+                        smoothed_loss
+                        if smoothed_loss is not None
+                        else float('nan')
+                    ),
                 )
 
                 accumulated_grads = None
@@ -2009,13 +2321,14 @@ class Trainer:
                     )
                     record = {
                         **step_logs,
+                        'loss': smoothed_loss,
                         'seconds_per_step': seconds_per_step,
                     }
                     self.log_history.append(record)
                     self._call_event('on_log', logs=dict(record))
                     loss_text = (
-                        f'{loss:<7.4f}'
-                        if loss is not None
+                        f'{smoothed_loss:<7.4f}'
+                        if smoothed_loss is not None
                         else 'non-finite'
                     )
                     learning_rate_text = (
@@ -2024,7 +2337,6 @@ class Trainer:
                         else ''
                     )
                     progress.console.print(
-                        f"[bold cyan]Epoch {current_epoch:<3}[/bold cyan] ┃ "
                         f"[bold cyan]Step {step:<6}[/bold cyan] "
                         f"[dim]┃ Loss:[/dim] "
                         f"[bold white]{loss_text}[/bold white]"
@@ -2097,23 +2409,17 @@ class Trainer:
                 ):
                     should_stop = True
 
-            for epoch in range(start_epoch, self.training_config.epochs):
+            while not should_stop:
                 if should_stop:
                     break
 
                 epoch_updates_run = 0
-                skip_batches = (
-                    resume_step_in_epoch
-                    if epoch == start_epoch
-                    else 0
-                )
+                skip_batches = resume_step_in_epoch
                 dataloader = self._train_dataloader
-                self._set_dataloader_epoch(dataloader, epoch)
                 data_iterator = iter(dataloader)
                 self._active_data_iterator = data_iterator
                 restored_iterator = (
                     resume_checkpoint is not None
-                    and epoch == start_epoch
                     and self._restore_dataloader_state(
                         data_iterator,
                         resume_checkpoint,
@@ -2142,73 +2448,212 @@ class Trainer:
                     self._place_batch,
                     prefetch_size,
                 )
-                for step_in_epoch, batch in enumerate(
-                    batches,
-                    start=enumerate_start,
-                ):
-                    if (
-                        compiled_gradient_step is None
-                        and self.training_config.jit_compile
-                    ):
-                        donate_argnums = ()
+                use_fused_accumulation = (
+                    self.training_config.jit_compile
+                    and accumulation_steps > 1
+                )
+                if use_fused_accumulation:
+                    # Fused microbatch loop: all microbatches of one optimizer
+                    # step run inside a single jitted ``lax.scan``. Gradient
+                    # trees never round-trip through Python and accumulate in
+                    # place inside the loop body, removing the per-microbatch
+                    # copies of the eager path. Microbatches must share one
+                    # batch structure; partial chunks at epoch boundaries reuse
+                    # the same compiled function through a per-size cache.
+                    fused_cache: dict[int, Any] = {}
+
+                    def make_fused_step(num_batches: int) -> Any:
+                        def fused_step(
+                            init_grads: Any,
+                            current_trainable: Any,
+                            current_frozen: Any,
+                            stacked_batch: Any,
+                            keys: Any,
+                            current_loss_scale: Any,
+                        ) -> tuple[Any, Any]:
+                            def accumulate_body(
+                                carry: Any,
+                                xs: Any,
+                            ) -> tuple[Any, Any]:
+                                acc_grads, acc_loss = carry
+                                batch, key = xs
+                                (_, loss), grads = loss_and_grad(
+                                    current_trainable,
+                                    current_frozen,
+                                    batch,
+                                    current_loss_scale,
+                                    key,
+                                )
+                                if use_loss_scaling:
+                                    grads = jax.tree.map(
+                                        lambda grad: (
+                                            grad
+                                            / current_loss_scale.astype(
+                                                grad.dtype
+                                            )
+                                        ),
+                                        grads,
+                                    )
+                                return (
+                                    _accumulate_grads(acc_grads, grads),
+                                    acc_loss + loss.astype(jnp.float32),
+                                ), None
+
+                            (acc_grads, acc_loss), _ = jax.lax.scan(
+                                accumulate_body,
+                                (
+                                    init_grads,
+                                    jnp.asarray(
+                                        0.0,
+                                        dtype=jnp.float32,
+                                    ),
+                                ),
+                                (stacked_batch, keys),
+                                length=num_batches,
+                            )
+                            return acc_grads, acc_loss
+
+                        return fused_step
+
+                    def get_fused_step(num_batches: int) -> Any:
+                        compiled = fused_cache.get(num_batches)
+                        if compiled is not None:
+                            return compiled
+                        donate_argnums = (0,)
                         if self.training_config.donate_batch:
-                            donate_argnums = (2,)
-                        compiled_gradient_step = jax.jit(
-                            gradient_step,
+                            donate_argnums = (0, 3)
+                        compiled = jax.jit(
+                            make_fused_step(num_batches),
                             in_shardings=(
                                 _tree_shardings(trainable_params),
+                                _tree_shardings(trainable_params),
                                 _tree_shardings(frozen_params),
-                                _tree_shardings(batch),
+                                None,
                                 None,
                                 None,
                             ),
                             out_shardings=(
-                                None,
                                 _tree_shardings(trainable_params),
+                                None,
                             ),
                             donate_argnums=donate_argnums,
                         )
-                    current_gradient_step = (
-                        compiled_gradient_step or gradient_step
-                    )
-                    microbatch_loss, microbatch_grads = (
-                        current_gradient_step(
-                            trainable_params,
-                            frozen_params,
-                            batch,
-                            jnp.asarray(
-                                self.loss_scale,
-                                dtype=jnp.float32,
-                            ),
+                        fused_cache[num_batches] = compiled
+                        return compiled
+
+                    step_in_epoch = enumerate_start - 1
+                    while True:
+                        if should_stop:
+                            break
+                        chunk = list(
+                            islice(batches, accumulation_steps)
+                        )
+                        if not chunk:
+                            break
+                        num_batches = len(chunk)
+                        stacked_batch = jax.tree.map(
+                            lambda *values: jnp.stack(values),
+                            *chunk,
+                        )
+                        keys = jnp.stack([
                             jax.random.fold_in(
                                 self.rngs(),
                                 jax.process_index(),
-                            ),
+                            )
+                            for _ in range(num_batches)
+                        ])
+                        accumulated_grads, accumulated_loss = (
+                            get_fused_step(num_batches)(
+                                _zeros_like_grads(trainable_params),
+                                trainable_params,
+                                frozen_params,
+                                stacked_batch,
+                                keys,
+                                jnp.asarray(
+                                    self.loss_scale,
+                                    dtype=jnp.float32,
+                                ),
+                            )
                         )
-                    )
-                    if accumulated_grads is None:
-                        accumulated_grads = microbatch_grads
-                        accumulated_loss = microbatch_loss.astype(jnp.float32)
-                    else:
-                        accumulated_grads = jax.tree.map(
-                            lambda total, value: total + value,
-                            accumulated_grads,
-                            microbatch_grads,
-                        )
-                        accumulated_loss = (
-                            accumulated_loss
-                            + microbatch_loss.astype(jnp.float32)
-                        )
-                    accumulated_microbatches += 1
-                    self.micro_step += 1
-                    microbatches_run_this_call += 1
+                        accumulated_microbatches = num_batches
+                        step_in_epoch += num_batches
+                        self.micro_step += num_batches
+                        microbatches_run_this_call += num_batches
 
-                    if accumulated_microbatches == accumulation_steps:
-                        finish_accumulation(epoch, step_in_epoch)
-                        epoch_updates_run += 1
-                    if should_stop:
-                        break
-                batches.close()
+                        if accumulated_microbatches == accumulation_steps:
+                            finish_accumulation(epoch, step_in_epoch)
+                            epoch_updates_run += 1
+                    batches.close()
+
+                else:
+                    for step_in_epoch, batch in enumerate(
+                        batches,
+                        start=enumerate_start,
+                    ):
+                        if (
+                            compiled_gradient_step is None
+                            and self.training_config.jit_compile
+                        ):
+                            donate_argnums = ()
+                            if self.training_config.donate_batch:
+                                donate_argnums = (2,)
+                            compiled_gradient_step = jax.jit(
+                                gradient_step,
+                                in_shardings=(
+                                    _tree_shardings(trainable_params),
+                                    _tree_shardings(frozen_params),
+                                    _tree_shardings(batch),
+                                    None,
+                                    None,
+                                ),
+                                out_shardings=(
+                                    None,
+                                    _tree_shardings(trainable_params),
+                                ),
+                                donate_argnums=donate_argnums,
+                            )
+                        current_gradient_step = (
+                            compiled_gradient_step or gradient_step
+                        )
+                        microbatch_loss, microbatch_grads = (
+                            current_gradient_step(
+                                trainable_params,
+                                frozen_params,
+                                batch,
+                                jnp.asarray(
+                                    self.loss_scale,
+                                    dtype=jnp.float32,
+                                ),
+                                jax.random.fold_in(
+                                    self.rngs(),
+                                    jax.process_index(),
+                                ),
+                            )
+                        )
+                        if accumulated_grads is None:
+                            accumulated_grads = microbatch_grads
+                            accumulated_loss = microbatch_loss.astype(
+                                jnp.float32
+                            )
+                        else:
+                            accumulated_grads = _accumulate_grads(
+                                accumulated_grads,
+                                microbatch_grads,
+                            )
+                            accumulated_loss = (
+                                accumulated_loss
+                                + microbatch_loss.astype(jnp.float32)
+                            )
+                        accumulated_microbatches += 1
+                        self.micro_step += 1
+                        microbatches_run_this_call += 1
+
+                        if accumulated_microbatches == accumulation_steps:
+                            finish_accumulation(epoch, step_in_epoch)
+                            epoch_updates_run += 1
+                        if should_stop:
+                            break
+                    batches.close()
 
                 if accumulated_microbatches and not should_stop:
                     finish_accumulation(epoch, step_in_epoch)
@@ -2228,7 +2673,6 @@ class Trainer:
                     )
                     progress.console.print(
                         f"[bold cyan]Evaluation[/bold cyan] ┃ "
-                        f"[bold cyan]Epoch {epoch:<3}[/bold cyan] "
                         f"[dim]┃ Loss:[/dim] "
                         f"[bold white]{metrics['eval_loss']:.4f}"
                         f"[/bold white]"
@@ -2250,6 +2694,19 @@ class Trainer:
                         )
                 resume_step_in_epoch = 0
 
+                # With no max_steps the dataloader is consumed once; otherwise
+                # cycle it (the dataloader owns its own shuffling) until
+                # max_steps is reached.
+                if self.training_config.max_steps is None:
+                    break
+                if epoch_updates_run == 0:
+                    # The dataloader yielded nothing this pass (e.g. a
+                    # one-shot iterator that can no longer be re-iterated).
+                    break
+                if should_stop:
+                    # max_steps was reached on this pass; do not start another.
+                    break
+
             if microbatches_run_this_call == 0 and step == 0:
                 raise ValueError('dataloader produced no training batches')
 
@@ -2263,10 +2720,10 @@ class Trainer:
                     / max(1, steps_since_log)
                 )
                 learning_rate = self._learning_rate_at_step(step)
+                smoothed_loss = moving_average_loss()
                 self.log_history.append({
                     'step': step,
-                    'epoch': epoch,
-                    'loss': loss,
+                    'loss': smoothed_loss,
                     'seconds_per_step': seconds_per_step,
                     'learning_rate': learning_rate,
                     'grad_norm': grad_norm,
@@ -2278,7 +2735,9 @@ class Trainer:
                     logs=dict(self.log_history[-1]),
                 )
                 loss_text = (
-                    f'{loss:<7.4f}' if loss is not None else 'non-finite'
+                    f'{smoothed_loss:<7.4f}'
+                    if smoothed_loss is not None
+                    else 'non-finite'
                 )
                 learning_rate_text = (
                     f' [dim]┃ LR: {learning_rate:.3e}[/dim]'
@@ -2286,7 +2745,6 @@ class Trainer:
                     else ''
                 )
                 progress.console.print(
-                    f"[bold cyan]Epoch {epoch:<3}[/bold cyan] ┃ "
                     f"[bold cyan]Step {step:<6}[/bold cyan] "
                     f"[dim]┃ Loss:[/dim] "
                     f"[bold white]{loss_text}[/bold white]"

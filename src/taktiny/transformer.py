@@ -13,19 +13,15 @@
 # limitations under the License.
 from __future__ import annotations
 
-from taktiny.cosettes.transformers._ordinario import (
+from taktiny.cosettes.transformers.ordinario import (
     TransformerContext,
-    TransformerCausalLM,
-    TransformerConditionalGeneration,
-    TransformerDecoderLayer,
-    TransformerModel
 )
 
 # Llama
 from taktiny.cosettes.transformers import LlamaDecoderLayer
 
 # Qwen
-from taktiny.cosettes.transformers import QwenDecoderLayer, Qwen2DecoderLayer
+from taktiny.cosettes.transformers import Qwen2DecoderLayer
 
 # Gemma
 from taktiny.cosettes.transformers import (
@@ -36,12 +32,7 @@ from taktiny.cosettes.transformers import (
 
 __all__ = [
     'TransformerContext',
-    'TransformerCausalLM',
-    'TransformerConditionalGeneration',
-    'TransformerDecoderLayer',
-    'TransformerModel',
     'LlamaDecoderLayer',
-    'QwenDecoderLayer',
     'Qwen2DecoderLayer',
     'GemmaDecoderLayer',
     'Gemma2DecoderLayer',

@@ -1,4 +1,10 @@
-from ._prelude import DatasetUtils, Map, BatchMap
+from .prelude import (
+    DatasetUtils,
+    Map,
+    BatchMap,
+    tokenize,
+    train_validation_split,
+)
 from .text import ApplyTemplate, CausalLMBatch, PackSequences
 
 __all__ = [
@@ -8,4 +14,6 @@ __all__ = [
     'PackSequences',
     'CausalLMBatch',
     'ApplyTemplate',
+    'tokenize',
+    'train_validation_split',
 ]

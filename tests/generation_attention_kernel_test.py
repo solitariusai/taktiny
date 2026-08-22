@@ -2,11 +2,12 @@ import jax.numpy as jnp
 import pytest
 
 from taktiny import nn
+from taktiny.cosettes.transformers.ordinario import TransformerMultimodalLM
 from taktiny.maestro.config import ModelConfig
 from taktiny.maestro.opus.llama import Llama
 
 
-def _model(*, use_list=False, **config_overrides):
+def _model(*, stack_type='stack', **config_overrides):
     values = {
         'num_hidden_layers': 1,
         'vocab_size': 32,
@@ -32,7 +33,7 @@ def _model(*, use_list=False, **config_overrides):
     return Llama(
         ModelConfig(**values),
         rngs=nn.Rngs(0),
-        use_list=use_list,
+        stack_type=stack_type,
     )
 
 
@@ -41,8 +42,8 @@ def test_generation_attention_kernel_auto_policy(monkeypatch):
 
     monkeypatch.setattr('jax.default_backend', lambda: 'tpu')
     assert model._resolve_generation_attention_kernels('auto') == (
-        'flash',
-        'ragged',
+        'dot_product',
+        'dot_product',
     )
 
 
@@ -60,12 +61,10 @@ def test_generation_attention_kernel_auto_respects_model_features(monkeypatch):
         'dot_product',
     )
     assert sliding._resolve_generation_attention_kernels('auto') == (
-        'flash',
-        'dot_product',
+        'dot_product', 'dot_product'
     )
     assert inactive_sliding._resolve_generation_attention_kernels('auto') == (
-        'flash',
-        'ragged',
+        'dot_product', 'dot_product'
     )
 
 
@@ -75,9 +74,9 @@ def test_generation_attention_kernel_accepts_phase_mapping_and_aliases():
     assert model._resolve_generation_attention_kernels(
         {
             'prefill': 'flash_attention',
-            'decode': 'ragged_attention',
+            'decode': 'standard',
         }
-    ) == ('flash', 'ragged')
+    ) == ('flash', 'dot_product')
     assert model._resolve_generation_attention_kernels('jax') == (
         'dot_product',
         'dot_product',
@@ -88,8 +87,8 @@ def test_generation_attention_kernel_accepts_phase_mapping_and_aliases():
     ('kernel', 'message'),
     [
         ('unknown', 'unsupported attention kernel'),
-        ({'prefill': 'ragged'}, 'decode-only'),
-        ({'decode': 'ring'}, 'prebuilt topology-specific kernel'),
+        ({'prefill': 'ragged'}, 'unsupported attention kernel'),
+        ({'decode': 'ring'}, 'unsupported attention kernel'),
         ({'prefill': 'flash', 'extra': 'flash'}, 'unknown attention_kernel'),
     ],
 )
@@ -100,7 +99,7 @@ def test_generation_attention_kernel_rejects_invalid_policies(kernel, message):
         model._resolve_generation_attention_kernels(kernel)
 
 
-def test_flash_prefill_and_ragged_decode_match_dot_product_generation():
+def test_flash_prefill_and_dot_decode_match_dot_product_generation():
     model = _model()
     input_ids = jnp.asarray(
         [[0, 0, 1, 2], [3, 4, 5, 6]],
@@ -126,7 +125,7 @@ def test_flash_prefill_and_ragged_decode_match_dot_product_generation():
         input_ids,
         attention_kernel={
             'prefill': 'flash',
-            'decode': 'ragged',
+            'decode': 'dot_product',
         },
         **generation_args,
     )
@@ -141,7 +140,7 @@ def test_flash_prefill_and_ragged_decode_match_dot_product_generation():
                 input_ids,
                 attention_kernel={
                     'prefill': 'flash',
-                    'decode': 'ragged',
+                    'decode': 'dot_product',
                 },
                 **generation_args,
             )
@@ -161,18 +160,18 @@ def test_generation_attention_kernel_auto_uses_dense_decode_off_tpu(
     monkeypatch.setattr('jax.default_backend', lambda: 'gpu')
 
     assert model._resolve_generation_attention_kernels('auto') == (
-        'flash',
+        'dot_product',
         'dot_product',
     )
 
-    with pytest.raises(ValueError, match='requires a TPU backend'):
+    with pytest.raises(ValueError, match='unsupported attention kernel'):
         model._resolve_generation_attention_kernels(
             {'prefill': 'flash', 'decode': 'ragged'}
         )
 
 
 def test_generation_uses_current_sliced_layer_count():
-    model = _model(num_hidden_layers=3, use_list=True)
+    model = _model(num_hidden_layers=3, stack_type='list')
     model.model.layers = model.model.layers[:2]
 
     output = model.generate(
@@ -185,3 +184,26 @@ def test_generation_uses_current_sliced_layer_count():
 
     assert isinstance(model.model.layers, nn.List)
     assert output.shape == (1, 5)
+
+
+def test_multimodal_generation_forwards_streamer_to_language_model():
+    class LanguageModel:
+        def generate(self, **kwargs):
+            self.kwargs = kwargs
+            return kwargs['input_ids']
+
+    streamer = object()
+    language_model = LanguageModel()
+    model = object.__new__(TransformerMultimodalLM)
+    model.language_model = language_model
+    input_ids = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+
+    output = model.generate(
+        input_ids,
+        max_new_tokens=2,
+        streamer=streamer,
+    )
+
+    assert output is input_ids
+    assert language_model.kwargs['streamer'] is streamer
+

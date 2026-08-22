@@ -7,7 +7,7 @@ import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from taktiny import nn
-from taktiny.layers import JointTransformerLayer
+from taktiny.cosettes.layers import JointTransformerLayer
 from taktiny.utils.typing import ShardMode
 
 

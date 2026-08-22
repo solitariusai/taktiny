@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from taktiny.maestro._prelude import Maestro
+from taktiny.maestro.prelude import Maestro
 from taktiny.maestro import opus
 
 __all__ = ['Maestro', 'opus']

@@ -420,14 +420,6 @@ wheels = [
 ]
 
 [[package]]
-name = "dextiny"
-version = "0.0.1"
-source = { git = "https://github.com/solitariusai/dextiny#5d7c23d7333dc37ae7cc9f446d85c10cff209867" }
-dependencies = [
-    { name = "jax" },
-]
-
-[[package]]
 name = "diffusers"
 version = "0.39.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2277,7 +2269,6 @@ wandb = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "dextiny" },
     { name = "diffusers" },
     { name = "equinox" },
     { name = "flax" },
@@ -2307,7 +2298,6 @@ provides-extras = ["tensorboard", "wandb", "reporting"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "dextiny", git = "https://github.com/solitariusai/dextiny" },
     { name = "diffusers", specifier = ">=0.39.0" },
     { name = "equinox", specifier = ">=0.13.8" },
     { name = "flax", specifier = ">=0.12.7" },

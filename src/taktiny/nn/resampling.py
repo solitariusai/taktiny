@@ -21,7 +21,7 @@ from numbers import Real
 import jax
 
 from taktiny import nn
-from taktiny.nn._continuo import (
+from taktiny.nn.continuo import (
     _as_batched,
     _constrain,
     _normalize_adaptive_size,

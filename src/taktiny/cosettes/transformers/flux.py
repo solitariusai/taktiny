@@ -21,13 +21,13 @@ import typing as tp
 import jax
 import jax.numpy as jnp
 
-from taktiny import layers as ly
+from taktiny.cosettes import layers as ly
 from taktiny import nn
-from taktiny.cosettes._continuo import (
+from taktiny.cosettes.continuo import (
     _config_value,
     combine_joint_positions as _combine_positions,
 )
-from taktiny.cosettes.transformers._ordinario import (
+from taktiny.cosettes.transformers.ordinario import (
     GatedParallelTransformerLayer,
     JointTransformerLayer,
 )
@@ -255,7 +255,7 @@ class Flux2JointAttention(ly.JointAttention):
         value = jnp.concatenate((v2, v1), axis=1)
         if self.pos_emb is not None:
             query, key = self.pos_emb(query, key, position_idx)
-        output = ly.Attention.apply(
+        output = ly.AttentionLegacy.apply(
             query,
             key,
             value,
@@ -382,7 +382,7 @@ class Flux2ParallelSelfAttention(nn.Module):
             **options,
         )
         norm_options = {
-            'eps': eps,
+            'epsilon': eps,
             'dtype': dtype,
             'axis_names': ('head_dim',),
             'shard_mode': shard_mode,
@@ -418,7 +418,7 @@ class Flux2ParallelSelfAttention(nn.Module):
         if self.pos_emb is not None:
             query, key = self.pos_emb(query, key, position_idx)
 
-        attention = ly.Attention.apply(
+        attention = ly.AttentionLegacy.apply(
             query,
             key,
             value,

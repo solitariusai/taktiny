@@ -2,9 +2,9 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from taktiny import layers as ly
+from taktiny.cosettes import layers as ly
 from taktiny import nn
-from taktiny.cosettes.transformers._ordinario import (
+from taktiny.cosettes.transformers.ordinario import (
     ConditionalTransformerLayer,
 )
 from taktiny.cosettes.transformers.sana import (
@@ -47,7 +47,7 @@ def test_sana_layer_declares_conditional_topology():
     assert isinstance(layer.norm1, nn.LayerNorm)
     assert not layer.norm1.elementwise_affine
     assert isinstance(layer.attn1, SanaLinearAttention)
-    assert isinstance(layer.attn2, ly.Attention)
+    assert isinstance(layer.attn2, ly.AttentionLegacy)
     assert isinstance(layer.norm2, nn.LayerNorm)
     assert isinstance(layer.ff, ly.GLUMBConv)
     assert layer.scale_shift_table.shape == (6, 8)

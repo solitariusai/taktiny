@@ -27,7 +27,6 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
-    "dextiny",
     "diffusers>=0.39.0",
     "equinox>=0.13.8",
     "flax>=0.12.7",
@@ -36,9 +35,6 @@ dev = [
     "tiktoken>=0.13.0",
     "torchvision>=0.27.1",
 ]
-
-[tool.uv.sources]
-dextiny = { git = "https://github.com/solitariusai/dextiny" }
 
 [tool.pytest.ini_options]
 markers = [

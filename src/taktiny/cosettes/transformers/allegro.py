@@ -19,10 +19,10 @@ import typing as tp
 
 import jax
 
-from taktiny import layers as ly
+from taktiny.cosettes import layers as ly
 from taktiny import nn
-from taktiny.cosettes._continuo import _config_value
-from taktiny.cosettes.transformers._ordinario import (
+from taktiny.cosettes.continuo import _config_value
+from taktiny.cosettes.transformers.ordinario import (
     ConditionalTransformerLayer,
 )
 from taktiny.maestro.config import ModelConfig
@@ -49,8 +49,8 @@ class AllegroTransformerLayer(ConditionalTransformerLayer):
             attention_bias=attention_bias,
             cross_attention_bias=attention_bias,
             input_layernorm=nn.LayerNorm,
-            self_attention=ly.Attention,
-            cross_attention=ly.Attention,
+            self_attention=ly.AttentionLegacy,
+            cross_attention=ly.AttentionLegacy,
             post_attention_layernorm=nn.LayerNorm,
             mlp=ly.FeedForward,
         )

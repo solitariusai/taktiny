@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from taktiny.layers import Attention
+from taktiny.cosettes.layers import AttentionLegacy
 
 
 pytestmark = [
@@ -18,7 +18,7 @@ def test_gpu_flash_attention_matches_dot_product(qkv):
     query, key, value = qkv()
 
     expected = jax.jit(
-        lambda q, k, v: Attention.apply(
+        lambda q, k, v: AttentionLegacy.apply(
             q,
             k,
             v,
@@ -27,7 +27,7 @@ def test_gpu_flash_attention_matches_dot_product(qkv):
         )
     )(query, key, value)
     actual = jax.jit(
-        lambda q, k, v: Attention.apply(
+        lambda q, k, v: AttentionLegacy.apply(
             q,
             k,
             v,

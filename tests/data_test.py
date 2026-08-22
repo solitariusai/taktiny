@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 from datasets import Dataset
 
-from taktiny.data._prelude import BatchMap, DatasetUtils, Map
+from taktiny.data import BatchMap, DatasetUtils, Map, tokenize, train_validation_split
 
 
 def test_map_requires_callable():
@@ -171,3 +171,82 @@ def test_from_datasets_validates_configuration(kwargs):
 
     with pytest.raises((TypeError, ValueError)):
         DatasetUtils.from_datasets(source, **kwargs)
+
+
+def test_from_datasets_defaults_to_single_epoch():
+    import inspect
+
+    sig = inspect.signature(DatasetUtils.from_datasets)
+
+    assert sig.parameters['num_epochs'].default == 1
+
+
+class _MockTokenizer:
+    def __call__(self, text, return_tensors=None, truncation=None, max_length=None):
+        ids = [ord(c) % 20 + 1 for c in text]
+        if max_length:
+            ids = ids[:max_length]
+        return {'input_ids': np.asarray([ids], dtype=np.int32)}
+
+
+def test_from_iterable_materializes_source():
+    loader = DatasetUtils.from_iterable(
+        [{'x': i} for i in range(4)],
+        num_epochs=1,
+        shuffle=False,
+        seed=0,
+    )
+
+    assert [record['x'] for record in loader] == [0, 1, 2, 3]
+
+
+def test_train_validation_split_by_fraction():
+    source = [{'x': i} for i in range(10)]
+
+    train, validation = train_validation_split(
+        source,
+        0.3,
+        shuffle=False,
+    )
+
+    assert len(train) == 7
+    assert len(validation) == 3
+    assert train[0] == {'x': 3}
+    assert validation[0] == {'x': 0}
+
+
+def test_train_validation_split_by_count():
+    source = [{'x': i} for i in range(10)]
+
+    train, validation = train_validation_split(
+        source,
+        2,
+        shuffle=False,
+    )
+
+    assert len(train) == 8
+    assert len(validation) == 2
+
+
+def test_tokenize_operation_produces_input_ids():
+    data = [{'text': 'hello world'}]
+    loader = DatasetUtils.from_datasets(
+        data,
+        operations=[
+            tokenize(
+                _MockTokenizer(),
+                'text',
+                max_length=8,
+                labels=True,
+            ),
+        ],
+        num_epochs=1,
+        shuffle=False,
+        seed=0,
+    )
+
+    record = list(loader)[0]
+
+    assert 'input_ids' in record
+    assert 'labels' in record
+    assert np.asarray(record['input_ids']).shape == (8,)

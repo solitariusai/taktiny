@@ -9,8 +9,8 @@ from safetensors import safe_open
 from safetensors.numpy import save_file
 
 from taktiny import Takt, nn
-from taktiny.cosettes import _overture as pretrained_base
-from taktiny.cosettes._overture import PretrainedModel
+from taktiny.cosettes import overture as pretrained_base
+from taktiny.cosettes.overture import PretrainedModel
 from taktiny.maestro.config import ModelConfig
 from taktiny.peft import LoraConfig
 

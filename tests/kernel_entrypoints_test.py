@@ -4,22 +4,22 @@ import numpy as np
 import pytest
 
 from taktiny import nn
-from taktiny.kernels.attention.flash_attention import (
+from taktiny.cosettes.kernels.attention.flash_attention import (
     flash_attention_block_masked,
 )
-from taktiny.kernels.attention.tokamax_splash import (
-    ring_attention_kernel,
+from taktiny.cosettes.kernels.attention.tokamax_splash import ring_attention_kernel
+from taktiny.cosettes.kernels.attention.tokamax_splash import (
     splash_attention_mask,
 )
-from taktiny.kernels.ragged import ragged_gather
-from taktiny.kernels.ragged.ragged_gather_reduce import (
+from taktiny.cosettes.kernels.ragged import ragged_gather
+from taktiny.cosettes.kernels.ragged.ragged_gather_reduce import (
     ragged_gather_reduce as ragged_gather_reduce_v1,
 )
-from taktiny.kernels.ragged.ragged_gather_reduce_v2 import (
+from taktiny.cosettes.kernels.ragged.ragged_gather_reduce_v2 import (
     ragged_gather_reduce as ragged_gather_reduce_v2,
 )
-from taktiny.layers.attention import Attention
-from taktiny.layers.ffn import FusedGateMLP, MoeFFN
+from taktiny.cosettes.layers.attention import AttentionLegacy
+from taktiny.cosettes.layers.ffn import FusedGateMLP, MoEFFN
 
 
 def _qkv(*, query_heads=4, key_heads=2, query_length=4, key_length=4):
@@ -69,7 +69,7 @@ def test_attention_kernel_entry_matches_dot_product_gqa(
         ]
     )
 
-    expected = Attention.apply(
+    expected = AttentionLegacy.apply(
         query,
         key,
         value,
@@ -78,7 +78,7 @@ def test_attention_kernel_entry_matches_dot_product_gqa(
         scale=0.25,
         is_causal=True,
     )
-    actual = Attention.apply(
+    actual = AttentionLegacy.apply(
         query,
         key,
         value,
@@ -94,7 +94,7 @@ def test_attention_kernel_entry_matches_dot_product_gqa(
 
 
 def test_attention_derives_packed_boundaries_from_position_ids():
-    attention = Attention(
+    attention = AttentionLegacy(
         hidden_size=8,
         num_heads=2,
         head_dim=4,
@@ -143,7 +143,7 @@ def test_attention_kernel_entry_is_jittable(kernel, kernel_kwargs):
     query, key, value = _qkv()
     mask = jnp.tril(jnp.ones((4, 4), dtype=jnp.bool_))
     apply = jax.jit(
-        lambda q, k, v: Attention.apply(
+        lambda q, k, v: AttentionLegacy.apply(
             q,
             k,
             v,
@@ -265,7 +265,7 @@ def test_splash_entry_supports_per_batch_per_head_masks():
         ]
     )
 
-    actual = Attention.apply(
+    actual = AttentionLegacy.apply(
         query,
         key,
         value,
@@ -297,7 +297,7 @@ def test_ragged_entry_matches_prefix_masked_decode(key_heads):
         < lengths[:, None, None, None]
     )
 
-    actual = Attention.apply(
+    actual = AttentionLegacy.apply(
         query,
         key,
         value,
@@ -323,7 +323,7 @@ def test_ragged_entry_rejects_prefill_and_non_prefix_masks():
     query, key, value = _qkv()
 
     with pytest.raises(ValueError, match='decode kernel'):
-        Attention.apply(
+        AttentionLegacy.apply(
             query,
             key,
             value,
@@ -331,7 +331,7 @@ def test_ragged_entry_rejects_prefill_and_non_prefix_masks():
         )
 
     with pytest.raises(ValueError, match='uses lengths'):
-        Attention.apply(
+        AttentionLegacy.apply(
             query[:, :1],
             key,
             value,
@@ -350,7 +350,7 @@ def test_ring_entry_calls_prebuilt_kernel_in_bhld_layout():
         assert segment_ids is None
         return q
 
-    actual = Attention.apply(
+    actual = AttentionLegacy.apply(
         query,
         key,
         value,
@@ -366,7 +366,7 @@ def test_ring_entry_requires_prebuilt_kernel():
     query, key, value = _qkv()
 
     with pytest.raises(ValueError, match='ring_kernel is required'):
-        Attention.apply(query, key, value, kernel='ring')
+        AttentionLegacy.apply(query, key, value, kernel='ring')
 
 
 @pytest.mark.parametrize(
@@ -407,7 +407,7 @@ def test_attention_entry_rejects_unsupported_additive_bias(kernel):
     query, key, value = _qkv()
 
     with pytest.raises(ValueError, match='does not support additive bias'):
-        Attention.apply(
+        AttentionLegacy.apply(
             query,
             key,
             value,
@@ -420,7 +420,7 @@ def test_attention_entry_rejects_unknown_kernel():
     query, key, value = _qkv()
 
     with pytest.raises(ValueError, match='Unknown attention kernel'):
-        Attention.apply(query, key, value, kernel='unknown')
+        AttentionLegacy.apply(query, key, value, kernel='unknown')
 
 
 @pytest.mark.parametrize('kernel', [None, 1, object()])
@@ -428,7 +428,7 @@ def test_attention_entry_rejects_non_string_kernel(kernel):
     query, key, value = _qkv()
 
     with pytest.raises(TypeError, match='kernel must be a string'):
-        Attention.apply(query, key, value, kernel=kernel)
+        AttentionLegacy.apply(query, key, value, kernel=kernel)
 
 
 def _gmm_inputs(*, transpose_rhs=False):
@@ -451,7 +451,7 @@ def _reference_gmm(lhs, rhs, group_sizes, *, transpose_rhs=False):
     return jnp.einsum('mk,mkn->mn', lhs, rhs[group_ids])
 
 
-@pytest.mark.parametrize('entry', [FusedGateMLP, MoeFFN])
+@pytest.mark.parametrize('entry', [FusedGateMLP, MoEFFN])
 @pytest.mark.parametrize('transpose_rhs', [False, True])
 def test_gmm_entry_matches_grouped_matmul(entry, transpose_rhs):
     lhs, rhs, group_sizes = _gmm_inputs(
@@ -486,7 +486,7 @@ def test_gmm_entry_forward_and_backward_match_reference():
     )
 
     def kernel_loss(left, right):
-        out = MoeFFN.apply(
+        out = MoEFFN.apply(
             left,
             right,
             group_sizes,
@@ -509,7 +509,7 @@ def test_gmm_entry_forward_and_backward_match_reference():
 def test_gmm_entry_is_jittable():
     lhs, rhs, group_sizes = _gmm_inputs()
     apply = jax.jit(
-        lambda left, right, sizes: MoeFFN.apply(
+        lambda left, right, sizes: MoEFFN.apply(
             left,
             right,
             sizes,
@@ -523,7 +523,7 @@ def test_gmm_entry_is_jittable():
     assert jnp.allclose(actual, expected, rtol=1e-6, atol=1e-6)
 
 
-@pytest.mark.parametrize('entry', [FusedGateMLP, MoeFFN])
+@pytest.mark.parametrize('entry', [FusedGateMLP, MoEFFN])
 def test_route_and_unroute_preserve_token_multiplicity(entry):
     tokens = jnp.arange(12, dtype=jnp.float32).reshape(4, 3)
     selected_experts = jnp.asarray(
@@ -559,7 +559,7 @@ def test_route_custom_gradient_matches_top_k_multiplicity():
     )
 
     def loss(tokens):
-        routed, _ = MoeFFN.apply_route(
+        routed, _ = MoEFFN.apply_route(
             tokens,
             selected_experts,
             num_groups=2,
@@ -577,7 +577,7 @@ def test_moe_entry_rejects_unknown_kernel():
     lhs, rhs, group_sizes = _gmm_inputs()
 
     with pytest.raises(ValueError, match='Unknown MoE kernel'):
-        MoeFFN.apply(
+        MoEFFN.apply(
             lhs,
             rhs,
             group_sizes,
@@ -585,7 +585,7 @@ def test_moe_entry_rejects_unknown_kernel():
         )
 
 
-@pytest.mark.parametrize('entry', [FusedGateMLP, MoeFFN])
+@pytest.mark.parametrize('entry', [FusedGateMLP, MoEFFN])
 @pytest.mark.parametrize('kernel', [None, 1, object()])
 def test_moe_entry_rejects_non_string_kernel(entry, kernel):
     lhs, rhs, group_sizes = _gmm_inputs()

@@ -20,7 +20,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from jax.tree_util import register_pytree_node_class
 import typing as tp
 
-from taktiny.utils.typing import ParameterDict, PyTree, StateDict
+from taktiny.utils.typing import AxisNames, ParameterDict, PyTree, StateDict
 from taktiny.utils.format import format_params, format_bytes, format_dtype
 
 def iter_children(obj: object) -> Iterator[tuple[str, Module | Parameter]]:
@@ -99,7 +99,7 @@ def build_tree_repr(
     return [], 0, 0
 
 def _is_dynamic(v: object) -> bool:
-    if isinstance(v, (Module, Parameter, jax.Array)):
+    if isinstance(v, (Module, Parameter, jax.Array, qwix.QArray)):
         return True
     if hasattr(jax.numpy, 'ndarray') and isinstance(v, jax.numpy.ndarray):
         return True
@@ -217,10 +217,39 @@ class Module:
                 if name in state:
                     child.load_state_dict(state[name])
 
+    def __call__(self, *args: tp.Any, **kwds: tp.Any) -> tp.Any:
+        pass
+
 class Parameter(Module):
-    def __init__(self, array: PyTree, *, trainable: bool = True) -> None:
+    def __init__(
+        self, array: PyTree, *,
+        trainable: bool = True,
+        axis_names: tp.Optional[AxisNames] = None
+    ) -> None:
         self.value = array
         self.trainable = trainable
+        self.axis_names = axis_names
+
+    def tree_flatten(
+        self,
+    ) -> tuple[tuple[PyTree], dict[str, tp.Any]]:
+        static_data = {
+            name: value
+            for name, value in self.__dict__.items()
+            if name != 'value'
+        }
+        return (self.value,), static_data
+
+    @classmethod
+    def tree_unflatten(
+        cls,
+        aux_data: dict[str, tp.Any],
+        children: tp.Sequence[PyTree],
+    ) -> tp.Self:
+        parameter = object.__new__(cls)
+        parameter.__dict__.update(aux_data)
+        parameter.value = children[0]
+        return parameter
 
     def __repr__(self) -> str:
         return (
@@ -238,23 +267,6 @@ class Parameter(Module):
 
     def __getattr__(self, name: str) -> tp.Any:
         return getattr(self.value, name)
-
-    def tree_flatten(self) -> tuple[tuple[PyTree], dict[str, tp.Any]]:
-        aux = {k: v for k, v in self.__dict__.items() if k != 'value'}
-        return (self.value,), aux
-
-    @classmethod
-    def tree_unflatten(
-        cls,
-        aux_data: Mapping[str, tp.Any],
-        children: Sequence[PyTree],
-    ) -> tp.Self:
-        obj = object.__new__(cls)
-        obj.value = children[0]
-        if aux_data:
-            for k, v in aux_data.items():
-                setattr(obj, k, v)
-        return obj
 
 def _make_magic_methods() -> None:
     for op in ['add', 'sub', 'mul', 'truediv', 'floordiv', 'mod', 'pow', 'matmul',

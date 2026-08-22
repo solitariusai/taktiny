@@ -95,11 +95,15 @@ model = Maestro.from_pretrained(
 )
 ```
 
-For a uniform weight-only format, `dtype="int8"` and `dtype="int4"` remain
-shortcuts. The quantized dtype describes linear-weight and embedding-table
-storage. Activations, quantization scales, and operation outputs remain BF16
-by default, while Qwix selects the available dot implementation for the
-quantized operands.
+For a convenient weight-only format, use `quant="int8"` or `quant="int4"`;
+the legacy quantized `dtype` values remain equivalent shortcuts. They quantize
+linear weights while keeping embedding tables and tied output heads dense. The
+4-bit shortcuts use groups of 128 input values to avoid the large cumulative
+error of whole-channel quantization.
+Activations, quantization scales, and operation outputs remain BF16 by
+default, while Qwix selects the available dot implementation for quantized
+operands. Use an explicit Qwix rule when embedding quantization or another
+group size is intentional.
 
 The shortcut can be combined with explicit rules. Explicit rules are checked
 first, and the dtype is used as the fallback for unmatched modules:
@@ -300,7 +304,6 @@ trainer = Trainer(
     model=model,
     loss_fn=loss_fn,
     training_config=TrainingConfig(
-        epochs=1,
         max_steps=1_000,
         optimizer=optax.adamw(3e-4),
         log_interval=10,
@@ -329,59 +332,6 @@ For gated repositories, `HF_TOKEN` takes precedence over `hf_token`. Repository
 loading, token resolution, preprocessing, and Grain wrapping are all skipped
 when `dataloader` is supplied explicitly.
 
-### Supervised Fine-Tuning
-
-`SFTTrainer` specializes the same training loop with causal language-model
-loss, tokenization, dynamic padding, and optional sequence packing:
-
-```python
-from transformers import AutoTokenizer
-
-from taktiny import SFTDatasetConfig, SFTTrainer, SFTTrainingConfig
-
-tokenizer = AutoTokenizer.from_pretrained(model_repo)
-if tokenizer.pad_token_id is None:
-    tokenizer.pad_token = tokenizer.eos_token
-
-trainer = SFTTrainer(
-    model,
-    training_config=SFTTrainingConfig(
-        epochs=1,
-        learning_rate=2e-4,
-        assistant_only_loss=True,
-        jit_compile=True,
-    ),
-    dataset_config=SFTDatasetConfig(
-        repo_id='open-r1/OpenThoughts-114k-math',
-        tokenizer=tokenizer,
-        process_fn=prepare_open_thoughts,
-        batch_size=8,
-        max_length=1024,
-        padding='longest',
-        packing=False,
-    ),
-)
-trainer.train()
-```
-
-Supported records contain one of:
-
-- `input_ids`, with optional `labels` and `attention_mask`
-- `text`
-- `messages`
-- `prompt` and `completion`
-
-Prompt-completion records use completion-only loss by default. Conversational
-records can use `assistant_only_loss=True`; explicit pretokenized `labels`
-always take precedence. Set `packing=True` to fill fixed-length sequences.
-Packed examples receive block-diagonal attention masks, so examples in the same
-sequence cannot attend to each other.
-
-`process_fn` runs once on a dataset loaded through `repo_id`. Use
-`formatting_fn` for per-record conversion. Set `skip_prepare_dataset=True` only
-when the supplied dataloader already yields complete SFT batches containing
-`input_ids`, `attention_mask`, and `labels`.
-
 Rematerialization is configured on models that understand their own layer
 boundaries:
 
@@ -389,6 +339,53 @@ boundaries:
 model.enable_remat()
 trainer.train()
 ```
+
+Remat is the largest single training-memory lever: with scanned layers it
+removes the per-layer residuals kept for the backward pass (measured ~10x
+reduction on a toy stack; current JAX versions store scan residuals per step,
+so scanning alone is not enough).
+
+The training loss tail — the `(sequence, vocab)` logits tensor — can be
+bounded with chunked cross entropy, which projects and reduces hidden states
+over sequence chunks inside a rematerialized scan:
+
+```python
+from functools import partial
+from taktiny.trainer.loss import causal_lm_loss
+
+loss_fn = partial(
+    causal_lm_loss,
+    logits_chunk_size=256,      # peak loss memory ~ chunk * vocab
+    attention_kernel='flash',   # or 'splash'/'dot_product'
+)
+trainer = Trainer(model, training_config, dataset_config, loss_fn=loss_fn)
+```
+
+`logits_chunk_size` is supported by models implementing
+`compute_causal_loss`; when both are set the peak loss memory scales with
+`chunk_size * vocab` instead of `sequence * vocab`. Gradient accumulation
+runs all microbatches of an optimizer step inside one jitted scan
+automatically when `jit_compile=True` and `gradient_accumulation_steps > 1`.
+
+### Exponential Moving Average
+
+`TrainingConfig.ema_decay` enables a running average of the weights, kept in
+the Trainer (not the model) and saved alongside each checkpoint:
+
+```python
+training_config = TrainingConfig(ema_decay=0.9999)
+trainer = Trainer(model, training_config, dataset_config, loss_fn=loss_fn)
+trainer.train()
+
+ema_model = trainer.ema   # a fresh model with the averaged weights
+ema_model.save_pretrained('checkpoints/ema')
+```
+
+`ema_decay` accepts a value in `(0, 1)` (larger = smoother, slower). The EMA
+tree is updated each optimizer step and written to `ema.safetensors` inside
+checkpoint directories, so it is restored when training resumes. The trained
+model is left untouched; `trainer.ema` returns an independent copy of the
+averaged weights.
 
 Scheduled checkpoints can preserve exact stochastic and dataloader progress:
 

@@ -20,17 +20,17 @@ import typing as tp
 
 import jax
 
-from taktiny import layers as ly
+from taktiny.cosettes import layers as ly
 from taktiny import nn
-from taktiny.cosettes._continuo import _config_value
-from taktiny.cosettes.transformers._ordinario import (
+from taktiny.cosettes.continuo import _config_value
+from taktiny.cosettes.transformers.ordinario import (
     DiffusionTransformerModel,
 )
 from taktiny.cosettes.transformers.sd import (
     SD3PatchEmbedding,
     SD3TransformerLayer,
 )
-from taktiny.maestro._livret import repertoire
+from taktiny.maestro.livret import repertoire
 from taktiny.maestro.config import ModelConfig
 from taktiny.utils.typing import PathLike
 

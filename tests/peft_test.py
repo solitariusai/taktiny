@@ -6,8 +6,8 @@ import qwix
 from safetensors.numpy import save_file
 
 from taktiny import Takt, nn
-from taktiny.takt import _prelude as takt_prelude
-from taktiny.cosettes._overture import PretrainedModel
+from taktiny.takt import prelude as takt_prelude
+from taktiny.cosettes.overture import PretrainedModel
 from taktiny.peft import LoraConfig
 
 

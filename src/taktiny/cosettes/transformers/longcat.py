@@ -20,9 +20,9 @@ import typing as tp
 import jax
 import jax.numpy as jnp
 
-from taktiny import layers as ly
+from taktiny.cosettes import layers as ly
 from taktiny import nn
-from taktiny.cosettes._continuo import (
+from taktiny.cosettes.continuo import (
     _config_value,
     _approximate_gelu,
     _model_dtype,
@@ -31,13 +31,13 @@ from taktiny.cosettes._continuo import (
     image_transformer_dimensions,
     multi_axis_position_embedding,
 )
-from taktiny.cosettes.transformers._ordinario import (
+from taktiny.cosettes.transformers.ordinario import (
     ConditionalTransformerLayer,
     GatedParallelTransformerLayer,
     JointTransformerLayer,
 )
 from taktiny.maestro.config import ModelConfig
-from taktiny.nn._continuo import _constrain
+from taktiny.nn.continuo import _constrain
 
 
 def _audio_dimensions(
@@ -380,8 +380,8 @@ class LongCatAudioTransformerLayer(ConditionalTransformerLayer):
             pos_emb=self.audio_position_embedding,
             cross_pos_emb=None,
             input_layernorm=nn.LayerNorm,
-            self_attention=ly.Attention,
-            cross_attention=(ly.Attention if self.use_cross_attention else None),
+            self_attention=ly.AttentionLegacy,
+            cross_attention=(ly.AttentionLegacy if self.use_cross_attention else None),
             cross_attention_layernorm=cross_input_norm,
             post_attention_layernorm=nn.LayerNorm,
             mlp=ly.FeedForward,
@@ -496,7 +496,7 @@ class LongCatAudioTransformerLayer(ConditionalTransformerLayer):
             key,
             encoder_position_idx,
         )
-        output = ly.Attention.apply(
+        output = ly.AttentionLegacy.apply(
             query,
             key,
             value,

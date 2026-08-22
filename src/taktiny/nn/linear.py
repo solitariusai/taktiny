@@ -22,7 +22,7 @@ import warnings
 
 from taktiny.nn.module import Module, Parameter
 from taktiny.nn.rng import Rngs
-from taktiny.nn._continuo import _constrain, _normalize_shape
+from taktiny.nn.continuo import _constrain, _normalize_shape
 from taktiny.utils.typing import AxisNames, DType, Initializer, ShardMode
 
 default_linear_initializer = lecun_uniform()
@@ -73,6 +73,7 @@ class Linear(Module):
             initializer(rngs(), weight_shape, dtype)
         )
         self.weight.quantization = quant
+        self.weight.quantization_kind = 'dot_general'
         self.weight.input_axis_count = len(in_features)
         self.weight.quantization_batch_axis_count = 0
 
@@ -181,6 +182,7 @@ class Bilinear(Module):
         )
         self.weight = Parameter(initializer(rngs(), weight_shape, dtype))
         self.weight.quantization = quant
+        self.weight.quantization_kind = 'dot_general'
         self.weight.input_axis_count = (
             len(self.in1_features) + len(self.in2_features)
         )

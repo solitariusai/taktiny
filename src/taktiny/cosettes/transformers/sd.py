@@ -21,12 +21,12 @@ import typing as tp
 import jax
 import jax.numpy as jnp
 
-from taktiny import layers as ly
+from taktiny.cosettes import layers as ly
 from taktiny import nn
-from taktiny.cosettes._continuo import _approximate_gelu
-from taktiny.cosettes.transformers._ordinario import JointTransformerLayer
+from taktiny.cosettes.continuo import _approximate_gelu
+from taktiny.cosettes.transformers.ordinario import JointTransformerLayer
 from taktiny.maestro.config import ModelConfig
-from taktiny.nn._continuo import _constrain
+from taktiny.nn.continuo import _constrain
 from taktiny.utils.typing import DType, ShardMode
 
 
@@ -48,7 +48,7 @@ class SD3TransformerLayer(JointTransformerLayer):
             input_layernorm=ly.AdaXNorm,
             context_input_layernorm=ly.AdaXNorm,
             joint_attention=ly.JointAttention,
-            second_attention=ly.Attention,
+            second_attention=ly.AttentionLegacy,
             post_attention_layernorm=nn.LayerNorm,
             context_post_attention_layernorm=nn.LayerNorm,
             mlp=ly.FeedForward,

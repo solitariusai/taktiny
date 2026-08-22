@@ -5,7 +5,7 @@ import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from taktiny import nn
-from taktiny.layers import (
+from taktiny.cosettes.layers import (
     AdaXNorm,
     SpatialNorm,
 )

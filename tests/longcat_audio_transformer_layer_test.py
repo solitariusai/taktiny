@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from taktiny import nn
-from taktiny.cosettes.transformers._ordinario import (
+from taktiny.cosettes.transformers.ordinario import (
     ConditionalTransformerLayer,
 )
 from taktiny.cosettes.transformers.longcat import (
@@ -40,8 +40,8 @@ def test_longcat_audio_uses_conditional_transformer_principle():
     layer = LongCatAudioTransformerLayer(_config(), rngs=nn.Rngs(0))
 
     assert isinstance(layer, ConditionalTransformerLayer)
-    assert layer.attn1.qkv_norm_across_heads
-    assert layer.attn2.qkv_norm_across_heads
+    assert layer.attn1.qk_norm_across_heads
+    assert layer.attn2.qk_norm_across_heads
     assert layer.audio_position_embedding.base == 100_000.0
     assert layer.prompt_position_embedding.base == 100_000.0
     assert layer.scale_shift_table.shape == (6, 8)

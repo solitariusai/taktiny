@@ -19,8 +19,6 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import jax.numpy as jnp
-
-from taktiny.cosettes.transformers._ordinario import TransformerContext
 from taktiny.utils.typing import Array, Batch
 
 from .classification import cross_entropy_loss
@@ -31,6 +29,8 @@ def causal_lm_loss(
     batch: Batch,
     *,
     ignore_index: int = -100,
+    logits_chunk_size: int | None = None,
+    attention_kernel: str = 'dot_product',
 ) -> Array:
     """Compute next-token loss for a TakTiny causal language model.
 
@@ -39,6 +39,13 @@ def causal_lm_loss(
     A two-dimensional attention mask is interpreted as a key-padding mask.
     Reset positions mark packed sequence boundaries and are excluded from the
     shifted targets.
+
+    ``logits_chunk_size`` enables the chunked vocabulary projection on models
+    implementing ``compute_causal_loss``: the LM head and cross entropy run
+    over sequence chunks of that size inside a rematerialized scan, so the
+    ``(sequence, vocab)`` logits tensor never materializes at full size.
+    ``attention_kernel`` selects the attention backend for the decoder
+    (``'dot_product'``, ``'flash'``, ``'ragged'``, ...).
 
     This function has the ``loss_fn(model, batch)`` signature expected by
     :class:`~taktiny.trainer.Trainer`.
@@ -87,17 +94,28 @@ def causal_lm_loss(
         if position_ids.shape != input_ids.shape:
             raise ValueError('position_ids and input_ids must have equal shapes')
 
-    ctx = TransformerContext(
-        key_cache=None,
-        value_cache=None,
-        position_idx=None,
-        is_causal=True,
-    )
+    if logits_chunk_size is not None:
+        if not hasattr(model, 'compute_causal_loss'):
+            raise TypeError(
+                'logits_chunk_size requires a model implementing '
+                'compute_causal_loss'
+            )
+        return model.compute_causal_loss(
+            input_ids,
+            labels,
+            attention_mask=batch.get('attention_mask'),
+            position_ids=batch.get('position_ids'),
+            ignore_index=ignore_index,
+            logits_chunk_size=logits_chunk_size,
+            attention_kernel=attention_kernel,
+        )
+
     outputs = model(
         input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
-        ctx=ctx,
+        is_causal=True,
+        kernel=attention_kernel,
     )
     logits = outputs[0] if isinstance(outputs, tuple) else outputs
     if hasattr(logits, 'logits'):

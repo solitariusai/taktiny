@@ -7,8 +7,8 @@ import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from taktiny import nn
-from taktiny.layers import (
-    Attention,
+from taktiny.cosettes.layers import (
+    AttentionLegacy,
     ConditionEmbedding,
     FrequencyEmbedding,
     ProjectionEmbedding,
@@ -191,7 +191,7 @@ def test_condition_embedding_rejects_incorrect_condition_names():
 
 
 def _token_resampler(*, residual=False, **kwargs):
-    attention = Attention(
+    attention = AttentionLegacy(
         8,
         2,
         4,
@@ -216,7 +216,7 @@ def test_token_resampler_matches_direct_cross_attention():
     q = layer.attention.q_proj(queries)
     k = layer.attention.k_proj(x)
     v = layer.attention.v_proj(x)
-    expected = layer.attention.o_proj(Attention.apply(q, k, v))
+    expected = layer.attention.o_proj(AttentionLegacy.apply(q, k, v))
 
     actual = jax.jit(layer)(x)
 

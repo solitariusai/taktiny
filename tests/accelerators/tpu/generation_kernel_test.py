@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from taktiny.layers import Attention
+from taktiny.cosettes.layers import AttentionLegacy
 
 
 pytestmark = [
@@ -18,7 +18,7 @@ def test_tpu_flash_attention_matches_dot_product(qkv):
     query, key, value = qkv(dtype='bfloat16')
 
     expected = jax.jit(
-        lambda q, k, v: Attention.apply(
+        lambda q, k, v: AttentionLegacy.apply(
             q,
             k,
             v,
@@ -27,7 +27,7 @@ def test_tpu_flash_attention_matches_dot_product(qkv):
         )
     )(query, key, value)
     actual = jax.jit(
-        lambda q, k, v: Attention.apply(
+        lambda q, k, v: AttentionLegacy.apply(
             q,
             k,
             v,
@@ -57,7 +57,7 @@ def test_tpu_ragged_decode_matches_prefix_masked_attention(qkv):
     )
 
     expected = jax.jit(
-        lambda q, k, v, mask: Attention.apply(
+        lambda q, k, v, mask: AttentionLegacy.apply(
             q,
             k,
             v,
@@ -65,7 +65,7 @@ def test_tpu_ragged_decode_matches_prefix_masked_attention(qkv):
             mask=mask,
         )
     )(query, key, value, prefix_mask)
-    actual = Attention.apply(
+    actual = AttentionLegacy.apply(
         query,
         key,
         value,

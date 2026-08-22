@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import pytest
+import qwix
 
 from taktiny import nn
 
@@ -169,6 +170,33 @@ def test_seq_stack_exposes_scan_controls_and_length():
     assert len(modules) == 3
     assert final == 6
     assert jnp.array_equal(outputs, jnp.asarray([6, 5, 3]))
+
+
+def test_seq_stack_slices_quantized_parameters_loaded_after_stacking():
+    layers = nn.SeqStack([
+        nn.Linear(4, 4, bias=False, rngs=nn.Rngs(index))
+        for index in range(2)
+    ])
+    parameter = layers.stacked.weight
+    parameter.value = qwix.quantize(
+        parameter.value,
+        'int4',
+        channelwise_axes=(0, 2),
+    )
+
+    def apply(layer, carry):
+        output = layer(carry)
+        return output, None
+
+    inputs = jnp.ones((1, 4), dtype=jnp.float32)
+    output, _ = layers(apply, inputs)
+
+    expected = inputs
+    for weight in qwix.dequantize(parameter.value):
+        expected = expected @ weight
+
+    assert output.shape == (1, 4)
+    assert jnp.allclose(output, expected)
 
 
 def test_stack_exposes_vmap_axis_controls_and_broadcast_axes():

@@ -7,7 +7,7 @@ from typing import Any, ClassVar
 import jax
 
 from taktiny import nn
-from taktiny.cosettes._ordinario import DiffusionDenoiser
+from taktiny.cosettes.ordinario import DiffusionDenoiser
 from taktiny.maestro.config import ModelConfig
 
 

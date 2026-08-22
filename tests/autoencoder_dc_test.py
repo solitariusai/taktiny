@@ -10,7 +10,7 @@ from safetensors.numpy import save_file
 
 from taktiny import nn
 from taktiny.autoencoder import Autoencoder, AutoencoderDC
-from taktiny.cosettes._continuo import (
+from taktiny.cosettes.continuo import (
     _pixel_shuffle,
     _pixel_unshuffle,
 )

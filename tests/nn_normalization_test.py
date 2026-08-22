@@ -66,7 +66,7 @@ def test_layer_norm_preserves_declared_axis_order_when_broadcasting():
 
 def test_rms_norm_supports_multiple_dimensions_and_bfloat16_statistics():
     x = jax.random.normal(jax.random.key(0), (2, 3, 4)).astype(jnp.bfloat16)
-    layer = nn.RMSNorm((3, 4), eps=1e-6, with_scale=False)
+    layer = nn.RMSNorm((3, 4), epsilon=1e-6, with_scale=False)
 
     output = jax.jit(layer)(x)
     value = x.astype(jnp.float32)
@@ -83,7 +83,7 @@ def test_rms_norm_supports_learned_bias_and_parameter_axes():
     x = jax.random.normal(jax.random.key(1), (2, 3, 4))
     layer = nn.RMSNorm(
         4,
-        eps=1e-6,
+        epsilon=1e-6,
         bias=True,
         axis_names=('feature',),
     )

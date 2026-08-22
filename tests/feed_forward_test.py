@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 
 from taktiny import nn
-from taktiny.layers import FeedForward
+from taktiny.cosettes.layers import FeedForward
 
 
 def test_feed_forward_matches_direct_projection_path():

@@ -14,41 +14,50 @@
 """Llama architectures"""
 
 from __future__ import annotations
-from typing import Any
-import typing as tp
 
-from taktiny.maestro._livret import repertoire
-from taktiny.cosettes.transformers._ordinario import TransformerCausalLM, TransformerConditionalGeneration
+from taktiny.maestro.livret import repertoire
+from taktiny.cosettes.transformers.ordinario import (
+    TransformerCausalLM,
+    TransformerModel,
+)
 from taktiny.cosettes.transformers.llama import LlamaDecoderLayer
 from taktiny.maestro.config import ModelConfig
-from taktiny import nn
+
+
+# ╻  ╻  ┏━┓┏┳┓┏━┓
+# ┃  ┃  ┣━┫┃┃┃┣━┫
+# ┗━╸┗━╸╹ ╹╹ ╹╹ ╹
+class LlamaModel(TransformerModel):
+    _layer_type = LlamaDecoderLayer
 
 
 class Llama(TransformerCausalLM):
-    def __init__(self, config: ModelConfig, **kwargs) -> None:
-        super().__init__(
-            config,
-            decoder=LlamaDecoderLayer,
-            norm=nn.RMSNorm,
-            **kwargs
-        )
+    _model_type = LlamaModel
+    _default_config = ModelConfig(
+        vocab_size=32_000,
+        hidden_size=4096,
+        intermediate_size=11_008,
+        num_hidden_layers=32,
+        num_attention_heads=32,
+        num_key_value_heads=None,
+        hidden_act='silu',
+        max_position_embeddings=2048,
+        initializer_range=0.02,
+        rms_norm_eps=1e-6,
+        use_cache=True,
+        pad_token_id=None,
+        bos_token_id=1,
+        eos_token_id=2,
+        pretraining_tp=1,
+        tie_word_embeddings=False,
+        rope_parameters=None,
+        attention_bias=False,
+        attention_dropout=0.0,
+        mlp_bias=False,
+        head_dim=None,
+    )
 
-# TODO: Llama4
-class Llama4(TransformerConditionalGeneration):
-    def __init__(self, config: ModelConfig, **kwargs) -> None:
-        super().__init__(
-            config,
-            decoder=LlamaDecoderLayer,
-            norm=nn.RMSNorm,
-            **kwargs,
-        )
 
-class_map = [
-    ('LlamaForCausalLM', Llama),
-    ('Llama4ForConditionalGeneration', Llama4),
-]
+repertoire.register('LlamaForCausalLM', Llama)
 
-__all__ = []
-for name, cls in class_map:
-    repertoire.register(name, cls)
-    __all__.append(cls.__name__)
+__all__ = ['LlamaModel', 'Llama']

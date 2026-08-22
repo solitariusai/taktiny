@@ -5,7 +5,7 @@ import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from taktiny import nn
-from taktiny.layers import JointAttention
+from taktiny.cosettes.layers import JointAttention
 from taktiny.utils.typing import ShardMode
 
 
@@ -55,8 +55,8 @@ def test_joint_attention_matches_direct_joint_attention():
         2,
         4,
         bias=True,
-        use_qkv_norm=True,
-        qkv_norm_eps=1e-6,
+        use_qk_norm=True,
+        qk_norm_eps=1e-6,
         scaling=0.25,
         dtype='float32',
         rngs=nn.Rngs(0),

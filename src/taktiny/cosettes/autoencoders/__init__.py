@@ -13,5 +13,5 @@
 # limitations under the License.
 """Autoencoder architecture components."""
 
-from ._ordinario import *
+from taktiny.cosettes.autoencoders.ordinario import *
 from .dc import *

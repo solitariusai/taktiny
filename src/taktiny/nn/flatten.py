@@ -18,7 +18,7 @@ import math
 import jax
 import jax.numpy as jnp
 from taktiny import nn
-from taktiny.nn._continuo import _canonical_axis
+from taktiny.nn.continuo import _canonical_axis
 
 
 class Flatten(nn.Module):

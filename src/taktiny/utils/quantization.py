@@ -47,9 +47,21 @@ def quantization_rules(quantization: Any) -> tuple[qwix.QuantizationRule, ...]:
     if quantization is None:
         return ()
     if isinstance(quantization, str):
+        qtype = normalize_qtype(quantization)
         return (
             qwix.QuantizationRule(
-                weight_qtype=normalize_qtype(quantization),
+                # String shortcuts are intended for weight-only matrix
+                # multiplications. Embedding tables, including tied output
+                # heads, are too sensitive for an unconditional 4-bit
+                # fallback and remain dense unless explicitly selected by a
+                # user-provided rule.
+                op_names=('dot_general',),
+                weight_qtype=qtype,
+                tile_size=(
+                    128
+                    if qtype in {'int4', 'nf4'}
+                    else None
+                ),
             ),
         )
     if isinstance(quantization, qwix.QuantizationRule):
@@ -122,9 +134,13 @@ def quantize_linear_weight(array: Any, parameter: Any, rule: Any) -> Any:
     )
     tiled_axes = None
     if rule.tile_size is not None:
-        tiled_axes = {
-            output_start - 1: rule.tile_size,
-        }
+        tiled_axis = output_start - 1
+        tile_size = rule.tile_size
+        if (
+            not isinstance(tile_size, int)
+            or array.shape[tiled_axis] % tile_size == 0
+        ):
+            tiled_axes = {tiled_axis: tile_size}
 
     return qwix.quantize(
         jnp.asarray(array),

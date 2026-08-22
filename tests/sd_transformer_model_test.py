@@ -6,7 +6,7 @@ from taktiny import nn
 from taktiny.cosettes.transformers.sd import (
     SD3PatchEmbedding,
 )
-from taktiny.cosettes.transformers._ordinario import DiffusionTransformerModel
+from taktiny.cosettes.transformers.ordinario import DiffusionTransformerModel
 from taktiny.maestro.opus.sd import SD3TransformerModel, _SD3_MODULE_MAP
 from taktiny.maestro.config import ModelConfig
 from taktiny.maestro import Maestro

@@ -22,7 +22,7 @@ import typing as tp
 from jax.nn.initializers import lecun_uniform, zeros
 from taktiny import nn
 from taktiny.utils.typing import AxisNames, DType, Initializer, ShardMode
-from taktiny.nn._continuo import (
+from taktiny.nn.continuo import (
     _adaptive_pool,
     _as_batched,
     _canonical_padding,

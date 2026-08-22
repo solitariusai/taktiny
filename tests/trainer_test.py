@@ -15,7 +15,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import taktiny
 from taktiny import nn
 from taktiny import Takt
-from taktiny.cosettes._overture import PretrainedModel
+from taktiny.cosettes.overture import PretrainedModel
 from taktiny.peft import LoraConfig
 from taktiny.trainer import (
     DatasetConfig,
@@ -27,6 +27,7 @@ from taktiny.trainer import (
 )
 from taktiny.trainer.trainer import (
     _format_iteration_time,
+    _global_grad_norm,
     _parameter_labels,
     _partition_params,
     _place_trainable_params,
@@ -275,6 +276,44 @@ def test_trainer_updates_only_trainable_parameters(jit_compile):
 
     assert float(model.weight.value) != 0.0
     assert float(model.frozen.value) == 3.0
+
+
+def test_gradient_accumulation_fused_scan_matches_eager_path():
+    def run(jit_compile):
+        model = TinyModel()
+        batches = [
+            {
+                'x': np.asarray([1.0], dtype=np.float32),
+                'y': np.asarray([2.0], dtype=np.float32),
+            },
+            {
+                'x': np.asarray([3.0], dtype=np.float32),
+                'y': np.asarray([1.0], dtype=np.float32),
+            },
+        ]
+        trainer = Trainer(
+            model,
+            TrainingConfig(
+                max_steps=1,
+                learning_rate=0.1,
+                log_interval=1,
+                jit_compile=jit_compile,
+                gradient_accumulation_steps=2,
+            ),
+            DatasetConfig(batches, prefetch_size=2),
+            loss_fn=squared_error,
+        )
+        trainer.train()
+        return float(model.weight.value), trainer.log_history
+
+    eager_weight, eager_history = run(jit_compile=False)
+    fused_weight, fused_history = run(jit_compile=True)
+
+    assert eager_weight != 0.0
+    assert fused_weight == pytest.approx(eager_weight)
+    assert fused_history[-1]['loss'] == pytest.approx(
+        eager_history[-1]['loss']
+    )
 
 
 def test_trainer_rejects_empty_dataloader():
@@ -643,7 +682,7 @@ def test_trainer_records_log_interval_and_final_history():
     trainer.train()
 
     assert [record['step'] for record in trainer.log_history] == [2, 4, 5]
-    assert all(record['epoch'] == 0 for record in trainer.log_history)
+    assert all('epoch' not in record for record in trainer.log_history)
     assert all(
         isinstance(record['loss'], float)
         for record in trainer.log_history
@@ -652,6 +691,34 @@ def test_trainer_records_log_interval_and_final_history():
         record['seconds_per_step'] >= 0
         for record in trainer.log_history
     )
+
+
+def test_trainer_logs_rolling_average_loss():
+    def supplied_loss(model, batch):
+        return model.weight.value * 0.0 + batch['loss']
+
+    losses = [1.0, 3.0, 5.0, 7.0, 9.0]
+    trainer = Trainer(
+        TinyModel(),
+        TrainingConfig(
+            max_steps=len(losses),
+            log_interval=3,
+        ),
+        DatasetConfig(
+            [
+                {'loss': np.asarray(value, dtype=np.float32)}
+                for value in losses
+            ],
+            prefetch_size=0,
+        ),
+        loss_fn=supplied_loss,
+    )
+
+    trainer.train()
+
+    assert [record['step'] for record in trainer.log_history] == [3, 5]
+    assert trainer.log_history[0]['loss'] == pytest.approx(3.0)
+    assert trainer.log_history[1]['loss'] == pytest.approx(7.0)
 
 
 def test_default_optimizer_uses_and_logs_schedule():
@@ -1526,7 +1593,9 @@ def test_trainer_checkpoints_and_restores_iterator_state(
     )
 
 
-def test_trainer_calls_epoch_hook_on_passed_dataloader():
+def test_trainer_does_not_reshuffle_passed_dataloader():
+    # The dataloader owns its own shuffling; the trainer must not call
+    # set_epoch to force a reshuffle.
     batches = [{
         'x': np.asarray([1.0], dtype=np.float32),
         'y': np.asarray([2.0], dtype=np.float32),
@@ -1535,7 +1604,6 @@ def test_trainer_calls_epoch_hook_on_passed_dataloader():
     trainer = Trainer(
         TinyModel(),
         TrainingConfig(
-            epochs=2,
             optimizer=optax.sgd(0.1),
             log_interval=10,
         ),
@@ -1545,8 +1613,8 @@ def test_trainer_calls_epoch_hook_on_passed_dataloader():
 
     trainer.train()
 
-    assert loader.epochs == [0, 1]
-    assert trainer.global_step == 2
+    assert loader.epochs == []
+    assert trainer.global_step == 1
 
 
 def test_epoch_hook_supports_nested_sampler_and_dataset():
@@ -1691,7 +1759,7 @@ def test_step_evaluation_loads_and_preserves_best_checkpoint(tmp_path):
     assert trainer.evaluate()['eval_loss'] == pytest.approx(4.0)
 
 
-def test_epoch_evaluation_records_each_completed_epoch():
+def test_epoch_evaluation_records_at_end_of_dataloader():
     model = CheckpointTinyModel()
     batches = [{
         'x': np.asarray([1.0], dtype=np.float32),
@@ -1700,7 +1768,6 @@ def test_epoch_evaluation_records_each_completed_epoch():
     trainer = Trainer(
         model,
         TrainingConfig(
-            epochs=2,
             learning_rate=0.1,
             log_interval=10,
             eval_strategy='epoch',
@@ -1720,10 +1787,8 @@ def test_epoch_evaluation_records_each_completed_epoch():
         for record in trainer.log_history
         if 'eval_loss' in record
     ]
-    assert [(record['step'], record['epoch']) for record in evaluations] == [
-        (1, 0),
-        (2, 1),
-    ]
+    assert [record['step'] for record in evaluations] == [1]
+    assert all('epoch' not in record for record in evaluations)
     assert trainer.best_metric == min(
         record['eval_loss']
         for record in evaluations
@@ -1829,7 +1894,6 @@ def test_parameter_placement_uses_single_device_mesh():
 @pytest.mark.parametrize(
     'factory',
     [
-        lambda: TrainingConfig(epochs=0),
         lambda: TrainingConfig(max_steps=0),
         lambda: TrainingConfig(log_interval=0),
         lambda: TrainingConfig(schedule=0.1),
@@ -1869,3 +1933,336 @@ def test_dataset_config_requires_train_dataloader():
         match='train_dataloader is required',
     ):
         DatasetConfig()
+
+
+def test_global_grad_norm_matches_optax_for_float32():
+    key = jax.random.key(7)
+    grads = {
+        'w': jax.random.normal(key, (4, 8)),
+        'b': jax.random.normal(jax.random.fold_in(key, 1), (8,)),
+    }
+    expected = optax.tree.norm(
+        jax.tree.map(lambda value: value.astype(jnp.float32), grads)
+    )
+
+    actual = _global_grad_norm(grads)
+
+    assert jnp.allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_global_grad_norm_matches_optax_for_bfloat16():
+    key = jax.random.key(8)
+    grads = {
+        'w': jax.random.normal(key, (16, 16), dtype=jnp.bfloat16),
+        'b': jax.random.normal(
+            jax.random.fold_in(key, 1),
+            (16,),
+            dtype=jnp.bfloat16,
+        ),
+    }
+    expected = optax.tree.norm(
+        jax.tree.map(lambda value: value.astype(jnp.float32), grads)
+    )
+
+    actual = _global_grad_norm(grads)
+
+    # bf16 leaves are accumulated by XLA in f32; allow bf16 rounding error.
+    assert jnp.allclose(actual, expected, rtol=5e-2, atol=5e-2)
+
+
+def test_global_grad_norm_handles_mixed_dtypes_and_zero_leaves():
+    grads = {
+        'f32': jnp.asarray([[1.0, -2.0], [3.0, -4.0]], dtype=jnp.float32),
+        'bf16': jnp.asarray([2.0, 2.0], dtype=jnp.bfloat16),
+        'zero': jnp.zeros((3, 3), dtype=jnp.float32),
+    }
+    expected = optax.tree.norm(
+        jax.tree.map(lambda value: value.astype(jnp.float32), grads)
+    )
+
+    actual = _global_grad_norm(grads)
+
+    assert jnp.allclose(actual, expected, rtol=5e-2, atol=5e-2)
+
+
+def test_global_grad_norm_of_empty_tree_is_zero():
+    assert float(_global_grad_norm({})) == 0.0
+
+
+def test_trainer_can_skip_grad_norm_tracking():
+    model = TinyModel()
+    batches = [
+        {
+            'x': np.asarray([1.0], dtype=np.float32),
+            'y': np.asarray([2.0], dtype=np.float32),
+        },
+        {
+            'x': np.asarray([3.0], dtype=np.float32),
+            'y': np.asarray([1.0], dtype=np.float32),
+        },
+    ]
+    trainer = Trainer(
+        model,
+        TrainingConfig(
+            max_steps=2,
+            learning_rate=0.1,
+            log_interval=1,
+            compute_grad_norm=False,
+        ),
+        DatasetConfig(batches, prefetch_size=2),
+        loss_fn=squared_error,
+    )
+
+    trainer.train()
+
+    assert float(model.weight.value) != 0.0
+    assert float(model.frozen.value) == 3.0
+    assert all(
+        record.get('grad_norm') is None
+        for record in trainer.log_history
+    )
+
+
+def test_grad_norm_still_computed_when_clipping_enabled():
+    model = TinyModel()
+    batches = [
+        {
+            'x': np.asarray([1.0], dtype=np.float32),
+            'y': np.asarray([2.0], dtype=np.float32),
+        }
+    ]
+    trainer = Trainer(
+        model,
+        TrainingConfig(
+            max_steps=1,
+            learning_rate=0.1,
+            log_interval=1,
+            max_grad_norm=1.0,
+            compute_grad_norm=False,
+        ),
+        DatasetConfig(batches, prefetch_size=1),
+        loss_fn=squared_error,
+    )
+
+    trainer.train()
+
+    assert trainer.log_history[-1].get('grad_norm') is not None
+    assert float(model.weight.value) != 0.0
+
+
+def test_ema_update_blends_and_preserves_frozen():
+    from taktiny.trainer.trainer import _ema_update
+
+    ema = {'w': jnp.asarray(0.0), 'f': None}
+    params = {'w': jnp.asarray(10.0), 'f': None}
+
+    out = _ema_update(ema, params, decay=0.9)
+
+    assert float(out['w']) == pytest.approx(0.9 * 0.0 + 0.1 * 10.0)
+    assert out['f'] is None
+
+
+def test_ema_property_returns_independent_model():
+    model = TinyModel()
+    batches = [
+        {
+            'x': np.asarray([1.0], dtype=np.float32),
+            'y': np.asarray([2.0], dtype=np.float32),
+        },
+        {
+            'x': np.asarray([3.0], dtype=np.float32),
+            'y': np.asarray([1.0], dtype=np.float32),
+        },
+    ]
+    trainer = Trainer(
+        model,
+        TrainingConfig(
+            max_steps=2,
+            learning_rate=0.1,
+            log_interval=1,
+            ema_decay=0.9,
+        ),
+        DatasetConfig(batches, prefetch_size=2),
+        loss_fn=squared_error,
+    )
+
+    trainer.train()
+
+    ema_model = trainer.ema
+    assert ema_model is not model
+    assert float(ema_model.weight.value) != 0.0
+    assert bool(jnp.isfinite(jnp.asarray(ema_model.weight.value)))
+
+    # The EMA copy is independent of the trained model.
+    model.weight.value = jnp.asarray(999.0)
+    assert float(ema_model.weight.value) != 999.0
+
+
+def test_ema_disabled_property_raises():
+    model = TinyModel()
+    trainer = Trainer(
+        model,
+        TrainingConfig(max_steps=1),
+        DatasetConfig([{
+            'x': np.asarray([1.0], dtype=np.float32),
+            'y': np.asarray([2.0], dtype=np.float32),
+        }], prefetch_size=1),
+        loss_fn=squared_error,
+    )
+
+    trainer.train()
+
+    with pytest.raises(RuntimeError, match='ema_decay'):
+        trainer.ema
+
+
+def test_ema_saved_and_restored_in_checkpoint(tmp_path):
+    def make_trainer():
+        model = CheckpointTinyModel()
+        batches = [
+            {
+                'x': np.asarray([1.0], dtype=np.float32),
+                'y': np.asarray([2.0], dtype=np.float32),
+            },
+            {
+                'x': np.asarray([3.0], dtype=np.float32),
+                'y': np.asarray([1.0], dtype=np.float32),
+            },
+        ]
+        trainer = Trainer(
+            model,
+            TrainingConfig(
+                max_steps=2,
+                learning_rate=0.1,
+                log_interval=1,
+                ema_decay=0.9,
+                output_dir=str(tmp_path),
+                save_steps=1,
+            ),
+            DatasetConfig(batches, prefetch_size=2),
+            loss_fn=squared_error,
+        )
+        return trainer
+
+    trainer = make_trainer()
+    trainer.train()
+
+    checkpoint_dir = os.path.join(str(tmp_path), 'checkpoint-2')
+    ema_file = os.path.join(checkpoint_dir, 'model-ema.safetensors')
+    assert os.path.isfile(ema_file)
+    ema_before = float(trainer.ema.weight.value)
+
+    # Restore the EMA into a fresh trainer (the same helper the resume path
+    # uses), and verify the weights round-trip.
+    fresh = Trainer(
+        TinyModel(),
+        TrainingConfig(
+            max_steps=2,
+            learning_rate=0.1,
+            log_interval=1,
+            ema_decay=0.9,
+        ),
+        DatasetConfig([], prefetch_size=1),
+        loss_fn=squared_error,
+    )
+    fresh._load_ema(checkpoint_dir)
+    ema_after = float(fresh.ema.weight.value)
+
+    assert ema_after == pytest.approx(ema_before)
+
+
+def test_ema_decay_configuration_validation():
+    with pytest.raises(ValueError, match='ema_decay'):
+        TrainingConfig(ema_decay=0)
+    with pytest.raises(ValueError, match='ema_decay'):
+        TrainingConfig(ema_decay=1.0)
+    assert TrainingConfig(ema_decay=None).ema_decay is None
+    assert TrainingConfig(ema_decay=0.9999).ema_decay == 0.9999
+
+
+class ShardedStubModel(CheckpointTinyModel):
+    def save_pretrained(self, path, *, max_shard_size):
+        os.makedirs(path, exist_ok=True)
+        from safetensors.numpy import save_file
+        save_file(
+            {'weight': np.asarray([1.0], dtype=np.float32)},
+            os.path.join(path, 'model-00001-of-00002.safetensors'),
+        )
+        save_file(
+            {'frozen': np.asarray([2.0], dtype=np.float32)},
+            os.path.join(path, 'model-00002-of-00002.safetensors'),
+        )
+        with open(os.path.join(path, 'model.safetensors.index.json'), 'w') as f:
+            json.dump({
+                'weight_map': {
+                    'weight': 'model-00001-of-00002.safetensors',
+                    'frozen': 'model-00002-of-00002.safetensors',
+                },
+            }, f)
+
+
+def test_ema_checkpoint_shards_with_ema_suffix(tmp_path):
+    model = ShardedStubModel()
+    trainer = Trainer(
+        model,
+        TrainingConfig(
+            max_steps=1,
+            learning_rate=0.1,
+            log_interval=1,
+            ema_decay=0.9,
+        ),
+        DatasetConfig([{
+            'x': np.asarray([1.0], dtype=np.float32),
+            'y': np.asarray([2.0], dtype=np.float32),
+        }], prefetch_size=1),
+        loss_fn=squared_error,
+    )
+    trainer.train()
+
+    out = str(tmp_path)
+    trainer._write_ema_checkpoint(out, trainer._ema_snapshot())
+
+    assert os.path.isfile(
+        os.path.join(out, 'model-00001-of-00002-ema.safetensors')
+    )
+    assert os.path.isfile(
+        os.path.join(out, 'model-00002-of-00002-ema.safetensors')
+    )
+    assert os.path.isfile(
+        os.path.join(out, 'model-ema.safetensors.index.json')
+    )
+    with open(os.path.join(out, 'model-ema.safetensors.index.json')) as f:
+        index = json.load(f)
+    assert all(
+        'ema' in shard for shard in index['weight_map'].values()
+    )
+
+
+def test_trainer_cycles_dataloader_until_max_steps():
+    loader = EpochAwareLoader([
+        {
+            'x': np.asarray([1.0], dtype=np.float32),
+            'y': np.asarray([2.0], dtype=np.float32),
+        },
+        {
+            'x': np.asarray([3.0], dtype=np.float32),
+            'y': np.asarray([1.0], dtype=np.float32),
+        },
+    ])
+    trainer = Trainer(
+        TinyModel(),
+        TrainingConfig(
+            max_steps=5,
+            learning_rate=0.1,
+            log_interval=1,
+        ),
+        DatasetConfig(loader, prefetch_size=0),
+        loss_fn=squared_error,
+    )
+
+    trainer.train()
+
+    assert trainer.global_step == 5
+    # Two batches per cycle: steps 0-2, 2-4, then one more on the third pass.
+    assert len(trainer.log_history) > 0
+    assert trainer.log_history[-1]['step'] == 5
