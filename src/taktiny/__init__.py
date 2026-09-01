@@ -20,13 +20,8 @@ __description__ = (
     "full-lifecycle trainers, and native architectures spanning Transformers, Diffusion, and SSMs."
 )
 
-from taktiny.cosette import kernels, layers
-from taktiny.maestro.overture import ModelOutput
-from taktiny.maestro.prelude import Maestro
-from taktiny.maestro.config import ModelConfig
+from taktiny import nn
 from taktiny.takt import Takt
-from taktiny import nn, peft
-from taktiny import transforms as tt
 from taktiny.trainer import (
     DatasetConfig,
     TensorBoardCallback,
@@ -35,25 +30,17 @@ from taktiny.trainer import (
     TrainingConfig,
     WandbCallback,
 )
-
-from taktiny.maestro.opus import *
+from taktiny.utils import typing
+from taktiny.utils.transforms import *
 
 __all__ = [
-    'Maestro',
+    'DatasetConfig',
     'Takt',
-    'PeftConfig',
-    'LoraConfig',
-    'ModelConfig',
-    'ModelOutput',
+    'TensorBoardCallback',
     'Trainer',
     'TrainerCallback',
-    'TensorBoardCallback',
-    'WandbCallback',
     'TrainingConfig',
-    'DatasetConfig',
-    'tt',
+    'WandbCallback',
     'nn',
-    'layers',
-    'kernels',
-    'peft'
+    'typing'
 ]
