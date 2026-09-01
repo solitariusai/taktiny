@@ -13,17 +13,28 @@
 # limitations under the License.
 """Base module class"""
 from __future__ import annotations
-import jax
-import operator
-import qwix
-from collections.abc import Iterator, Mapping, Sequence
-from jax.tree_util import register_pytree_node_class
-import typing as tp
 
+import operator
+import typing as tp
+from collections.abc import Iterator, Mapping, Sequence
+
+import jax
+import qwix
+from jax.tree_util import register_pytree_node_class
+
+from taktiny.utils.format import format_bytes, format_dtype, format_params
 from taktiny.utils.typing import AxisNames, ParameterDict, PyTree, StateDict
-from taktiny.utils.format import format_params, format_bytes, format_dtype
+
 
 def iter_children(obj: object) -> Iterator[tuple[str, Module | Parameter]]:
+    """Iterates over the children Modules and Parameters of a given object.
+
+    Args:
+        obj (object): The object whose children to iterate over.
+
+    Yields:
+        Iterator[tuple[str, Module | Parameter]]: An iterator of (name, child) tuples.
+    """
     if not hasattr(obj, '__dict__'): return
     for k, v in obj.__dict__.items():
         if isinstance(v, (Module, Parameter)):
@@ -46,6 +57,18 @@ def build_tree_repr(
     is_last: bool = True,
     is_root: bool = False,
 ) -> tuple[list[str], int, int]:
+    """Builds a string representation of the module tree.
+
+    Args:
+        name (str): The name of the current node.
+        obj (object): The module or parameter object to represent.
+        prefix (str, optional): Prefix string for the current line. Defaults to "".
+        is_last (bool, optional): Whether this is the last child node. Defaults to True.
+        is_root (bool, optional): Whether this is the root node. Defaults to False.
+
+    Returns:
+        tuple[list[str], int, int]: A tuple containing the list of representation string lines, the total number of parameters, and the total bytes.
+    """
     lines = []
     total_params = 0
     total_bytes = 0
@@ -99,25 +122,42 @@ def build_tree_repr(
     return [], 0, 0
 
 def _is_dynamic(v: object) -> bool:
+    """Checks if a given value contains dynamic objects like Modules, Parameters, or Arrays.
+
+    Args:
+        v (object): The object to check.
+
+    Returns:
+        bool: True if the object contains dynamic properties, False otherwise.
+    """
     if isinstance(v, (Module, Parameter, jax.Array, qwix.QArray)):
         return True
     if hasattr(jax.numpy, 'ndarray') and isinstance(v, jax.numpy.ndarray):
         return True
     if isinstance(v, (list, tuple)) and len(v) > 0 and all(_is_dynamic(x) for x in v):
         return True
-    if isinstance(v, dict) and len(v) > 0 and all(_is_dynamic(x) for x in v.values()):
-        return True
-    return False
+    return bool(isinstance(v, dict) and len(v) > 0 and all(_is_dynamic(x) for x in v.values()))
 
 class Module:
+    """
+    Base class for all neural network modules.
+    """
+
     training: bool = True
 
     def __init_subclass__(cls, **kwargs: tp.Any) -> None:
+        """
+        Initializes subclasses and registers them as PyTree nodes.
+        """
         super().__init_subclass__(**kwargs)
         register_pytree_node_class(cls)
 
     def train(self) -> tp.Self:
-        """Set this module and every child module to training mode."""
+        """Sets the module and all its children to training mode.
+
+        Returns:
+            tp.Self: The module itself.
+        """
         self.training = True
         for _, child in iter_children(self):
             if isinstance(child, Module) and not isinstance(child, Parameter):
@@ -125,7 +165,11 @@ class Module:
         return self
 
     def eval(self) -> tp.Self:
-        """Set this module and every child module to evaluation mode."""
+        """Sets the module and all its children to evaluation mode.
+
+        Returns:
+            tp.Self: The module itself.
+        """
         self.training = False
         for _, child in iter_children(self):
             if isinstance(child, Module) and not isinstance(child, Parameter):
@@ -169,6 +213,14 @@ class Module:
         return obj
 
     def flat_state_dict(self, prefix: str = '') -> StateDict:
+        """Returns a flattened dictionary containing the module's state.
+
+        Args:
+            prefix (str, optional): A prefix to prepend to all keys. Defaults to ''.
+
+        Returns:
+            StateDict: A dictionary mapping flattened parameter names to their values.
+        """
         state = {}
         for name, child in iter_children(self):
             if isinstance(child, Parameter):
@@ -178,6 +230,14 @@ class Module:
         return state
 
     def flat_parameter_dict(self, prefix: str = '') -> ParameterDict:
+        """Returns a flattened dictionary containing the module's parameters.
+
+        Args:
+            prefix (str, optional): A prefix to prepend to all keys. Defaults to ''.
+
+        Returns:
+            ParameterDict: A dictionary mapping flattened names to Parameter objects.
+        """
         state = {}
         for name, child in iter_children(self):
             if isinstance(child, Parameter):
@@ -187,6 +247,11 @@ class Module:
         return state
 
     def state_dict(self) -> StateDict:
+        """Returns a hierarchical dictionary containing the module's state.
+
+        Returns:
+            StateDict: A nested dictionary representing the module state.
+        """
         state = {}
         for name, child in iter_children(self):
             if isinstance(child, Parameter):
@@ -200,6 +265,12 @@ class Module:
         state: Mapping[str, PyTree],
         prefix: str = '',
     ) -> None:
+        """Loads state values from a flattened dictionary into the module.
+
+        Args:
+            state (Mapping[str, PyTree]): Flattened dictionary of state values.
+            prefix (str, optional): Prefix used in the flattened keys. Defaults to ''.
+        """
         for name, child in iter_children(self):
             if isinstance(child, Parameter):
                 full_name = prefix + name
@@ -209,26 +280,48 @@ class Module:
                 child.load_flat_state_dict(state, prefix + name + '.')
 
     def load_state_dict(self, state: Mapping[str, PyTree]) -> None:
+        """Loads state values from a hierarchical dictionary into the module.
+
+        Args:
+            state (Mapping[str, PyTree]): Hierarchical dictionary of state values.
+        """
         for name, child in iter_children(self):
             if isinstance(child, Parameter):
                 if name in state:
                     child.value = state[name]
-            elif isinstance(child, Module):
-                if name in state:
-                    child.load_state_dict(state[name])
+            elif isinstance(child, Module) and name in state:
+                child.load_state_dict(state[name])
 
     def __call__(self, *args: tp.Any, **kwds: tp.Any) -> tp.Any:
-        pass
+        """
+        Forward pass of the module.
+        """
 
 class Parameter(Module):
+    """
+    A kind of Module that represents a single array parameter.
+    """
+
     def __init__(
         self, array: PyTree, *,
         trainable: bool = True,
-        axis_names: tp.Optional[AxisNames] = None
+        axis_names: AxisNames | None = None
     ) -> None:
+        """Initializes a parameter object.
+
+        Args:
+            array (PyTree): The underlying array value.
+            trainable (bool, optional): Whether the parameter should be updated during training. Defaults to True.
+            axis_names (AxisNames | None, optional): Optional logical axis names for the parameter. Defaults to None.
+        """
         self.value = array
         self.trainable = trainable
         self.axis_names = axis_names
+        # tmp
+        self.quantization = None
+        self.quantization_kind = None
+        self.input_axis_count = None
+        self.quantization_batch_axis_count = None
 
     def tree_flatten(
         self,
@@ -269,6 +362,9 @@ class Parameter(Module):
         return getattr(self.value, name)
 
 def _make_magic_methods() -> None:
+    """
+    Attaches common array magic methods to the Parameter class.
+    """
     for op in ['add', 'sub', 'mul', 'truediv', 'floordiv', 'mod', 'pow', 'matmul',
                'eq', 'ne', 'lt', 'le', 'gt', 'ge']:
         magic = f'__{op}__'
@@ -279,11 +375,16 @@ def _make_magic_methods() -> None:
         magic = f'__{op}__'
         setattr(Parameter, magic, lambda self, o=op: getattr(operator, o)(self.value))
 
-    setattr(Parameter, '__getitem__', lambda self, key: operator.getitem(self.value, key))
+    Parameter.__getitem__ = lambda self, key: operator.getitem(self.value, key)
 
 _make_magic_methods()
 
 def module(cls):
+    """Class decorator to transform a generic class into a Module subclass.
+
+    Returns:
+        _type_: The newly created Module subclass.
+    """
     if issubclass(cls, Module):
         return cls
 

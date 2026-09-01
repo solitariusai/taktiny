@@ -13,22 +13,31 @@
 # limitations under the License.
 """Shape-only flattening modules."""
 from __future__ import annotations
-from collections.abc import Sequence
+
 import math
+from collections.abc import Sequence
+
 import jax
 import jax.numpy as jnp
-from taktiny import nn
-from taktiny.nn.continuo import _canonical_axis
+
+from taktiny.nn.base import Module
+from taktiny.nn.utils import _canonical_axis
 
 
-class Flatten(nn.Module):
-    """Collapse a contiguous range of dimensions into one dimension."""
+class Flatten(Module):
+    """Flattens a contiguous range of axes of a tensor."""
 
     def __init__(
         self,
         start_axis: int = 1,
         end_axis: int = -1,
     ) -> None:
+        """Initializes a Flatten module.
+
+        Args:
+            start_axis (int, optional): The first axis to flatten. Defaults to 1.
+            end_axis (int, optional): The last axis to flatten. Defaults to -1.
+        """
         if not isinstance(start_axis, int) or isinstance(start_axis, bool):
             raise TypeError('start_axis must be an integer')
         if not isinstance(end_axis, int) or isinstance(end_axis, bool):
@@ -37,6 +46,14 @@ class Flatten(nn.Module):
         self.end_axis = end_axis
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        """Flattens the specified axes of the input tensor.
+
+        Args:
+            x (jax.Array): The input tensor to be flattened.
+
+        Returns:
+            jax.Array: The flattened tensor.
+        """
         start_axis = _canonical_axis(
             self.start_axis,
             x.ndim,
@@ -66,14 +83,20 @@ class Flatten(nn.Module):
         return f'start_axis={self.start_axis}, end_axis={self.end_axis}'
 
 
-class Unflatten(nn.Module):
-    """Expand one dimension into a specified sequence of dimensions."""
+class Unflatten(Module):
+    """Unflattens a specific axis of a tensor into multiple dimensions."""
 
     def __init__(
         self,
         axis: int,
         unflattened_size: int | Sequence[int],
     ) -> None:
+        """Initializes an Unflatten module.
+
+        Args:
+            axis (int): The axis to unflatten.
+            unflattened_size (int | Sequence[int]): The sizes of the new dimensions. One of the sizes can be -1, in which case its value is inferred.
+        """
         if not isinstance(axis, int) or isinstance(axis, bool):
             raise TypeError('axis must be an integer')
         if isinstance(unflattened_size, int):
@@ -106,6 +129,14 @@ class Unflatten(nn.Module):
         self.unflattened_size = unflattened_size
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        """Unflattens the specified axis of the input tensor.
+
+        Args:
+            x (jax.Array): The input tensor to unflatten.
+
+        Returns:
+            jax.Array: The unflattened tensor.
+        """
         if x.ndim == 0:
             raise ValueError('cannot unflatten a scalar input')
         axis = _canonical_axis(self.axis, x.ndim, name='axis')

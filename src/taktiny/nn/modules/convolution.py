@@ -13,16 +13,19 @@
 # limitations under the License.
 """Convolution modules"""
 from __future__ import annotations
+
+import math
+import typing as tp
 from collections.abc import Sequence
 from itertools import product
-import math
+
 import jax
 import jax.numpy as jnp
-import typing as tp
 from jax.nn.initializers import lecun_uniform, zeros
-from taktiny import nn
-from taktiny.utils.typing import AxisNames, DType, Initializer, ShardMode
-from taktiny.nn.continuo import (
+
+from taktiny.nn.base import Module, Parameter
+from taktiny.nn.rng import Rngs
+from taktiny.nn.utils import (
     _adaptive_pool,
     _as_batched,
     _canonical_padding,
@@ -35,35 +38,16 @@ from taktiny.nn.continuo import (
     _reduce_window_config,
     _restore_batch,
     _scatter_indices,
-    _window_output_shape
+    _window_output_shape,
 )
+from taktiny.utils.typing import AxisNames, DType, Initializer, ShardMode
 
 default_conv_initializer = lecun_uniform()
-class Conv(nn.Module):
+
+
+class Conv(Module):
     """
-    N-dimensional channels-last convolution.
-
-    The spatial rank is inferred from ``kernel_size``. For example,
-    ``kernel_size=3`` creates a 1D convolution, while ``kernel_size=(3, 3)``
-    creates a 2D convolution. Inputs may be batched as
-    ``[batch, *spatial, channels]`` or unbatched as ``[*spatial, channels]``.
-
-    Args:
-        in_channels: Number of channels in the input.
-        out_channels: Number of channels produced by the convolution.
-        kernel_size: Kernel extent for each spatial dimension.
-        stride: Window stride for each spatial dimension.
-        padding: ``"SAME"``, ``"VALID"``, a symmetric integer, one symmetric
-            integer per dimension, or explicit ``(low, high)`` pairs.
-        dilation: Kernel dilation for each spatial dimension.
-        groups: Number of blocked channel groups.
-        bias: Whether to add a learned output-channel bias.
-        padding_mode: ``"zeros"``, ``"reflect"``, ``"replicate"``, or
-            ``"circular"``. Nonzero modes require explicit numeric padding.
-        dtype: Parameter dtype.
-        rngs: Random stream used for parameter initialization.
-        initializer: Weight initializer receiving ``(key, shape, dtype)``.
-        bias_initializer: Bias initializer receiving ``(key, shape, dtype)``.
+    Applies a convolution over an input signal.
     """
 
     def __init__(
@@ -79,12 +63,35 @@ class Conv(nn.Module):
         dtype: DType = jnp.float32,
         *,
         bias: bool = True,
-        rngs: nn.Rngs,
+        rngs: Rngs,
         initializer: Initializer = default_conv_initializer,
         bias_initializer: Initializer = zeros,
         axis_names: AxisNames | None = None,
         shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
+        """
+        The spatial rank is inferred from ``kernel_size``. For example,
+        ``kernel_size=3`` creates a 1D convolution, while ``kernel_size=(3, 3)``
+        creates a 2D convolution. Inputs may be batched as
+        ``[batch, *spatial, channels]`` or unbatched as ``[*spatial, channels]``.
+
+        Args:
+            in_channels (int): Number of channels in the input image.
+            out_channels (int): Number of channels produced by the convolution.
+            kernel_size (int | Sequence[int]): Size of the convolving kernel.
+            rngs (Rngs): PRNG key generator for parameter initialization.
+            stride (int | Sequence[int], optional): Stride of the convolution. Defaults to 1.
+            padding (str | int | Sequence[int | tuple[int, int]], optional): Padding added to all sides of the input. Defaults to 0.
+            dilation (int | Sequence[int], optional): Spacing between kernel elements. Defaults to 1.
+            groups (int, optional): Number of blocked connections from input channels to output channels. Defaults to 1.
+            padding_mode (str, optional): Padding mode. Defaults to 'zeros'.
+            dtype (DType, optional): Data type of the parameters. Defaults to jnp.float32.
+            bias (bool, optional): If True, adds a learnable bias to the output. Defaults to True.
+            initializer (Initializer, optional): Initializer for the weights. Defaults to default_conv_initializer.
+            bias_initializer (Initializer, optional): Initializer for the bias. Defaults to zeros.
+            axis_names (AxisNames | None, optional): Logical axis names for sharding. Defaults to None.
+            shard_mode (ShardMode, optional): Sharding mode. Defaults to ShardMode.AUTO.
+        """
         if not isinstance(in_channels, int) or in_channels <= 0:
             raise ValueError('in_channels must be a positive integer')
         if not isinstance(out_channels, int) or out_channels <= 0:
@@ -150,7 +157,7 @@ class Conv(nn.Module):
             in_channels // groups,
             out_channels,
         )
-        self.weight = nn.Parameter(
+        self.weight = Parameter(
             initializer(rngs(), weight_shape, dtype)
         )
         if axis_names is not None:
@@ -162,7 +169,7 @@ class Conv(nn.Module):
             self.weight.axis_names = axis_names
 
         if bias:
-            self.bias = nn.Parameter(
+            self.bias = Parameter(
                 bias_initializer(rngs(), (out_channels,), dtype)
             )
             if axis_names is not None:
@@ -175,6 +182,16 @@ class Conv(nn.Module):
         rank: int | None = None,
         name: str,
     ) -> tuple[int, ...]:
+        """Normalizes a spatial argument into a tuple of integers.
+
+        Args:
+            value (int | Sequence[int]): The value to normalize.
+            name (str): The name of the argument (used for error messages).
+            rank (int | None, optional): The expected spatial rank. Defaults to None.
+
+        Returns:
+            tuple[int, ...]: The normalized spatial argument.
+        """
         if isinstance(value, int):
             values = (value,) if rank is None else (value,) * rank
         else:
@@ -194,6 +211,15 @@ class Conv(nn.Module):
         padding: str | int | Sequence[int | tuple[int, int]],
         rank: int,
     ) -> str | tuple[tuple[int, int], ...]:
+        """Normalizes the padding argument into a canonical form.
+
+        Args:
+            padding (str | int | Sequence[int | tuple[int, int]]): The padding to normalize.
+            rank (int): The spatial rank.
+
+        Returns:
+            str | tuple[tuple[int, int], ...]: The normalized padding.
+        """
         if isinstance(padding, str):
             padding = padding.upper()
             if padding not in {'SAME', 'VALID'}:
@@ -236,6 +262,15 @@ class Conv(nn.Module):
         x: jax.Array,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
+        """Applies the convolution operation.
+
+        Args:
+            x (jax.Array): The input array.
+            out_sharding (jax.sharding.Sharding | None, optional): Optional sharding constraint for the output. Defaults to None.
+
+        Returns:
+            jax.Array: The result of the convolution.
+        """
         expected_batched_rank = self.spatial_rank + 2
         if x.ndim not in {expected_batched_rank - 1, expected_batched_rank}:
             raise ValueError(
@@ -298,8 +333,10 @@ class Conv(nn.Module):
             f'k={self.kernel_size}, s={self.stride}'
         )
 
-class ConvTranspose(nn.Module):
-    """N-dimensional channels-last transposed convolution."""
+class ConvTranspose(Module):
+    """
+    Applies a transposed convolution over an input signal.
+    """
 
     def __init__(
         self,
@@ -315,12 +352,32 @@ class ConvTranspose(nn.Module):
         dtype: DType = jnp.float32,
         *,
         bias: bool = True,
-        rngs: nn.Rngs,
+        rngs: Rngs,
         initializer: Initializer = default_conv_initializer,
         bias_initializer: Initializer = zeros,
         axis_names: AxisNames | None = None,
         shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
+        """Initializes the ConvTranspose module.
+
+        Args:
+            in_channels (int): Number of channels in the input image.
+            out_channels (int): Number of channels produced by the convolution.
+            kernel_size (int | Sequence[int]): Size of the convolving kernel.
+            rngs (Rngs): PRNG key generator for parameter initialization.
+            stride (int | Sequence[int], optional): Stride of the convolution. Defaults to 1.
+            padding (str | int | Sequence[int | tuple[int, int]], optional): Padding added to all sides of the input. Defaults to 0.
+            output_padding (int | Sequence[int], optional): Additional size added to one side of each dimension in the output shape. Defaults to 0.
+            groups (int, optional): Number of blocked connections from input channels to output channels. Defaults to 1.
+            dilation (int | Sequence[int], optional): Spacing between kernel elements. Defaults to 1.
+            padding_mode (str, optional): Padding mode. Defaults to 'zeros'.
+            dtype (DType, optional): Data type of the parameters. Defaults to jnp.float32.
+            bias (bool, optional): If True, adds a learnable bias to the output. Defaults to True.
+            initializer (Initializer, optional): Initializer for the weights. Defaults to default_conv_initializer.
+            bias_initializer (Initializer, optional): Initializer for the bias. Defaults to zeros.
+            axis_names (AxisNames | None, optional): Logical axis names for sharding. Defaults to None.
+            shard_mode (ShardMode, optional): Sharding mode. Defaults to ShardMode.AUTO.
+        """
         if not isinstance(in_channels, int) or in_channels <= 0:
             raise ValueError('in_channels must be a positive integer')
         if not isinstance(out_channels, int) or out_channels <= 0:
@@ -384,7 +441,7 @@ class ConvTranspose(nn.Module):
             in_channels,
             out_channels // groups,
         )
-        self.weight = nn.Parameter(
+        self.weight = Parameter(
             initializer(rngs(), weight_shape, dtype)
         )
         if axis_names is not None:
@@ -396,7 +453,7 @@ class ConvTranspose(nn.Module):
             self.weight.axis_names = axis_names
 
         if bias:
-            self.bias = nn.Parameter(
+            self.bias = Parameter(
                 bias_initializer(rngs(), (out_channels,), dtype)
             )
             if axis_names is not None:
@@ -407,6 +464,15 @@ class ConvTranspose(nn.Module):
         x: jax.Array,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
+        """Applies the transposed convolution operation.
+
+        Args:
+            x (jax.Array): The input array.
+            out_sharding (jax.sharding.Sharding | None, optional): Optional sharding constraint for the output. Defaults to None.
+
+        Returns:
+            jax.Array: The result of the transposed convolution.
+        """
         x, unbatched = _as_batched(
             x,
             self.spatial_rank,
@@ -460,8 +526,10 @@ class ConvTranspose(nn.Module):
             f'k={self.kernel_size}, s={self.stride}'
         )
 
-class Unfold(nn.Module):
-    """Extract sliding blocks into ``[batch, windows, patch_width]``."""
+class Unfold(Module):
+    """
+    Extracts sliding local blocks from a batched input tensor.
+    """
 
     def __init__(
         self,
@@ -470,6 +538,14 @@ class Unfold(nn.Module):
         padding: str | int | Sequence[int | tuple[int, int]] = 0,
         stride: int | Sequence[int] = 1,
     ) -> None:
+        """Initializes the Unfold module.
+
+        Args:
+            kernel_size (int | Sequence[int]): The size of the sliding blocks.
+            dilation (int | Sequence[int], optional): A parameter that controls the stride of elements within the neighborhood. Defaults to 1.
+            padding (str | int | Sequence[int | tuple[int, int]], optional): Implicit zero padding to be added on both sides of input. Defaults to 0.
+            stride (int | Sequence[int], optional): The stride of the sliding blocks in the input spatial dimensions. Defaults to 1.
+        """
         kernel_size = Conv._normalize_spatial(kernel_size, name='kernel_size')
         rank = len(kernel_size)
         self.kernel_size = kernel_size
@@ -487,6 +563,14 @@ class Unfold(nn.Module):
         self.spatial_rank = rank
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        """Extracts patches from the input tensor.
+
+        Args:
+            x (jax.Array): The input array.
+
+        Returns:
+            jax.Array: A tensor containing the extracted patches.
+        """
         x, unbatched = _as_batched(x, self.spatial_rank)
         patches = jax.lax.conv_general_dilated_patches(
             x,
@@ -503,8 +587,10 @@ class Unfold(nn.Module):
         )
         return _restore_batch(patches, unbatched)
 
-class Fold(nn.Module):
-    """Overlap-add a matrix of flattened sliding blocks into an array."""
+class Fold(Module):
+    """
+    Combines an array of sliding local blocks into a large containing tensor.
+    """
 
     def __init__(
         self,
@@ -514,6 +600,15 @@ class Fold(nn.Module):
         padding: str | int | Sequence[int | tuple[int, int]] = 0,
         stride: int | Sequence[int] = 1,
     ) -> None:
+        """Initializes the Fold module.
+
+        Args:
+            output_size (int | Sequence[int]): The shape of the spatial dimensions of the output.
+            kernel_size (int | Sequence[int]): The size of the sliding blocks.
+            dilation (int | Sequence[int], optional): A parameter that controls the stride of elements within the neighborhood. Defaults to 1.
+            padding (str | int | Sequence[int | tuple[int, int]], optional): Implicit zero padding to be added on both sides of input. Defaults to 0.
+            stride (int | Sequence[int], optional): The stride of the sliding blocks in the input spatial dimensions. Defaults to 1.
+        """
         output_size = Conv._normalize_spatial(output_size, name='output_size')
         rank = len(output_size)
         self.output_size = output_size
@@ -536,6 +631,14 @@ class Fold(nn.Module):
         self.spatial_rank = rank
 
     def __call__(self, patches: jax.Array) -> jax.Array:
+        """Folds the extracted patches back into an output tensor.
+
+        Args:
+            patches (jax.Array): The input patches array.
+
+        Returns:
+            jax.Array: The folded output tensor.
+        """
         if patches.ndim not in {2, 3}:
             raise ValueError(
                 'Fold expects [windows, patch] or [batch, windows, patch]'
@@ -608,8 +711,10 @@ class Fold(nn.Module):
             ].add(values, mode='drop')
         return _restore_batch(output, unbatched)
 
-class MaxPool(nn.Module):
-    """N-dimensional max pooling with optional flattened spatial indices."""
+class MaxPool(Module):
+    """
+    Applies a max pooling over an input signal.
+    """
 
     def __init__(
         self,
@@ -620,6 +725,16 @@ class MaxPool(nn.Module):
         return_indices: bool = False,
         ceil_mode: bool = False,
     ) -> None:
+        """Initializes the MaxPool module.
+
+        Args:
+            kernel_size (int | Sequence[int]): The size of the window to take a max over.
+            stride (int | Sequence[int] | None, optional): The stride of the window. Default value is kernel_size. Defaults to None.
+            padding (str | int | Sequence[int | tuple[int, int]], optional): Implicit zero padding to be added on both sides. Defaults to 0.
+            dilation (int | Sequence[int], optional): A parameter that controls the stride of elements in the window. Defaults to 1.
+            return_indices (bool, optional): If True, will return the max indices along with the outputs. Defaults to False.
+            ceil_mode (bool, optional): When True, will use ceil instead of floor to compute the output shape. Defaults to False.
+        """
         kernel_size = Conv._normalize_spatial(kernel_size, name='kernel_size')
         rank = len(kernel_size)
         self.kernel_size = kernel_size
@@ -642,6 +757,14 @@ class MaxPool(nn.Module):
         self,
         x: jax.Array,
     ) -> jax.Array | tuple[jax.Array, jax.Array]:
+        """Applies the max pooling operation.
+
+        Args:
+            x (jax.Array): The input array.
+
+        Returns:
+            jax.Array | tuple[jax.Array, jax.Array]: The pooled result, and optionally the indices of the maximum values.
+        """
         x, unbatched = _as_batched(x, self.spatial_rank)
         spatial_shape = x.shape[1:-1]
         padding = _pool_padding(
@@ -709,8 +832,10 @@ class MaxPool(nn.Module):
             _restore_batch(indices, unbatched),
         )
 
-class MaxUnpool(nn.Module):
-    """Scatter pooled values back to flattened indices from :class:`MaxPool`."""
+class MaxUnpool(Module):
+    """
+    Computes a partial inverse of MaxPool.
+    """
 
     def __init__(
         self,
@@ -719,6 +844,14 @@ class MaxUnpool(nn.Module):
         padding: int | Sequence[int | tuple[int, int]] = 0,
         dilation: int | Sequence[int] = 1,
     ) -> None:
+        """Initializes the MaxUnpool module.
+
+        Args:
+            kernel_size (int | Sequence[int]): Size of the max pooling window.
+            stride (int | Sequence[int] | None, optional): Stride of the max pooling window. Defaults to None.
+            padding (int | Sequence[int | tuple[int, int]], optional): Padding that was added to the input. Defaults to 0.
+            dilation (int | Sequence[int], optional): Spacing between window elements. Defaults to 1.
+        """
         kernel_size = Conv._normalize_spatial(kernel_size, name='kernel_size')
         rank = len(kernel_size)
         self.kernel_size = kernel_size
@@ -729,7 +862,7 @@ class MaxUnpool(nn.Module):
         )
         normalized_padding = Conv._normalize_padding(padding, rank)
         if isinstance(normalized_padding, str):
-            raise ValueError('MaxUnpool requires explicit numeric padding')
+            raise TypeError('MaxUnpool requires explicit numeric padding')
         self.padding = normalized_padding
         self.dilation = Conv._normalize_spatial(
             dilation,
@@ -744,6 +877,16 @@ class MaxUnpool(nn.Module):
         indices: jax.Array,
         output_size: int | Sequence[int] | None = None,
     ) -> jax.Array:
+        """Applies the unpooling operation.
+
+        Args:
+            x (jax.Array): The input array to unpool.
+            indices (jax.Array): The indices returned by MaxPool.
+            output_size (int | Sequence[int] | None, optional): The targeted output size. Defaults to None.
+
+        Returns:
+            jax.Array: The unpooled result.
+        """
         x, unbatched = _as_batched(x, self.spatial_rank)
         indices, indices_unbatched = _as_batched(indices, self.spatial_rank)
         if indices_unbatched != unbatched or indices.shape != x.shape:
@@ -787,8 +930,10 @@ class MaxUnpool(nn.Module):
         output = output.reshape(batch_size, *output_size, channels)
         return _restore_batch(output, unbatched)
 
-class AvgPool(nn.Module):
-    """N-dimensional average pooling with configurable divisor semantics."""
+class AvgPool(Module):
+    """
+    Applies an average pooling over an input signal.
+    """
 
     def __init__(
         self,
@@ -799,6 +944,16 @@ class AvgPool(nn.Module):
         count_include_pad: bool = True,
         divisor_override: int | None = None,
     ) -> None:
+        """Initializes the AvgPool module.
+
+        Args:
+            kernel_size (int | Sequence[int]): The size of the window.
+            stride (int | Sequence[int] | None, optional): The stride of the window. Defaults to None.
+            padding (str | int | Sequence[int | tuple[int, int]], optional): Implicit zero padding to be added on both sides. Defaults to 0.
+            ceil_mode (bool, optional): When True, will use ceil instead of floor to compute the output shape. Defaults to False.
+            count_include_pad (bool, optional): When True, will include the zero-padding in the averaging calculation. Defaults to True.
+            divisor_override (int | None, optional): If specified, it will be used as divisor, otherwise size of the pooling region will be used. Defaults to None.
+        """
         kernel_size = Conv._normalize_spatial(kernel_size, name='kernel_size')
         rank = len(kernel_size)
         if divisor_override is not None and divisor_override <= 0:
@@ -816,6 +971,14 @@ class AvgPool(nn.Module):
         self.spatial_rank = rank
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        """Applies the average pooling operation.
+
+        Args:
+            x (jax.Array): The input array.
+
+        Returns:
+            jax.Array: The pooled result.
+        """
         x, unbatched = _as_batched(x, self.spatial_rank)
         if not jnp.issubdtype(x.dtype, jnp.inexact):
             x = x.astype(jnp.float32)
@@ -888,8 +1051,10 @@ class AvgPool(nn.Module):
             divisor = valid
         return _restore_batch(total / divisor, unbatched)
 
-class FractionalMaxPool(nn.Module):
-    """N-dimensional max pooling over reproducible fractional intervals."""
+class FractionalMaxPool(Module):
+    """
+    Applies a fractional max pooling over an input signal.
+    """
 
     def __init__(
         self,
@@ -899,8 +1064,18 @@ class FractionalMaxPool(nn.Module):
         return_indices: bool = False,
         random_samples: jax.Array | Sequence[float] | None = None,
         *,
-        rngs: nn.Rngs | None = None,
+        rngs: Rngs | None = None,
     ) -> None:
+        """Initializes the FractionalMaxPool module.
+
+        Args:
+            kernel_size (int | Sequence[int]): The size of the window to take a max over.
+            output_size (int | Sequence[int] | None, optional): The target output size. Defaults to None.
+            output_ratio (float | Sequence[float] | None, optional): The ratio of output size to input size. Defaults to None.
+            return_indices (bool, optional): If True, will return the max indices along with the outputs. Defaults to False.
+            random_samples (jax.Array | Sequence[float] | None, optional): Optional random samples for pooling grid generation. Defaults to None.
+            rngs (Rngs | None, optional): PRNG key generator. Defaults to None.
+        """
         kernel_size = Conv._normalize_spatial(kernel_size, name='kernel_size')
         rank = len(kernel_size)
         if (output_size is None) == (output_ratio is None):
@@ -955,6 +1130,14 @@ class FractionalMaxPool(nn.Module):
         self,
         x: jax.Array,
     ) -> jax.Array | tuple[jax.Array, jax.Array]:
+        """Applies the fractional max pooling operation.
+
+        Args:
+            x (jax.Array): The input array.
+
+        Returns:
+            jax.Array | tuple[jax.Array, jax.Array]: The pooled result, and optionally the indices of the maximum values.
+        """
         x, unbatched = _as_batched(x, self.spatial_rank)
         spatial_shape = x.shape[1:-1]
         if self.output_size is None:
@@ -1049,8 +1232,10 @@ class FractionalMaxPool(nn.Module):
         )
         return output, _restore_batch(index_output, unbatched)
 
-class LPPool(nn.Module):
-    """N-dimensional pooling using the sum-based p-norm of each window."""
+class LPPool(Module):
+    """
+    Applies a power-average pooling over an input signal.
+    """
 
     def __init__(
         self,
@@ -1059,6 +1244,14 @@ class LPPool(nn.Module):
         stride: int | Sequence[int] | None = None,
         ceil_mode: bool = False,
     ) -> None:
+        """Initializes the LPPool module.
+
+        Args:
+            norm_type (float): The power to use.
+            kernel_size (int | Sequence[int]): The size of the window.
+            stride (int | Sequence[int] | None, optional): The stride of the window. Defaults to None.
+            ceil_mode (bool, optional): When True, will use ceil instead of floor to compute the output shape. Defaults to False.
+        """
         if norm_type <= 0:
             raise ValueError('norm_type must be positive')
         kernel_size = Conv._normalize_spatial(kernel_size, name='kernel_size')
@@ -1074,6 +1267,14 @@ class LPPool(nn.Module):
         self.spatial_rank = rank
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        """Applies the LPPool operation.
+
+        Args:
+            x (jax.Array): The input array.
+
+        Returns:
+            jax.Array: The pooled result.
+        """
         x, unbatched = _as_batched(x, self.spatial_rank)
         if not jnp.issubdtype(x.dtype, jnp.inexact):
             x = x.astype(jnp.float32)
@@ -1104,8 +1305,10 @@ class LPPool(nn.Module):
         output = total ** (1.0 / self.norm_type)
         return _restore_batch(output, unbatched)
 
-class AdaptiveMaxPool(nn.Module):
-    """Max-pool adaptive regions to a requested spatial output size."""
+class AdaptiveMaxPool(Module):
+    """
+    Applies an adaptive max pooling over an input signal.
+    """
 
     def __init__(
         self,
@@ -1119,6 +1322,14 @@ class AdaptiveMaxPool(nn.Module):
         self,
         x: jax.Array,
     ) -> jax.Array | tuple[jax.Array, jax.Array]:
+        """Applies the adaptive max pooling operation.
+
+        Args:
+            x (jax.Array): The input array.
+
+        Returns:
+            jax.Array | tuple[jax.Array, jax.Array]: The pooled result, and optionally the indices of the maximum values.
+        """
         rank = len(self.output_size)
         x, unbatched = _as_batched(x, rank)
         spatial_shape = x.shape[1:-1]
@@ -1137,16 +1348,31 @@ class AdaptiveMaxPool(nn.Module):
             return values
         return values, _restore_batch(indices, unbatched)
 
-class AdaptiveAvgPool(nn.Module):
-    """Average-pool adaptive regions to a requested spatial output size."""
+class AdaptiveAvgPool(Module):
+    """
+    Applies an adaptive average pooling over an input signal.
+    """
 
     def __init__(
         self,
         output_size: int | Sequence[int | None],
     ) -> None:
+        """Initializes the AdaptiveAvgPool module.
+
+        Args:
+            output_size (int | Sequence[int | None]): The target output size.
+        """
         self.output_size = _normalize_adaptive_size(output_size)
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        """Applies the adaptive average pooling operation.
+
+        Args:
+            x (jax.Array): The input array.
+
+        Returns:
+            jax.Array: The pooled result.
+        """
         rank = len(self.output_size)
         x, unbatched = _as_batched(x, rank)
         if not jnp.issubdtype(x.dtype, jnp.inexact):
@@ -1163,8 +1389,10 @@ class AdaptiveAvgPool(nn.Module):
         )
         return _restore_batch(values, unbatched)
 
-class Padding(nn.Module):
-    """Apply rank-generic ``jax.numpy.pad`` padding to an array."""
+class Padding(Module):
+    """
+    Pads an input array.
+    """
 
     def __init__(
         self,
@@ -1172,6 +1400,13 @@ class Padding(nn.Module):
         mode: str = 'constant',
         value: float = 0.0,
     ) -> None:
+        """Initializes the Padding module.
+
+        Args:
+            padding (int | Sequence[int] | Sequence[tuple[int, int]]): The size of the padding.
+            mode (str, optional): The padding mode. Defaults to 'constant'.
+            value (float, optional): The fill value for 'constant' padding. Defaults to 0.0.
+        """
         aliases = {
             'zeros': 'constant',
             'replicate': 'edge',
@@ -1193,6 +1428,14 @@ class Padding(nn.Module):
         self.value = value
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        """Applies the padding operation.
+
+        Args:
+            x (jax.Array): The input array.
+
+        Returns:
+            jax.Array: The padded result.
+        """
         if self.mode == 'constant':
             return jnp.pad(
                 x,
@@ -1202,17 +1445,18 @@ class Padding(nn.Module):
             )
         return jnp.pad(x, self.padding, mode=self.mode)
 
+
 __all__ = [
+    'AdaptiveAvgPool',
+    'AdaptiveMaxPool',
+    'AvgPool',
     'Conv',
     'ConvTranspose',
-    'Unfold',
     'Fold',
-    'MaxPool',
-    'MaxUnpool',
-    'AvgPool',
     'FractionalMaxPool',
     'LPPool',
-    'AdaptiveMaxPool',
-    'AdaptiveAvgPool',
+    'MaxPool',
+    'MaxUnpool',
     'Padding',
+    'Unfold',
 ]

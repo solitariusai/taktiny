@@ -14,14 +14,14 @@
 """Dimension-agnostic channels-last resampling modules."""
 from __future__ import annotations
 
-from collections.abc import Sequence
 import math
+from collections.abc import Sequence
 from numbers import Real
 
 import jax
 
-from taktiny import nn
-from taktiny.nn.continuo import (
+from taktiny.nn.base import Module
+from taktiny.nn.utils import (
     _as_batched,
     _constrain,
     _normalize_adaptive_size,
@@ -30,7 +30,6 @@ from taktiny.nn.continuo import (
 )
 from taktiny.utils.typing import ShardMode
 
-
 _METHOD_ALIASES = {
     'bilinear': 'linear',
     'trilinear': 'linear',
@@ -38,8 +37,8 @@ _METHOD_ALIASES = {
 }
 
 
-class _Resize(nn.Module):
-    """Shared implementation for spatial resize modules."""
+class _Resize(Module):
+    """Base class for spatial dimension resampling modules."""
 
     def __init__(
         self,
@@ -51,6 +50,16 @@ class _Resize(nn.Module):
         antialias: bool,
         shard_mode: ShardMode,
     ) -> None:
+        """Initializes the resize module.
+
+        Args:
+            size (int | Sequence[int  |  None] | None): Target spatial size.
+            scale_factor (float | Sequence[float] | None): Scaling factor for the spatial dimensions.
+            default_scale_factor (float): Default scaling factor if none is provided.
+            method (str): Resampling method to use (e.g., 'linear', 'nearest').
+            antialias (bool): Whether to apply antialiasing.
+            shard_mode (ShardMode): Sharding mode for the output array.
+        """
         if size is not None and scale_factor is not None:
             raise ValueError('size and scale_factor are mutually exclusive')
         if size is None and scale_factor is None:
@@ -91,9 +100,26 @@ class _Resize(nn.Module):
         self.shard_mode = shard_mode
 
     def _scaled_size(self, current: int, scale: float) -> int:
+        """Computes the scaled size for a single dimension.
+
+        Args:
+            current (int): Current size of the dimension.
+            scale (float): Scale factor to apply.
+
+        Returns:
+            int: The new scaled size.
+        """
         raise NotImplementedError
 
     def _spatial_shape(self, current_shape: Sequence[int]) -> tuple[int, ...]:
+        """Computes the target spatial shape.
+
+        Args:
+            current_shape (Sequence[int]): The current spatial shape.
+
+        Returns:
+            tuple[int, ...]: The target spatial shape.
+        """
         if self.size is not None:
             return tuple(
                 current if requested is None else requested
@@ -109,6 +135,15 @@ class _Resize(nn.Module):
         x: jax.Array,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
+        """Applies the resize operation to the input array.
+
+        Args:
+            x (jax.Array): Input channels-last array to resize.
+            out_sharding (jax.sharding.Sharding | None, optional): Target sharding. Defaults to None.
+
+        Returns:
+            jax.Array: Resized output array.
+        """
         x, unbatched = _as_batched(x, self.spatial_rank)
         spatial_shape = self._spatial_shape(x.shape[1:-1])
         output = jax.image.resize(
@@ -121,6 +156,11 @@ class _Resize(nn.Module):
         return _constrain(output, out_sharding, self.shard_mode)
 
     def extra_repr(self) -> str:
+        """Returns extra representation string for the module.
+
+        Returns:
+            str: Extra representation of the module parameters.
+        """
         if self.size is not None:
             target = f'size={self.size}'
         else:
@@ -129,7 +169,7 @@ class _Resize(nn.Module):
 
 
 class Upsample(_Resize):
-    """Resize channels-last inputs to a size or by a spatial scale factor."""
+    """Upsamples the spatial dimensions of a channels-last array."""
 
     def __init__(
         self,
@@ -139,6 +179,15 @@ class Upsample(_Resize):
         antialias: bool = True,
         shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
+        """Initializes the upsampling module.
+
+        Args:
+            size (int | Sequence[int  |  None] | None, optional): Target spatial size. Defaults to None.
+            scale_factor (float | Sequence[float] | None, optional): Scaling factor for spatial dimensions. Defaults to None.
+            method (str, optional): Resampling method. Defaults to 'nearest'.
+            antialias (bool, optional): Whether to apply antialiasing. Defaults to True.
+            shard_mode (ShardMode, optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
+        """
         super().__init__(
             size,
             scale_factor,
@@ -149,16 +198,20 @@ class Upsample(_Resize):
         )
 
     def _scaled_size(self, current: int, scale: float) -> int:
+        """Computes the upscaled size for a single dimension.
+
+        Args:
+            current (int): Current size of the dimension.
+            scale (float): Scale factor to apply.
+
+        Returns:
+            int: The new upscaled size.
+        """
         return max(1, math.floor(current * scale))
 
 
 class Downsample(_Resize):
-    """Reduce channels-last spatial axes by an exact size or divisor.
-
-    ``scale_factor`` is a downsampling divisor, so ``scale_factor=2`` halves
-    each configured spatial axis. Inputs may be batched or unbatched and may
-    contain any positive number of spatial dimensions.
-    """
+    """Downsamples the spatial dimensions of a channels-last array."""
 
     def __init__(
         self,
@@ -168,6 +221,15 @@ class Downsample(_Resize):
         antialias: bool = True,
         shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
+        """Initializes the downsampling module.
+
+        Args:
+            size (int | Sequence[int  |  None] | None, optional): Target spatial size. Defaults to None.
+            scale_factor (float | Sequence[float] | None, optional): Reduction factor for spatial dimensions. Defaults to None.
+            method (str, optional): Resampling method. Defaults to 'linear'.
+            antialias (bool, optional): Whether to apply antialiasing. Defaults to True.
+            shard_mode (ShardMode, optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
+        """
         super().__init__(
             size,
             scale_factor,
@@ -185,9 +247,26 @@ class Downsample(_Resize):
             )
 
     def _scaled_size(self, current: int, scale: float) -> int:
+        """Computes the downscaled size for a single dimension.
+
+        Args:
+            current (int): Current size of the dimension.
+            scale (float): Reduction factor to apply.
+
+        Returns:
+            int: The new downscaled size.
+        """
         return max(1, math.floor(current / scale))
 
     def _spatial_shape(self, current_shape: Sequence[int]) -> tuple[int, ...]:
+        """Computes and validates the target spatial shape.
+
+        Args:
+            current_shape (Sequence[int]): The current spatial shape.
+
+        Returns:
+            tuple[int, ...]: The target spatial shape.
+        """
         spatial_shape = super()._spatial_shape(current_shape)
         if any(
             requested > current

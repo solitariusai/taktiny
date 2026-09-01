@@ -13,10 +13,11 @@
 # limitations under the License.
 """Utilities modules for stack/group other modules"""
 from __future__ import annotations
+
 from collections.abc import (
     Callable,
-    Iterable,
     ItemsView,
+    Iterable,
     Iterator,
     KeysView,
     Mapping,
@@ -24,13 +25,24 @@ from collections.abc import (
     ValuesView,
 )
 from typing import Any, overload
+
 import jax
 import jax.numpy as jnp
-from taktiny import transforms as tt
-from taktiny.nn.module import Module
+
+import taktiny.utils.transforms as tt
+from taktiny.nn.base import Module
 from taktiny.utils.typing import PyTree
 
+
 def _stack_modules(modules: Iterable[Module]) -> tuple[Module, int]:
+    """Stacks a sequence of compatible modules into a single module.
+
+    Args:
+        modules (Iterable[Module]): The sequence of modules to stack.
+
+    Returns:
+        tuple[Module, int]: A tuple containing the stacked module and the number of stacked modules.
+    """
     modules = tuple(modules)
     if not modules:
         raise ValueError('modules must contain at least one Module')
@@ -93,6 +105,15 @@ def _stack_modules(modules: Iterable[Module]) -> tuple[Module, int]:
 
 
 def _stack_compatible(reference: Module, module: Module) -> bool:
+    """Checks if a module is compatible for stacking with a reference module.
+
+    Args:
+        reference (Module): The reference module to check against.
+        module (Module): The module to check for compatibility.
+
+    Returns:
+        bool: True if the modules are compatible, False otherwise.
+    """
     if type(module) is not type(reference):
         return False
     if jax.tree_util.tree_structure(module) != jax.tree_util.tree_structure(
@@ -123,6 +144,14 @@ def _stack_compatible(reference: Module, module: Module) -> bool:
 def _group_stack_compatible(
     modules: Sequence[Module],
 ) -> tuple[tuple[Module, ...], ...]:
+    """Groups consecutive modules in a sequence that are compatible for stacking.
+
+    Args:
+        modules (Sequence[Module]): The sequence of modules to group.
+
+    Returns:
+        tuple[tuple[Module, ...], ...]: A tuple of module groups, where each group contains stack-compatible modules.
+    """
     groups: list[list[Module]] = []
     for module in modules:
         if not groups or not _stack_compatible(groups[-1][0], module):
@@ -144,8 +173,17 @@ def _validate_module_sequence(modules: Sequence[Module]) -> None:
                 f'{type(module).__name__}'
             )
 
+
 class List(Module):
+    """
+    A list-like module container.
+    """
     def __init__(self, modules: Sequence[Module]) -> None:
+        """Initializes the list module container.
+
+        Args:
+            modules (Sequence[Module]): The sequence of modules to store.
+        """
         _validate_module_sequence(modules)
         self.layers = list(modules)
 
@@ -169,10 +207,18 @@ class List(Module):
     def extra_repr(self) -> str:
         return f"{len(self.layers)}"
 
+
 class Dict(Module):
-    """A module container indexed by stable string keys."""
+    """
+    A dictionary-like module container indexed by stable string keys.
+    """
 
     def __init__(self, modules: Mapping[str, Module]) -> None:
+        """Initializes the dictionary module container.
+
+        Args:
+            modules (Mapping[str, Module]): A mapping of string keys to modules.
+        """
         if not isinstance(modules, Mapping):
             raise TypeError(
                 f'modules must be a mapping, got {type(modules).__name__}'
@@ -206,19 +252,42 @@ class Dict(Module):
         return iter(self.layers)
 
     def keys(self) -> KeysView[str]:
+        """Returns a view of the module keys.
+
+        Returns:
+            KeysView[str]: A view of the module keys.
+        """
         return self.layers.keys()
 
     def values(self) -> ValuesView[Module]:
+        """Returns a view of the module values.
+
+        Returns:
+            ValuesView[Module]: A view of the module values.
+        """
         return self.layers.values()
 
     def items(self) -> ItemsView[str, Module]:
+        """Returns a view of the module items (key-value pairs).
+
+        Returns:
+            ItemsView[str, Module]: A view of the module items.
+        """
         return self.layers.items()
 
     def extra_repr(self) -> str:
         return f'{len(self.layers)}'
 
 class Sequential(Module):
+    """
+    A sequential module container.
+    """
     def __init__(self, modules: Sequence[Module]) -> None:
+        """Initializes the sequential module container.
+
+        Args:
+            modules (Sequence[Module]): The sequence of modules to chain.
+        """
         _validate_module_sequence(modules)
         self.layers = tuple(modules)
 
@@ -240,6 +309,14 @@ class Sequential(Module):
         return iter(self.layers)
 
     def __call__(self, x: PyTree, *args: Any, **kwargs: Any) -> PyTree:
+        """Applies each module in sequence to the input.
+
+        Args:
+            x (PyTree): The input data.
+
+        Returns:
+            PyTree: The output after applying all modules sequentially.
+        """
         for layer in self.layers:
             x = layer(x, *args, **kwargs)
         return x
@@ -247,7 +324,11 @@ class Sequential(Module):
     def extra_repr(self) -> str:
         return f"{len(self.layers)}"
 
+
 class SeqStack(Module):
+    """
+    A sequential module stack that uses scan to apply stacked modules.
+    """
     def __init__(
         self,
         modules: Iterable[Module],
@@ -256,6 +337,14 @@ class SeqStack(Module):
         unroll: int | bool = 1,
         split_transpose: bool = False,
     ) -> None:
+        """Initializes the sequential stack module.
+
+        Args:
+            modules (Iterable[Module]): The sequence of modules to stack and scan over.
+            reverse (bool, optional): Whether to scan in reverse. Defaults to False.
+            unroll (int | bool, optional): Loop unrolling factor. Defaults to 1.
+            split_transpose (bool, optional): Whether to split transpose. Defaults to False.
+        """
         if not isinstance(reverse, bool):
             raise TypeError('reverse must be a boolean')
         if not isinstance(unroll, (int, bool)) or (
@@ -301,6 +390,15 @@ class SeqStack(Module):
         *args: Any,
         **kwargs: Any,
     ) -> tuple[PyTree, PyTree]:
+        """Applies a scanned function over the stacked modules.
+
+        Args:
+            f (Callable[..., Any]): The function to scan over the modules.
+            carry (PyTree): The initial carry value for the scan operation.
+
+        Returns:
+            tuple[PyTree, PyTree]: A tuple of the final carry and the stacked outputs.
+        """
         if hasattr(self, 'groups'):
             groups = reversed(self.groups) if self.reverse else self.groups
             group_outputs = []
@@ -348,7 +446,11 @@ class SeqStack(Module):
             return f'{self.num_stack}, groups=({groups})'
         return f'{self.num_stack}'
 
+
 class Stack(Module):
+    """
+    A module stack that uses vmap to apply stacked modules.
+    """
     def __init__(
         self,
         modules: Iterable[Module],
@@ -356,6 +458,13 @@ class Stack(Module):
         axis_name: Any | None = None,
         spmd_axis_name: Any | tuple[Any, ...] | None = None,
     ) -> None:
+        """Initializes the stack module.
+
+        Args:
+            modules (Iterable[Module]): The modules to stack and vectorize.
+            axis_name (Any | None, optional): The name of the mapped axis. Defaults to None.
+            spmd_axis_name (Any | tuple[Any, ...] | None, optional): The name of the SPMD mapped axis. Defaults to None.
+        """
         self.stacked, self.num_stack = _stack_modules(modules)
         self.axis_name = axis_name
         self.spmd_axis_name = spmd_axis_name
@@ -370,6 +479,15 @@ class Stack(Module):
         out_axes: Any = 0,
         **kwargs: Any,
     ) -> PyTree:
+        """Applies a vectorized function over the stacked modules.
+
+        Args:
+            in_axes (int | None | tuple[int  |  None, ...], optional): The axes to map over for arguments. Defaults to 0.
+            out_axes (Any, optional): The mapped output axes. Defaults to 0.
+
+        Returns:
+            PyTree: The outputs of the vectorized application.
+        """
         if isinstance(in_axes, tuple):
             if len(in_axes) != len(args):
                 raise ValueError(
@@ -394,10 +512,11 @@ class Stack(Module):
     def extra_repr(self) -> str:
         return f"{self.num_stack}"
 
+
 __all__ = [
-    'List',
     'Dict',
-    'Sequential',
+    'List',
     'SeqStack',
+    'Sequential',
     'Stack',
 ]

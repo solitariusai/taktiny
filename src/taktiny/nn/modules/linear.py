@@ -13,39 +13,53 @@
 # limitations under the License.
 """Linear modules."""
 from __future__ import annotations
+
 import typing as tp
+
 import jax
 import jax.numpy as jnp
 import qwix
 from jax.nn.initializers import lecun_uniform
-import warnings
 
-from taktiny.nn.module import Module, Parameter
+from taktiny.nn.base import Module, Parameter
 from taktiny.nn.rng import Rngs
-from taktiny.nn.continuo import _constrain, _normalize_shape
+from taktiny.nn.utils import _constrain, _normalize_shape
 from taktiny.utils.typing import AxisNames, DType, Initializer, ShardMode
 
 default_linear_initializer = lecun_uniform()
 
 
-# Deprecated: Linear seed
 class Linear(Module):
-    """General linear projection with optional Qwix-quantized weights."""
+    """Applies a linear transformation to the incoming data."""
+    
     def __init__(
         self,
         in_features: int | tuple[int, ...],
         out_features: int | tuple[int, ...],
         *,
         bias: bool = True,
-        dtype: tp.Optional[DType] = jnp.float32,
-        rngs: Rngs | None = None,
-        seed: Rngs | None = None,
+        dtype: DType | None = 'float32',
+        rngs: Rngs | None,
         initializer: Initializer = default_linear_initializer,
         quant: tp.Any = None,
         dot_general: tp.Any = None,
         axis_names: AxisNames | None = None,
         shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
+        """Initializes the linear module.
+
+        Args:
+            in_features (int | tuple[int, ...]): Size of each input sample.
+            out_features (int | tuple[int, ...]): Size of each output sample.
+            rngs (Rngs | None): Random number generators for initialization.
+            bias (bool, optional): If set to False, the layer will not learn an additive bias. Defaults to True.
+            dtype (DType | None, optional): The dtype of the computation. Defaults to 'float32'.
+            initializer (Initializer, optional): Initializer for the weight matrix. Defaults to default_linear_initializer.
+            quant (tp.Any, optional): Quantization configuration. Defaults to None.
+            dot_general (tp.Any, optional): Custom dot_general implementation. Defaults to None.
+            axis_names (AxisNames | None, optional): Names for the axes of the weight and bias parameters. Defaults to None.
+            shard_mode (ShardMode, optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
+        """
         if isinstance(in_features, int):
             in_features = (in_features,)
         else:
@@ -62,11 +76,8 @@ class Linear(Module):
         self.dot_general = dot_general
         self.shard_mode = shard_mode
 
-        if rngs is None and seed is None:
-            raise ValueError('A rngs must be provided to initialize Linear layer')
         if rngs is None:
-            warnings.warn('seed is deprecated. use `rngs` instead')
-            rngs = seed
+            raise ValueError('A rngs must be provided to initialize Linear layer')
 
         weight_shape = in_features + out_features
         self.weight = Parameter(
@@ -95,6 +106,15 @@ class Linear(Module):
         x: jax.Array,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
+        """Applies the linear transformation to the input.
+
+        Args:
+            x (jax.Array): The input array.
+            out_sharding (jax.sharding.Sharding | None, optional): The sharding for the output array. Defaults to None.
+
+        Returns:
+            jax.Array: The transformed output array.
+        """
         in_dims = len(self.in_features)
         x_contracting_dims = tuple(range(x.ndim - in_dims, x.ndim))
         weight_contracting_dims = tuple(range(in_dims))
@@ -140,11 +160,7 @@ class Linear(Module):
 
 
 class Bilinear(Module):
-    """Apply a bilinear projection to two arrays with shared leading axes.
-
-    The trailing feature shapes of ``x1`` and ``x2`` are contracted against
-    the first and second input feature groups of ``weight`` respectively.
-    """
+    """Applies a bilinear transformation to the incoming data."""
 
     def __init__(
         self,
@@ -153,15 +169,29 @@ class Bilinear(Module):
         out_features: int | tuple[int, ...],
         *,
         bias: bool = True,
-        dtype: tp.Optional[DType] = jnp.float32,
+        dtype: DType | None = jnp.float32,
         rngs: Rngs | None = None,
-        seed: Rngs | None = None,
         initializer: Initializer = default_linear_initializer,
         quant: tp.Any = None,
         dot_general: tp.Any = None,
         axis_names: AxisNames | None = None,
         shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
+        """Initializes the bilinear module.
+
+        Args:
+            in1_features (int | tuple[int, ...]): Size of each first input sample.
+            in2_features (int | tuple[int, ...]): Size of each second input sample.
+            out_features (int | tuple[int, ...]): Size of each output sample.
+            bias (bool, optional): If set to False, the layer will not learn an additive bias. Defaults to True.
+            dtype (DType | None, optional): The dtype of the computation. Defaults to jnp.float32.
+            rngs (Rngs | None, optional): Random number generators for initialization. Defaults to None.
+            initializer (Initializer, optional): Initializer for the weight matrix. Defaults to default_linear_initializer.
+            quant (tp.Any, optional): Quantization configuration. Defaults to None.
+            dot_general (tp.Any, optional): Custom dot_general implementation. Defaults to None.
+            axis_names (AxisNames | None, optional): Names for the axes of the weight and bias parameters. Defaults to None.
+            shard_mode (ShardMode, optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
+        """
         self.in1_features = _normalize_shape(in1_features, 'in1_features')
         self.in2_features = _normalize_shape(in2_features, 'in2_features')
         self.out_features = _normalize_shape(out_features, 'out_features')
@@ -169,11 +199,8 @@ class Bilinear(Module):
         self.dot_general = dot_general
         self.shard_mode = shard_mode
 
-        if rngs is None and seed is None:
-            raise ValueError('A rngs must be provided to initialize Bilinear layer')
         if rngs is None:
-            warnings.warn('seed is deprecated. use `rngs` instead')
-            rngs = seed
+            raise ValueError('A rngs must be provided to initialize Bilinear layer')
 
         weight_shape = (
             self.in1_features
@@ -207,6 +234,16 @@ class Bilinear(Module):
         x2: jax.Array,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
+        """Applies the bilinear transformation to the inputs.
+
+        Args:
+            x1 (jax.Array): The first input array.
+            x2 (jax.Array): The second input array.
+            out_sharding (jax.sharding.Sharding | None, optional): The sharding for the output array. Defaults to None.
+
+        Returns:
+            jax.Array: The transformed output array.
+        """
         in1_dims = len(self.in1_features)
         in2_dims = len(self.in2_features)
         if x1.ndim < in1_dims or x2.ndim < in2_dims:
@@ -297,4 +334,4 @@ class Bilinear(Module):
         return f'{in1}, {in2} -> {output}{quant}{custom_dot}'
 
 
-__all__ = ['Linear', 'Bilinear']
+__all__ = ['Bilinear', 'Linear']

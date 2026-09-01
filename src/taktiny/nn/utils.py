@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from __future__ import annotations
-from collections.abc import Callable, Sequence
-from itertools import product
+
 import math
+from collections.abc import Sequence
+from itertools import product
 from numbers import Real
+
 import jax
 import jax.numpy as jnp
 
-from taktiny.utils.typing import Activation, Axes, ShardMode
+from taktiny.utils.typing import Axes, ShardMode
 
 
 def _validate_integer(
@@ -28,6 +30,16 @@ def _validate_integer(
     *,
     minimum: int = 1,
 ) -> int:
+    """Validates that a value is an integer meeting a minimum constraint.
+
+    Args:
+        value (int): The value to validate.
+        name (str): The name of the value for error messages.
+        minimum (int, optional): The minimum allowed value. Defaults to 1.
+
+    Returns:
+        int: The validated integer value.
+    """
     if (
         not isinstance(value, int)
         or isinstance(value, bool)
@@ -47,6 +59,15 @@ def _normalize_shape(
     value: int | Sequence[int],
     name: str,
 ) -> tuple[int, ...]:
+    """Normalizes a shape to a tuple of positive integers.
+
+    Args:
+        value (int | Sequence[int]): A single integer or sequence of integers.
+        name (str): The name of the value for error messages.
+
+    Returns:
+        tuple[int, ...]: A normalized shape tuple containing at least one dimension.
+    """
     values = (value,) if isinstance(value, int) else tuple(value)
     if not values:
         raise ValueError(f'{name} must contain at least one dimension')
@@ -56,6 +77,15 @@ def _normalize_shape(
 
 
 def _validate_positive_float(value: float, name: str) -> float:
+    """Validates that a value is a finite positive float.
+
+    Args:
+        value (float): The value to validate.
+        name (str): The name of the value for error messages.
+
+    Returns:
+        float: The validated positive float value.
+    """
     if (
         isinstance(value, bool)
         or not isinstance(value, Real)
@@ -72,6 +102,16 @@ def _validate_probability(
     *,
     allow_one: bool = True,
 ) -> float:
+    """Validates that a value is a valid probability between 0 and 1.
+
+    Args:
+        value (float): The probability value to validate.
+        name (str, optional): The name of the value for error messages. Defaults to 'p'.
+        allow_one (bool, optional): Whether 1.0 is considered a valid probability. Defaults to True.
+
+    Returns:
+        float: The validated probability value.
+    """
     if isinstance(value, bool) or not isinstance(value, Real):
         raise TypeError(f'{name} must be a real number')
     value = float(value)
@@ -83,6 +123,15 @@ def _validate_probability(
 
 
 def _resolve_training(default: bool, training: bool | None) -> bool:
+    """Resolves the training flag, falling back to a default if None.
+
+    Args:
+        default (bool): The default boolean value.
+        training (bool | None): The specific training flag or None.
+
+    Returns:
+        bool: The resolved boolean training flag.
+    """
     if training is None:
         return default
     if not isinstance(training, bool):
@@ -97,6 +146,17 @@ def _canonical_axis(
     name: str = 'axis',
     allow_scalar: bool = False,
 ) -> int:
+    """Converts a potentially negative axis index into a canonical non-negative index.
+
+    Args:
+        axis (int): The axis index to resolve.
+        ndim (int): The rank (number of dimensions) of the array.
+        name (str, optional): The name of the value for error messages. Defaults to 'axis'.
+        allow_scalar (bool, optional): Whether to allow scalar handling. Defaults to False.
+
+    Returns:
+        int: The canonical non-negative axis index.
+    """
     if not isinstance(axis, int) or isinstance(axis, bool):
         raise TypeError(f'{name} must be an integer')
     if ndim == 0 and allow_scalar and axis in {-1, 0}:
@@ -116,6 +176,17 @@ def _canonical_axes(
     name: str = 'axes',
     allow_empty: bool = False,
 ) -> tuple[int, ...]:
+    """Converts a sequence of axes into a canonical sequence of unique non-negative indices.
+
+    Args:
+        axes (Axes): An axis or sequence of axes.
+        ndim (int): The rank (number of dimensions) of the array.
+        name (str, optional): The name of the value for error messages. Defaults to 'axes'.
+        allow_empty (bool, optional): Whether an empty sequence is allowed. Defaults to False.
+
+    Returns:
+        tuple[int, ...]: A tuple of unique canonical non-negative axes.
+    """
     values = (axes,) if isinstance(axes, int) else tuple(axes)
     if not values and not allow_empty:
         raise ValueError(f'{name} must contain at least one axis')
@@ -129,48 +200,15 @@ def _canonical_axes(
 
 
 def _identity(value: jax.Array) -> jax.Array:
+    """Returns the input value unchanged.
+
+    Args:
+        value (jax.Array): The input array.
+
+    Returns:
+        jax.Array: The identical input array.
+    """
     return value
-
-
-def _relu6(value: jax.Array) -> jax.Array:
-    return jnp.minimum(jax.nn.relu(value), 6)
-
-
-def _approximate_gelu(value: jax.Array) -> jax.Array:
-    return jax.nn.gelu(value, approximate=True)
-
-
-def _resolve_activation(
-    activation: Activation | None,
-    *,
-    allow_none: bool = False,
-) -> Callable[[jax.Array], jax.Array]:
-    if activation is None:
-        if allow_none:
-            return _identity
-        raise TypeError('activation must be a string or callable')
-    if callable(activation):
-        return activation
-    if not isinstance(activation, str):
-        expected = 'a string, callable, or None' if allow_none else 'a string or callable'
-        raise TypeError(f'activation must be {expected}')
-    normalized = activation.lower().replace('-', '_')
-    compact = normalized.replace('_', '')
-    if compact == 'relu6':
-        return _relu6
-    if compact in {
-        'gelupytorchtanh',
-        'gelunew',
-        'gelufast',
-        'geluapproximate',
-    }:
-        return _approximate_gelu
-    if compact == 'swish':
-        return jax.nn.silu
-    function = getattr(jax.nn, normalized, None)
-    if function is None or not callable(function):
-        raise ValueError(f'unsupported activation: {activation!r}')
-    return function
 
 
 def _constrain(
@@ -178,6 +216,16 @@ def _constrain(
     sharding: jax.sharding.Sharding | None,
     shard_mode: ShardMode,
 ) -> jax.Array:
+    """Applies a sharding constraint to the given array if explicitly requested.
+
+    Args:
+        value (jax.Array): The array to constrain.
+        sharding (jax.sharding.Sharding | None): The sharding configuration.
+        shard_mode (ShardMode): The sharding mode being used.
+
+    Returns:
+        jax.Array: The constrained array, or the original if unconstrained.
+    """
     if shard_mode == ShardMode.EXPLICIT and sharding is not None:
         return jax.lax.with_sharding_constraint(value, sharding)
     return value
@@ -188,6 +236,16 @@ def _normalize_nonnegative(
     *,
     name: str,
 ) -> tuple[int, ...]:
+    """Normalizes a value into a sequence of non-negative integers of a given rank.
+
+    Args:
+        value (int | Sequence[int]): A single integer or sequence of integers.
+        rank (int): The expected length of the resulting tuple.
+        name (str): The name of the value for error messages.
+
+    Returns:
+        tuple[int, ...]: A normalized tuple of non-negative integers.
+    """
     if isinstance(value, int):
         values = (value,) * rank
     else:
@@ -200,6 +258,14 @@ def _normalize_nonnegative(
 
 
 def _conv_dimension_numbers(rank: int) -> jax.lax.ConvDimensionNumbers:
+    """Generates standard convolution dimension numbers for channels-last format.
+
+    Args:
+        rank (int): The spatial rank of the convolution (e.g., 2 for 2D).
+
+    Returns:
+        jax.lax.ConvDimensionNumbers: The computed dimension numbers for convolution.
+    """
     lhs_spec = (0, rank + 1, *range(1, rank + 1))
     rhs_spec = (rank + 1, rank, *range(rank))
     return jax.lax.ConvDimensionNumbers(lhs_spec, rhs_spec, lhs_spec)
@@ -211,6 +277,16 @@ def _as_batched(
     *,
     channels: int | None = None,
 ) -> tuple[jax.Array, bool]:
+    """Ensures the input tensor has a batch dimension, optionally verifying channels.
+
+    Args:
+        x (jax.Array): The input array.
+        rank (int): The spatial rank of the operation.
+        channels (int | None, optional): Expected number of channels. Defaults to None.
+
+    Returns:
+        tuple[jax.Array, bool]: The batched array and a flag indicating if it was initially unbatched.
+    """
     batched_rank = rank + 2
     if x.ndim not in {batched_rank - 1, batched_rank}:
         raise ValueError(
@@ -224,6 +300,15 @@ def _as_batched(
 
 
 def _restore_batch(x: jax.Array, unbatched: bool) -> jax.Array:
+    """Removes the batch dimension if the original input was unbatched.
+
+    Args:
+        x (jax.Array): The potentially batched array.
+        unbatched (bool): Whether the original input lacked a batch dimension.
+
+    Returns:
+        jax.Array: The array with its original batched or unbatched shape.
+    """
     return x[0] if unbatched else x
 
 
@@ -234,6 +319,18 @@ def _canonical_padding(
     stride: Sequence[int],
     dilation: Sequence[int],
 ) -> tuple[tuple[int, int], ...]:
+    """Computes explicit padding sizes given convolution parameters.
+
+    Args:
+        padding (str | tuple[tuple[int, int], ...]): Padding string or explicit padding tuple.
+        input_shape (Sequence[int]): Spatial shape of the input.
+        kernel_size (Sequence[int]): Spatial sizes of the kernel.
+        stride (Sequence[int]): Stride of the convolution.
+        dilation (Sequence[int]): Dilation of the kernel.
+
+    Returns:
+        tuple[tuple[int, int], ...]: Computed explicit (low, high) padding per spatial dimension.
+    """
     if not isinstance(padding, str):
         return padding
     if padding == 'VALID':
@@ -261,6 +358,18 @@ def _window_output_shape(
     dilation: Sequence[int],
     padding: Sequence[tuple[int, int]],
 ) -> tuple[int, ...]:
+    """Calculates the output spatial shape of a sliding window operation.
+
+    Args:
+        input_shape (Sequence[int]): Spatial shape of the input.
+        kernel_size (Sequence[int]): Spatial sizes of the kernel.
+        stride (Sequence[int]): Stride of the operation.
+        dilation (Sequence[int]): Dilation of the kernel.
+        padding (Sequence[tuple[int, int]]): Explicit padding per dimension.
+
+    Returns:
+        tuple[int, ...]: The spatial shape of the output.
+    """
     output = []
     for size, kernel, step, spacing, (low, high) in zip(
         input_shape,
@@ -285,6 +394,19 @@ def _pool_padding(
     dilation: Sequence[int],
     ceil_mode: bool,
 ) -> tuple[tuple[int, int], ...]:
+    """Computes explicit padding sizes for pooling operations, handling ceil_mode.
+
+    Args:
+        padding (str | tuple[tuple[int, int], ...]): Padding string or explicit padding tuple.
+        input_shape (Sequence[int]): Spatial shape of the input.
+        kernel_size (Sequence[int]): Spatial sizes of the pooling kernel.
+        stride (Sequence[int]): Stride of the pooling operation.
+        dilation (Sequence[int]): Dilation of the pooling kernel.
+        ceil_mode (bool): Whether to use ceil instead of floor for output shape.
+
+    Returns:
+        tuple[tuple[int, int], ...]: Computed explicit padding per spatial dimension.
+    """
     pairs = list(
         _canonical_padding(
             padding,
@@ -331,6 +453,18 @@ def _reduce_window_config(
     tuple[tuple[int, int], ...],
     tuple[int, ...],
 ]:
+    """Formats window configuration for JAX reduce_window operations with channels-last data.
+
+    Args:
+        rank (int): Spatial rank.
+        kernel_size (Sequence[int]): Spatial kernel sizes.
+        stride (Sequence[int]): Spatial strides.
+        dilation (Sequence[int]): Spatial dilations.
+        padding (Sequence[tuple[int, int]]): Spatial paddings.
+
+    Returns:
+        tuple: Expanded kernel, stride, padding, and dilation for batch and channel dimensions.
+    """
     return (
         (1, *kernel_size, 1),
         (1, *stride, 1),
@@ -346,6 +480,18 @@ def _scatter_indices(
     stride: Sequence[int],
     padding: Sequence[tuple[int, int]],
 ) -> tuple[jax.Array, ...]:
+    """Generates broadcastable indices for scatter operations across batch, spatial, and channel dimensions.
+
+    Args:
+        batch_size (int): Size of the batch dimension.
+        channels (int): Number of channels.
+        grid_shape (Sequence[int]): Spatial shape of the output grid.
+        stride (Sequence[int]): Stride of the operation.
+        padding (Sequence[tuple[int, int]]): Applied padding.
+
+    Returns:
+        tuple[jax.Array, ...]: A tuple of JAX arrays containing indices for each dimension.
+    """
     rank = len(grid_shape)
     batch = jnp.arange(batch_size).reshape(
         (batch_size, *(1,) * rank, 1)
@@ -361,6 +507,14 @@ def _scatter_indices(
 
 
 def _max_identity(dtype: jnp.dtype) -> jax.Array:
+    """Returns the identity value for the max reduction operation for a given dtype.
+
+    Args:
+        dtype (jnp.dtype): The JAX data type.
+
+    Returns:
+        jax.Array: The identity value (e.g., -inf or min value) for max reduction.
+    """
     if jnp.issubdtype(dtype, jnp.bool_):
         return jnp.asarray(False, dtype=dtype)
     if jnp.issubdtype(dtype, jnp.integer):
@@ -371,6 +525,14 @@ def _max_identity(dtype: jnp.dtype) -> jax.Array:
 def _normalize_adaptive_size(
     output_size: int | Sequence[int | None],
 ) -> tuple[int | None, ...]:
+    """Normalizes the output size for adaptive pooling operations.
+
+    Args:
+        output_size (int | Sequence[int | None]): Target spatial size.
+
+    Returns:
+        tuple[int | None, ...]: A normalized tuple of target spatial sizes.
+    """
     if isinstance(output_size, int):
         values: tuple[int | None, ...] = (output_size,)
     else:
@@ -393,6 +555,17 @@ def _adaptive_pool(
     reduction: str,
     return_indices: bool,
 ) -> tuple[jax.Array, jax.Array | None]:
+    """Performs adaptive pooling to a dynamically determined spatial shape.
+
+    Args:
+        x (jax.Array): The batched, channels-last input tensor.
+        output_size (Sequence[int]): The desired output spatial dimensions.
+        reduction (str): The reduction method ('mean' or 'max').
+        return_indices (bool): Whether to return spatial indices (only valid for 'max').
+
+    Returns:
+        tuple[jax.Array, jax.Array | None]: The pooled array and optional indices.
+    """
     spatial_shape = x.shape[1:-1]
     if len(output_size) != len(spatial_shape):
         raise ValueError('output_size rank does not match the input')
@@ -461,24 +634,24 @@ def _adaptive_pool(
     return output, index_output
 
 __all__ = [
-    '_validate_integer',
-    '_normalize_shape',
-    '_validate_positive_float',
-    '_resolve_training',
-    '_canonical_axis',
-    '_canonical_axes',
-    '_resolve_activation',
-    '_constrain',
-    '_normalize_nonnegative',
-    '_conv_dimension_numbers',
+    '_adaptive_pool',
     '_as_batched',
-    '_restore_batch',
+    '_canonical_axes',
+    '_canonical_axis',
     '_canonical_padding',
-    '_window_output_shape',
-    '_pool_padding',
-    '_reduce_window_config',
-    '_scatter_indices',
+    '_constrain',
+    '_conv_dimension_numbers',
+    '_identity',
     '_max_identity',
     '_normalize_adaptive_size',
-    '_adaptive_pool',
+    '_normalize_nonnegative',
+    '_normalize_shape',
+    '_pool_padding',
+    '_reduce_window_config',
+    '_resolve_training',
+    '_restore_batch',
+    '_scatter_indices',
+    '_validate_integer',
+    '_validate_positive_float',
+    '_window_output_shape'
 ]

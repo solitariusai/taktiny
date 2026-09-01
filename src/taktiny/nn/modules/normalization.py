@@ -13,16 +13,18 @@
 # limitations under the License.
 """Rank-generic normalization modules."""
 from __future__ import annotations
-from collections.abc import Sequence
+
 import math
+from collections.abc import Sequence
+
 import jax
 import jax.numpy as jnp
 from jax.core import Tracer
 
-from taktiny.nn.module import Module, Parameter
-from taktiny.nn.continuo import (
-    _canonical_axis,
+from taktiny.nn.base import Module, Parameter
+from taktiny.nn.utils import (
     _canonical_axes,
+    _canonical_axis,
     _constrain,
     _normalize_shape,
     _resolve_training,
@@ -38,7 +40,16 @@ from taktiny.utils.typing import (
     ShardMode,
 )
 
+
 def _default_axes(rank: int) -> tuple[int, ...]:
+    """Returns the default normalized axes given a rank.
+
+    Args:
+        rank (int): The rank to get the default axes for.
+
+    Returns:
+        tuple[int, ...]: A tuple of axes `(-rank, ..., -1)`.
+    """
     return tuple(range(-rank, 0))
 
 
@@ -46,6 +57,15 @@ def _parameter_axis_names(
     axis_names: AxisNames | None,
     rank: int,
 ) -> AxisNames | None:
+    """Validates and standardizes parameter axis names.
+
+    Args:
+        axis_names (AxisNames | None): Optional axis names for parameters.
+        rank (int): The required rank.
+
+    Returns:
+        AxisNames | None: The validated axis names.
+    """
     if axis_names is None:
         return None
     names = tuple(axis_names)
@@ -61,6 +81,13 @@ def _validate_input_shape(
     shape: tuple[int, ...],
     axes: tuple[int, ...],
 ) -> None:
+    """Validates that the input tensor matches the normalized shape.
+
+    Args:
+        x (jax.Array): The input tensor.
+        shape (tuple[int, ...]): The expected normalized shape.
+        axes (tuple[int, ...]): The axes being normalized.
+    """
     actual = tuple(x.shape[axis] for axis in axes)
     if actual != shape:
         raise ValueError(
@@ -74,6 +101,16 @@ def _broadcast_parameter(
     ndim: int,
     axes: tuple[int, ...],
 ) -> jax.Array:
+    """Broadcasts a normalization parameter to the input shape.
+
+    Args:
+        parameter (jax.Array): The parameter tensor to broadcast.
+        ndim (int): The number of dimensions of the input.
+        axes (tuple[int, ...]): The axes the parameter normalizes over.
+
+    Returns:
+        jax.Array: The broadcasted parameter tensor.
+    """
     trailing_axes = tuple(range(ndim - parameter.ndim, ndim))
     if axes == trailing_axes:
         return parameter
@@ -91,18 +128,33 @@ def _broadcast_parameter(
 
 
 def _statistics_value(x: jax.Array) -> jax.Array:
+    """Converts the input to float32 if it is a half-precision float for computing statistics.
+
+    Args:
+        x (jax.Array): The input tensor.
+
+    Returns:
+        jax.Array: The converted input tensor.
+    """
     if x.dtype in (jnp.float16, jnp.bfloat16):
         return x.astype(jnp.float32)
     return x
 
 
 def _validate_floating(x: jax.Array) -> None:
+    """Validates that the input tensor has a floating-point data type.
+
+    Args:
+        x (jax.Array): The input tensor to validate.
+    """
     if not jnp.issubdtype(x.dtype, jnp.floating):
         raise TypeError('normalization requires a floating-point input')
 
 
 class LayerNorm(Module):
-    """Normalize one or more activation dimensions by mean and variance."""
+    """
+    Applies Layer Normalization over a mini-batch of inputs.
+    """
 
     def __init__(
         self,
@@ -118,6 +170,20 @@ class LayerNorm(Module):
         axis_names: AxisNames | None = None,
         shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
+        """Initializes the LayerNorm module.
+
+        Args:
+            normalized_shape (int | Sequence[int] | None): Input shape from an expected input of size.
+            eps (float, optional): A value added to the denominator for numerical stability. Defaults to 1e-5.
+            elementwise_affine (bool, optional): A boolean value that when set to True, this module has learnable per-element affine parameters initialized to ones (for weights) and zeros (for biases). Defaults to True.
+            dtype (DType, optional): Data type of the module parameters. Defaults to jnp.float32.
+            bias (bool, optional): If set to False, the layer will not learn an additive bias (only relevant if elementwise_affine is True). Defaults to True.
+            axes (Axes | None, optional): The axes to normalize over. Defaults to None.
+            initializer (Initializer, optional): Initializer for the weight parameter. Defaults to jnp.ones.
+            bias_initializer (Initializer, optional): Initializer for the bias parameter. Defaults to jnp.zeros.
+            axis_names (AxisNames | None, optional): Logical names for the parameter axes. Defaults to None.
+            shard_mode (ShardMode, optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
+        """
         self.normalized_shape = (
             None
             if normalized_shape is None
@@ -193,6 +259,15 @@ class LayerNorm(Module):
         x: jax.Array,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
+        """Applies layer normalization to the input.
+
+        Args:
+            x (jax.Array): The input tensor.
+            out_sharding (jax.sharding.Sharding | None, optional): Sharding constraint for the output. Defaults to None.
+
+        Returns:
+            jax.Array: The normalized input.
+        """
         x = jnp.asarray(x)
         _validate_floating(x)
         axes = _canonical_axes(self.axes, x.ndim)
@@ -230,7 +305,9 @@ class LayerNorm(Module):
 
 
 class RMSNorm(Module):
-    """Normalize one or more activation dimensions by root mean square."""
+    """
+    Applies Root Mean Square Normalization over a mini-batch of inputs.
+    """
 
     def __init__(
         self,
@@ -246,6 +323,20 @@ class RMSNorm(Module):
         bias_initializer: Initializer = jnp.zeros,
         axes: Axes | None = None,
     ) -> None:
+        """Initializes the RMSNorm module.
+
+        Args:
+            shape (int | Sequence[int] | None): Input shape from an expected input of size.
+            epsilon (float, optional): A value added to the denominator for numerical stability. Defaults to 1e-5.
+            dtype (DType | None, optional): Data type of the module parameters. Defaults to None.
+            with_scale (bool, optional): If set to True, the layer will learn a multiplicative scale parameter. Defaults to True.
+            bias (bool, optional): If set to True, the layer will learn an additive bias parameter. Defaults to False.
+            axis_names (AxisNames | None, optional): Logical names for the parameter axes. Defaults to None.
+            shard_mode (ShardMode, optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
+            initializer (Initializer, optional): Initializer for the scale parameter. Defaults to jnp.ones.
+            bias_initializer (Initializer, optional): Initializer for the bias parameter. Defaults to jnp.zeros.
+            axes (Axes | None, optional): The axes to normalize over. Defaults to None.
+        """
         self.normalized_shape = (
             None
             if shape is None
@@ -311,6 +402,15 @@ class RMSNorm(Module):
         x: jax.Array,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
+        """Applies root mean square normalization to the input.
+
+        Args:
+            x (jax.Array): The input tensor.
+            out_sharding (jax.sharding.Sharding | None, optional): Sharding constraint for the output. Defaults to None.
+
+        Returns:
+            jax.Array: The normalized input.
+        """
         x = jnp.asarray(x)
         _validate_floating(x)
         axes = _canonical_axes(self.axes, x.ndim)
@@ -350,12 +450,8 @@ class RMSNorm(Module):
 
 
 class BatchNorm(Module):
-    """Batch normalization for arrays of arbitrary rank.
-
-    Training uses current-batch statistics. Set ``update_stats=True`` to also
-    update the stored running statistics during eager execution. State updates
-    are intentionally rejected while tracing; call ``statistics`` inside JIT
-    and ``update_running_stats`` with those concrete results outside JIT.
+    """
+    Applies Batch Normalization over a mini-batch of inputs.
     """
 
     def __init__(
@@ -375,6 +471,23 @@ class BatchNorm(Module):
         collective_axis_name: MeshAxisName = None,
         shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
+        """Initializes the BatchNorm module.
+
+        Args:
+            num_features (int): Expected number of features.
+            eps (float, optional): A value added to the denominator for numerical stability. Defaults to 1e-5.
+            momentum (float | None, optional): The value used for the running_mean and running_var computation. Defaults to 0.1.
+            affine (bool, optional): A boolean value that when set to True, this module has learnable affine parameters. Defaults to True.
+            track_running_stats (bool, optional): A boolean value that when set to True, this module tracks the running mean and variance. Defaults to True.
+            dtype (DType | None, optional): Data type of the module parameters. Defaults to None.
+            bias (bool, optional): If set to False, the layer will not learn an additive bias. Defaults to True.
+            channel_axis (int, optional): The axis containing the channel information. Defaults to -1.
+            initializer (Initializer, optional): Initializer for the weight parameter. Defaults to jnp.ones.
+            bias_initializer (Initializer, optional): Initializer for the bias parameter. Defaults to jnp.zeros.
+            axis_names (AxisNames | None, optional): Logical names for the parameter axes. Defaults to None.
+            collective_axis_name (MeshAxisName, optional): The axis name to normalize over collectively in parallel. Defaults to None.
+            shard_mode (ShardMode, optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
+        """
         self.num_features = _validate_integer(num_features, 'num_features')
         self.eps = _validate_positive_float(eps, 'eps')
         if momentum is not None:
@@ -420,7 +533,15 @@ class BatchNorm(Module):
                 self.running_var.axis_names = names
 
     def statistics(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """Return per-channel batch mean and variance without changing state."""
+        """Computes the mean and variance of the input tensor.
+
+        Args:
+            x (jax.Array): The input tensor.
+
+        Returns:
+            tuple[jax.Array, jax.Array]: A tuple containing the mean and variance.
+        """
+
         x = jnp.asarray(x)
         _validate_floating(x)
         channel_axis = _canonical_axis(
@@ -458,12 +579,18 @@ class BatchNorm(Module):
         mean: jax.Array,
         variance: jax.Array,
     ) -> None:
-        """Update stored statistics from concrete, already-computed values."""
+        """Updates the running mean and variance statistics.
+
+        Args:
+            mean (jax.Array): The current batch mean.
+            variance (jax.Array): The current batch variance.
+        """
+
         if not self.track_running_stats:
             raise ValueError('running statistics are disabled')
 
         if isinstance(mean, Tracer) or isinstance(variance, Tracer):
-            raise ValueError(
+            raise TypeError(
                 'BatchNorm running statistics cannot be mutated while tracing'
             )
         if mean.shape != (self.num_features,) or variance.shape != (
@@ -487,7 +614,10 @@ class BatchNorm(Module):
         self.num_batches_tracked.value = jnp.asarray(count, dtype=jnp.int32)
 
     def reset_running_stats(self) -> None:
-        """Reset running statistics to their initial values."""
+        """
+        Resets the running mean and variance to their initial values.
+        """
+
         if not self.track_running_stats:
             raise ValueError('running statistics are disabled')
         self.running_mean.value = jnp.zeros_like(self.running_mean.value)
@@ -502,6 +632,18 @@ class BatchNorm(Module):
         update_stats: bool = False,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
+        """Applies batch normalization to the input.
+
+        Args:
+            x (jax.Array): The input tensor.
+            training (bool | None, optional): Whether the module is in training mode. Defaults to None.
+            update_stats (bool, optional): Whether to update the running statistics. Defaults to False.
+            out_sharding (jax.sharding.Sharding | None, optional): Sharding constraint for the output. Defaults to None.
+
+        Returns:
+            jax.Array: The normalized input.
+        """
+
         x = jnp.asarray(x)
         _validate_floating(x)
         training = _resolve_training(self.training, training)
@@ -555,7 +697,9 @@ class BatchNorm(Module):
 
 
 class GroupNorm(Module):
-    """Group normalization for arrays of arbitrary rank and channel layout."""
+    """
+    Applies Group Normalization over a mini-batch of inputs.
+    """
 
     def __init__(
         self,
@@ -573,6 +717,23 @@ class GroupNorm(Module):
         axis_names: AxisNames | None = None,
         shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
+        """Initializes the GroupNorm module.
+
+        Args:
+            num_groups (int): Expected number of groups.
+            num_channels (int): Expected number of channels.
+            eps (float, optional): A value added to the denominator for numerical stability. Defaults to 1e-5.
+            affine (bool, optional): A boolean value that when set to True, this module has learnable affine parameters. Defaults to True.
+            dtype (DType | None, optional): Data type of the module parameters. Defaults to None.
+            bias (bool, optional): If set to False, the layer will not learn an additive bias. Defaults to True.
+            channel_axis (int, optional): The axis containing the channel information. Defaults to -1.
+            batch_axis (int | None, optional): The batch axis. Defaults to 0.
+            initializer (Initializer, optional): Initializer for the weight parameter. Defaults to jnp.ones.
+            bias_initializer (Initializer, optional): Initializer for the bias parameter. Defaults to jnp.zeros.
+            axis_names (AxisNames | None, optional): Logical names for the parameter axes. Defaults to None.
+            shard_mode (ShardMode, optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
+        """
+
         self.num_groups = _validate_integer(num_groups, 'num_groups')
         self.num_channels = _validate_integer(num_channels, 'num_channels')
         if self.num_channels % self.num_groups != 0:
@@ -605,6 +766,16 @@ class GroupNorm(Module):
         x: jax.Array,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
+        """Applies group normalization to the input.
+
+        Args:
+            x (jax.Array): The input tensor.
+            out_sharding (jax.sharding.Sharding | None, optional): Sharding constraint for the output. Defaults to None.
+
+        Returns:
+            jax.Array: The normalized input.
+        """
+        
         x = jnp.asarray(x)
         _validate_floating(x)
         channel_axis = _canonical_axis(
@@ -692,8 +863,8 @@ class GroupNorm(Module):
 
 
 __all__ = [
-    'LayerNorm',
-    'RMSNorm',
     'BatchNorm',
     'GroupNorm',
+    'LayerNorm',
+    'RMSNorm',
 ]
