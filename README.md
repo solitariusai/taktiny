@@ -1,17 +1,17 @@
 # Taktiny
 
-Taktiny is an experimental deep learning framework built directly on JAX. It provides object-oriented modules that remain valid JAX PyTrees, a robust set of neural network building blocks, and an end-to-end training loop integration. 
+Taktiny is an experimental neural-network library for JAX. It provides object-oriented modules that are registered as JAX PyTrees, basic network layers, and a training loop.
 
-The project is currently focused on providing low-level, composable components for modern deep learning architectures. 
+The project is currently in development and APIs are subject to change.
 
-## Highlights
+## Features
 
-- **Object-Oriented Modeling**: Stateful `nn.Module` and `nn.Parameter` objects registered natively as JAX PyTrees.
-- **PEFT Ecosystem**: Native support for Parameter-Efficient Fine-Tuning adapters including LoRA, DoRA, AdaLoRA, LoHa, LoKr, and VeRA via `Takt`.
-- **Quantization**: Built-in support for weight-only post-training quantization through integration with `qwix`.
-- **Full-Lifecycle Trainer**: Experimental `Trainer` abstraction integrating tightly with Optax for full distributed training, checkpointing, and logging (TensorBoard/WandB).
-- **JAX Native**: Seamless compatibility with `jax.jit`, `jax.value_and_grad`, `jax.vmap`, and hardware mesh sharding.
-- **Rust/PyO3 Extensions**: Hardware-accelerated subroutines using Rust bindings.
+- Stateful `nn.Module` and `nn.Parameter` objects
+- PEFT adapters via `Takt` (LoRA, DoRA, AdaLoRA, LoHa, LoKr, VeRA)
+- Weight-only PTQ using `qwix`
+- An experimental trainer using Optax, with checkpointing and logging
+- Compatible with standard JAX transformations (`jit`, `vmap`, `value_and_grad`)
+- Rust/PyO3 extensions
 
 ## Requirements
 
@@ -33,9 +33,9 @@ To run the offline test suite on the CPU:
 uv run --frozen pytest
 ```
 
-## Quick Start: Building Models
+## Building Models
 
-Taktiny modules keep parameters directly on the object while participating seamlessly in JAX functional transformations. 
+Taktiny modules hold their parameters directly while acting as standard JAX PyTrees.
 
 ```python
 import jax
@@ -59,20 +59,18 @@ class MLP(nn.Module):
 model = MLP(64, 128, 10, rngs=nn.Rngs(42))
 jitted_model = jax.jit(model)
 
-# Forward pass
 dummy_input = jax.numpy.ones((1, 64))
 output = jitted_model(dummy_input)
 ```
 
-## Applying PEFT Adapters (Takt)
+## Applying PEFT
 
-Taktiny features native `Takt` PEFT layers for injecting trainable adapters into existing topologies.
+The `Takt` namespace provides functions for applying PEFT adapters to an existing model.
 
 ```python
 from taktiny import Takt
 from taktiny.takt.peft import LoRAAdapter
 
-# Target the `input` linear layer in the previously built MLP model
 model = Takt.apply_peft(
     model,
     LoRAAdapter(
@@ -85,7 +83,7 @@ model = Takt.apply_peft(
 
 ## Training
 
-The experimental `Trainer` connects Taktiny modules directly to Optax for update steps, checkpointing, and evaluation metrics.
+The `Trainer` class wraps an Optax optimizer and a Taktiny model for training.
 
 ```python
 import optax
@@ -110,13 +108,13 @@ trainer.train()
 
 ```text
 src/taktiny/
-├── nn/                 Core JAX object-oriented layers, activations, and parameters
+├── nn/                 JAX modules, layers, and parameters
 ├── takt/               Model transformations and PEFT implementations
-├── trainer/            Experimental training loop utilities and callbacks
+├── trainer/            Training loop utilities and callbacks
 └── utils/              Typing, state dictionaries, and transform helpers
 
 src/taktinylib/         Rust extension Python wrappers
-lib/                    Core Rust implementations
+lib/                    Rust implementations
 ```
 
 ## License
