@@ -11,20 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Built-in LoRA adapter."""
+"""Built-in AdaLoRA adapter."""
 
 from __future__ import annotations
 
-from taktiny.nn.modules.peft import LoRALinear
+from typing import Any
+
+from taktiny.nn.modules.peft import AdaLoRALinear
 from taktiny.nn.rng import Rngs
 from taktiny.takt.peft.adapter import BaseAdapter
 from taktiny.utils.typing import DType
 
 
-class LoRAAdapter(BaseAdapter):
-    """Apply :class:`LoRALinear` to modules selected by regex patterns."""
+class AdaLoRAAdapter(BaseAdapter):
+    """Apply :class:`AdaLoRALinear` to matching modules."""
 
-    _adapter = LoRALinear
+    _adapter = AdaLoRALinear
 
     def __init__(
         self,
@@ -34,6 +36,7 @@ class LoRAAdapter(BaseAdapter):
         *,
         dtype: DType | None = None,
         rngs: Rngs,
+        **kwargs: Any,
     ) -> None:
         super().__init__(
             targets,
@@ -41,7 +44,8 @@ class LoRAAdapter(BaseAdapter):
             alpha,
             dtype=dtype,
             rngs=rngs,
+            **kwargs,
         )
 
 
-__all__ = ['LoRAAdapter']
+__all__ = ['AdaLoRAAdapter']

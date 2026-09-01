@@ -14,6 +14,23 @@
 """Transformations for existing model instances."""
 
 from .prelude import Takt
-from .peft import LoraConfig, PeftConfig
+from .peft import (
+    AdaLoRAAdapter,
+    BaseAdapter,
+    DoRAAdapter,
+    LoHaAdapter,
+    LoKrAdapter,
+    LoRAAdapter,
+    VeRAAdapter,
+)
 
-__all__ = ['Takt', 'PeftConfig', 'LoraConfig']
+__all__ = [
+    'AdaLoRAAdapter',
+    'BaseAdapter',
+    'DoRAAdapter',
+    'LoHaAdapter',
+    'LoKrAdapter',
+    'LoRAAdapter',
+    'Takt',
+    'VeRAAdapter',
+]

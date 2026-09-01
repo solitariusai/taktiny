@@ -11,9 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Parameter-efficient fine-tuning transformations."""
+"""Parameter-efficient fine-tuning adapters."""
 
-from .config import LoraConfig, PeftConfig
-from . import lora as _lora
+from .adapter import BaseAdapter
+from .adalora import AdaLoRAAdapter
+from .dora import DoRAAdapter
+from .lora import LoRAAdapter
+from .loha import LoHaAdapter
+from .lokr import LoKrAdapter
+from .vera import VeRAAdapter
 
-__all__ = ['PeftConfig', 'LoraConfig']
+__all__ = [
+    'AdaLoRAAdapter',
+    'BaseAdapter',
+    'DoRAAdapter',
+    'LoHaAdapter',
+    'LoKrAdapter',
+    'LoRAAdapter',
+    'VeRAAdapter',
+]
