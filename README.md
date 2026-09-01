@@ -11,7 +11,6 @@ The project is currently in development and APIs are subject to change.
 - Weight-only PTQ using `qwix`
 - An experimental trainer using Optax, with checkpointing and logging
 - Compatible with standard JAX transformations (`jit`, `vmap`, `value_and_grad`)
-- Rust/PyO3 extensions
 
 ## Requirements
 
@@ -24,7 +23,6 @@ To set up a local development environment:
 
 ```bash
 uv sync --frozen --group dev
-uv run maturin develop
 ```
 
 To run the offline test suite on the CPU:
@@ -112,9 +110,6 @@ src/taktiny/
 ├── takt/               Model transformations and PEFT implementations
 ├── trainer/            Training loop utilities and callbacks
 └── utils/              Typing, state dictionaries, and transform helpers
-
-src/taktinylib/         Rust extension Python wrappers
-lib/                    Rust implementations
 ```
 
 ## License
