@@ -32,7 +32,7 @@ import numpy as np
 import qwix
 from taktiny.trainer.config import TrainingConfig, DatasetConfig
 from taktiny.nn import Rngs
-from taktiny.nn.module import Module, Parameter
+from taktiny.nn.base import Module, Parameter
 from taktiny.utils.typing import Batch, LossFn, PathLike, PyTree
 
 import jax.numpy as jnp
