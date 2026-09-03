@@ -37,7 +37,6 @@ from taktiny.utils.typing import (
     DType,
     Initializer,
     MeshAxisName,
-    ShardMode,
 )
 
 
@@ -168,7 +167,6 @@ class LayerNorm(Module):
         initializer: Initializer = jnp.ones,
         bias_initializer: Initializer = jnp.zeros,
         axis_names: AxisNames | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
         """Initializes the LayerNorm module.
 
@@ -182,7 +180,7 @@ class LayerNorm(Module):
             initializer (Initializer, optional): Initializer for the weight parameter. Defaults to jnp.ones.
             bias_initializer (Initializer, optional): Initializer for the bias parameter. Defaults to jnp.zeros.
             axis_names (AxisNames | None, optional): Logical names for the parameter axes. Defaults to None.
-            shard_mode (ShardMode, optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
+            shard_mode (optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
         """
         self.normalized_shape = (
             None
@@ -227,7 +225,6 @@ class LayerNorm(Module):
                 'axes and normalized_shape must have the same number '
                 'of dimensions'
             )
-        self.shard_mode = shard_mode
 
         if self.normalized_shape is None and axis_names is not None:
             raise ValueError(
@@ -293,7 +290,7 @@ class LayerNorm(Module):
                 )
                 output = output + bias
         output = output.astype(input_dtype)
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         shape = (
@@ -318,7 +315,6 @@ class RMSNorm(Module):
         with_scale: bool = True,
         bias: bool = False,
         axis_names: AxisNames | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
         initializer: Initializer = jnp.ones,
         bias_initializer: Initializer = jnp.zeros,
         axes: Axes | None = None,
@@ -332,7 +328,7 @@ class RMSNorm(Module):
             with_scale (bool, optional): If set to True, the layer will learn a multiplicative scale parameter. Defaults to True.
             bias (bool, optional): If set to True, the layer will learn an additive bias parameter. Defaults to False.
             axis_names (AxisNames | None, optional): Logical names for the parameter axes. Defaults to None.
-            shard_mode (ShardMode, optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
+            shard_mode (optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
             initializer (Initializer, optional): Initializer for the scale parameter. Defaults to jnp.ones.
             bias_initializer (Initializer, optional): Initializer for the bias parameter. Defaults to jnp.zeros.
             axes (Axes | None, optional): The axes to normalize over. Defaults to None.
@@ -371,7 +367,6 @@ class RMSNorm(Module):
                 'axes and normalized_shape must have the same number '
                 'of dimensions'
             )
-        self.shard_mode = shard_mode
 
         if self.normalized_shape is None and axis_names is not None:
             raise ValueError(
@@ -435,7 +430,7 @@ class RMSNorm(Module):
             )
             output = output + bias
         output = output.astype(input_dtype)
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         shape = (
@@ -469,7 +464,6 @@ class BatchNorm(Module):
         bias_initializer: Initializer = jnp.zeros,
         axis_names: AxisNames | None = None,
         collective_axis_name: MeshAxisName = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
         """Initializes the BatchNorm module.
 
@@ -486,7 +480,7 @@ class BatchNorm(Module):
             bias_initializer (Initializer, optional): Initializer for the bias parameter. Defaults to jnp.zeros.
             axis_names (AxisNames | None, optional): Logical names for the parameter axes. Defaults to None.
             collective_axis_name (MeshAxisName, optional): The axis name to normalize over collectively in parallel. Defaults to None.
-            shard_mode (ShardMode, optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
+            shard_mode (optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
         """
         self.num_features = _validate_integer(num_features, 'num_features')
         self.eps = _validate_positive_float(eps, 'eps')
@@ -500,7 +494,6 @@ class BatchNorm(Module):
         self.track_running_stats = bool(track_running_stats)
         self.channel_axis = channel_axis
         self.collective_axis_name = collective_axis_name
-        self.shard_mode = shard_mode
         dtype = jnp.float32 if dtype is None else dtype
 
         names = _parameter_axis_names(axis_names, 1)
@@ -605,13 +598,13 @@ class BatchNorm(Module):
         factor = 1.0 / count if self.momentum is None else self.momentum
         mean = mean.astype(self.running_mean.value.dtype)
         variance = variance.astype(self.running_var.value.dtype)
-        self.running_mean.value = (
+        self.running_mean._value = (
             (1.0 - factor) * self.running_mean.value + factor * mean
         )
-        self.running_var.value = (
+        self.running_var._value = (
             (1.0 - factor) * self.running_var.value + factor * variance
         )
-        self.num_batches_tracked.value = jnp.asarray(count, dtype=jnp.int32)
+        self.num_batches_tracked._value = jnp.asarray(count, dtype=jnp.int32)
 
     def reset_running_stats(self) -> None:
         """
@@ -620,9 +613,9 @@ class BatchNorm(Module):
 
         if not self.track_running_stats:
             raise ValueError('running statistics are disabled')
-        self.running_mean.value = jnp.zeros_like(self.running_mean.value)
-        self.running_var.value = jnp.ones_like(self.running_var.value)
-        self.num_batches_tracked.value = jnp.asarray(0, dtype=jnp.int32)
+        self.running_mean._value = jnp.zeros_like(self.running_mean.value)
+        self.running_var._value = jnp.ones_like(self.running_var.value)
+        self.num_batches_tracked._value = jnp.asarray(0, dtype=jnp.int32)
 
     def __call__(
         self,
@@ -687,7 +680,7 @@ class BatchNorm(Module):
                 output = output + bias
 
         output = output.astype(input_dtype)
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         return (
@@ -715,7 +708,6 @@ class GroupNorm(Module):
         initializer: Initializer = jnp.ones,
         bias_initializer: Initializer = jnp.zeros,
         axis_names: AxisNames | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
         """Initializes the GroupNorm module.
 
@@ -731,7 +723,7 @@ class GroupNorm(Module):
             initializer (Initializer, optional): Initializer for the weight parameter. Defaults to jnp.ones.
             bias_initializer (Initializer, optional): Initializer for the bias parameter. Defaults to jnp.zeros.
             axis_names (AxisNames | None, optional): Logical names for the parameter axes. Defaults to None.
-            shard_mode (ShardMode, optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
+            shard_mode (optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
         """
 
         self.num_groups = _validate_integer(num_groups, 'num_groups')
@@ -746,7 +738,6 @@ class GroupNorm(Module):
         self.has_bias = self.affine and bool(bias)
         self.channel_axis = channel_axis
         self.batch_axis = batch_axis
-        self.shard_mode = shard_mode
         dtype = jnp.float32 if dtype is None else dtype
 
         names = _parameter_axis_names(axis_names, 1)
@@ -853,7 +844,7 @@ class GroupNorm(Module):
                 output = output + bias
 
         output = output.astype(x.dtype)
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         return (

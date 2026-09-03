@@ -21,10 +21,10 @@ import jax
 import jax.numpy as jnp
 
 from taktiny.nn.base import Module, Parameter
-from taktiny.nn.modules.linear import Linear, default_linear_initializer
+from taktiny.nn.modules.linear import Linear, default_kernel_initializer
 from taktiny.nn.rng import Rngs
 from taktiny.nn.utils import _constrain
-from taktiny.utils.typing import AxisNames, DType, Initializer, ShardMode
+from taktiny.utils.typing import AxisNames, DType, Initializer
 
 
 class LoRALinear(Module):
@@ -38,10 +38,9 @@ class LoRALinear(Module):
         *,
         dtype: DType | None = None,
         rngs: Rngs,
-        initializer: Initializer = default_linear_initializer,
+        initializer: Initializer = default_kernel_initializer,
         dot_general: Any = None,
         axis_names: tuple[AxisNames | None, AxisNames | None] | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
         if rank <= 0:
             raise ValueError(f"`rank` must be > 0, got {rank}")
@@ -67,7 +66,6 @@ class LoRALinear(Module):
             initializer=initializer,
             dot_general=dot_general,
             axis_names=a_axis_names,
-            shard_mode=shard_mode,
         )
 
         self.lora_B = Linear(
@@ -79,7 +77,6 @@ class LoRALinear(Module):
             initializer=jax.nn.initializers.zeros,
             dot_general=dot_general,
             axis_names=b_axis_names,
-            shard_mode=shard_mode,
         )
 
     def __call__(
@@ -117,7 +114,7 @@ class DoRALinear(Module):
         *,
         dtype: DType | None = None,
         rngs: Rngs,
-        initializer: Initializer = default_linear_initializer,
+        initializer: Initializer = default_kernel_initializer,
         dot_general: Any = None,
         axis_names: tuple[
             AxisNames | None,
@@ -154,7 +151,6 @@ class DoRALinear(Module):
             initializer=initializer,
             dot_general=dot_general,
             axis_names=a_axis_names,
-            shard_mode=shard_mode,
         )
 
         self.lora_B = Linear(
@@ -166,7 +162,6 @@ class DoRALinear(Module):
             initializer=jax.nn.initializers.zeros,
             dot_general=dot_general,
             axis_names=b_axis_names,
-            shard_mode=shard_mode,
         )
 
         # m = ||W|| over all input-feature axes
@@ -315,7 +310,7 @@ class AdaLoRALinear(Module):
         *,
         dtype: DType | None = 'float32',
         rngs: Rngs,
-        initializer: Initializer = default_linear_initializer,
+        initializer: Initializer = default_kernel_initializer,
         dot_general: Any = None,
         axis_names: tuple[
             AxisNames | None,
@@ -354,7 +349,6 @@ class AdaLoRALinear(Module):
             initializer=initializer,
             dot_general=dot_general,
             axis_names=a_axis_names,
-            shard_mode=shard_mode,
         )
 
         self.lora_B = Linear(
@@ -366,7 +360,6 @@ class AdaLoRALinear(Module):
             initializer=initializer,
             dot_general=dot_general,
             axis_names=b_axis_names,
-            shard_mode=shard_mode,
         )
 
         # Singular-value-like parameters.
@@ -433,7 +426,7 @@ class AdaLoRALinear(Module):
                 f"got {mask.shape}"
             )
 
-        self.lora_E.value = jnp.where(
+        self.lora_E._value = jnp.where(
             mask,
             self.lora_E.value,
             jnp.zeros_like(self.lora_E.value),
@@ -487,7 +480,7 @@ class LoHaLinear(Module):
         *,
         dtype: DType | None = 'float32',
         rngs: Rngs | None,
-        initializer: Initializer = default_linear_initializer,
+        initializer: Initializer = default_kernel_initializer,
         dot_general: Any = None,
         axis_names: tuple[
             AxisNames | None,
@@ -621,11 +614,6 @@ class LoHaLinear(Module):
             ((), ()),
         )
 
-        explicit_out_sharding = (
-            out_sharding
-            if self.shard_mode == ShardMode.EXPLICIT
-            else None
-        )
 
         if self.dot_general is not None:
             delta = self.dot_general(
@@ -638,7 +626,7 @@ class LoHaLinear(Module):
                 delta,
                 B,
                 dimension_numbers_B,
-                out_sharding=explicit_out_sharding,
+                out_sharding=out_sharding,
             )
 
         delta = _constrain(
@@ -704,7 +692,7 @@ class LoKrLinear(Module):
         *,
         dtype: DType | None = None,
         rngs: Rngs | None,
-        initializer: Initializer = default_linear_initializer,
+        initializer: Initializer = default_kernel_initializer,
         decompose_both: bool = False,
         decompose_factor: int = -1,
         dot_general: Any = None,
