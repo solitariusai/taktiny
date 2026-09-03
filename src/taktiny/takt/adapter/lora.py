@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from taktiny.nn.modules.peft import LoRALinear
 from taktiny.nn.rng import Rngs
-from taktiny.takt.peft.adapter import BaseAdapter
+from taktiny.takt.adapter.base import BaseAdapter
 from taktiny.utils.typing import DType
 
 

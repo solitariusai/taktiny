@@ -25,7 +25,7 @@ from taktiny.nn.base import Module, Parameter
 from taktiny.nn.modules.linear import default_linear_initializer
 from taktiny.nn.modules.peft import VeRALinear
 from taktiny.nn.rng import Rngs
-from taktiny.takt.peft.adapter import BaseAdapter
+from taktiny.takt.adapter.base import BaseAdapter
 from taktiny.utils.typing import DType, Initializer
 
 

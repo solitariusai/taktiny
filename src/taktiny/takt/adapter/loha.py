@@ -11,22 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Built-in LoKr adapter."""
+"""Built-in LoHa adapter."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from taktiny.nn.modules.peft import LoKrLinear
+from taktiny.nn.modules.peft import LoHaLinear
 from taktiny.nn.rng import Rngs
-from taktiny.takt.peft.adapter import BaseAdapter
+from taktiny.takt.adapter.base import BaseAdapter
 from taktiny.utils.typing import DType
 
 
-class LoKrAdapter(BaseAdapter):
-    """Apply :class:`LoKrLinear` to matching modules."""
+class LoHaAdapter(BaseAdapter):
+    """Apply :class:`LoHaLinear` to matching modules."""
 
-    _adapter = LoKrLinear
+    _adapter = LoHaLinear
 
     def __init__(
         self,
@@ -48,4 +48,4 @@ class LoKrAdapter(BaseAdapter):
         )
 
 
-__all__ = ['LoKrAdapter']
+__all__ = ['LoHaAdapter']

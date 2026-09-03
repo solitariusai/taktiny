@@ -11,22 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Built-in AdaLoRA adapter."""
+"""Built-in DoRA adapter."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from taktiny.nn.modules.peft import AdaLoRALinear
+from taktiny.nn.modules.peft import DoRALinear
 from taktiny.nn.rng import Rngs
-from taktiny.takt.peft.adapter import BaseAdapter
+from taktiny.takt.adapter.base import BaseAdapter
 from taktiny.utils.typing import DType
 
 
-class AdaLoRAAdapter(BaseAdapter):
-    """Apply :class:`AdaLoRALinear` to matching modules."""
+class DoRAAdapter(BaseAdapter):
+    """Apply :class:`DoRALinear` to matching modules."""
 
-    _adapter = AdaLoRALinear
+    _adapter = DoRALinear
 
     def __init__(
         self,
@@ -48,4 +48,4 @@ class AdaLoRAAdapter(BaseAdapter):
         )
 
 
-__all__ = ['AdaLoRAAdapter']
+__all__ = ['DoRAAdapter']
