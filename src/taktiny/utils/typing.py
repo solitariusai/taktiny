@@ -22,6 +22,7 @@ from typing import Any, Protocol, TypeAlias, TypeVar, runtime_checkable
 import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jax.typing import ArrayLike as JaxArrayLike, DTypeLike
+import qwix
 
 
 Array: TypeAlias = jax.Array
@@ -46,12 +47,8 @@ StateDict: TypeAlias = dict[str, PyTree]
 ParameterDict: TypeAlias = dict[str, Any]
 ModuleFactory: TypeAlias = Callable[..., Any]
 LossFn: TypeAlias = Callable[[Any, Batch], Array]
+QuantConfig: TypeAlias = str | qwix.QuantizationRule | qwix.PtqProvider | Sequence[qwix.QuantizationRule] | None
 T = TypeVar('T')
-
-class ShardMode(enum.Enum):
-    """Select automatic constraints or explicit output shardings."""
-    AUTO = 'auto'
-    EXPLICIT = 'explicit'
 
 @runtime_checkable
 class StatefulIterator(Protocol[T]):
@@ -92,8 +89,8 @@ __all__ = [
     'ParameterDict',
     'PathLike',
     'PyTree',
+    'QuantConfig',
     'Shape',
-    'ShardMode',
     'Sharding',
     'StateDict',
     'StatefulIterator',

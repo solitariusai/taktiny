@@ -242,6 +242,6 @@ class DatasetConfig:
 
 
 __all__ = [
-    'TrainingConfig',
     'DatasetConfig',
+    'TrainingConfig',
 ]

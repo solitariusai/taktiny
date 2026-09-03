@@ -43,13 +43,7 @@ def _add_mapped_axis(module: Module, axis: int) -> None:
                 + tuple(axis_names[mapped_axis:])
             )
 
-        batch_axes = getattr(
-            parameter,
-            'quantization_batch_axis_count',
-            None,
-        )
-        if batch_axes is not None and mapped_axis <= batch_axes:
-            parameter.quantization_batch_axis_count += 1
+
 
 
 def _update_output_axes(output: Any, out_axes: Any) -> None:
