@@ -14,15 +14,19 @@
 """Base module class"""
 from __future__ import annotations
 
-import operator
 import typing as tp
 from collections.abc import Iterator, Mapping, Sequence
+from typing import Any, Self
 
 import jax
 import qwix
+from jax._src import config
+from jax.sharding import NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
+from jax.typing import ArrayLike
 
 from taktiny.utils.format import format_bytes, format_dtype, format_params
+from taktiny.utils.spmd import logical_to_mesh_axes
 from taktiny.utils.typing import AxisNames, ParameterDict, PyTree, StateDict
 
 
@@ -30,19 +34,28 @@ def iter_children(obj: object) -> Iterator[tuple[str, Module | Parameter]]:
     """Iterates over the children Modules and Parameters of a given object.
 
     Args:
-        obj (object): The object whose children to iterate over.
+        obj: The object whose children to iterate over.
 
     Yields:
-        Iterator[tuple[str, Module | Parameter]]: An iterator of (name, child) tuples.
+        Tuples of (name, child) for each child Module or Parameter.
     """
-    if not hasattr(obj, '__dict__'): return
-    for k, v in obj.__dict__.items():
+    try:
+        attrs = vars(obj)
+    except TypeError:
+        return
+
+    for k, v in attrs.items():
         if isinstance(v, (Module, Parameter)):
             yield k, v
-        elif isinstance(v, (list, tuple)) and all(isinstance(x, (Module, Parameter)) for x in v):
+
+        elif isinstance(
+            v, (list, tuple)) and \
+            all(isinstance(x, (Module, Parameter)) for x in v
+        ):
             for i, x in enumerate(v):
                 name = str(i) if k == 'layers' else f"{k}.{i}"
                 yield name, x
+
         elif isinstance(v, Mapping) and all(
             isinstance(x, (Module, Parameter)) for x in v.values()
         ):
@@ -107,11 +120,11 @@ def build_tree_repr(
         title = f"{obj.__class__.__name__}({extra})" if extra else obj.__class__.__name__
 
         if is_root:
-            node_str = f"{title} ({format_params(total_params)} parameters, {format_bytes(total_bytes)})"
+            node_str = f"{title} ({format_params(total_params)}, {format_bytes(total_bytes)})"
         else:
             node_str = (
                 f"{current_prefix}{name}: {title} "
-                f"({format_params(total_params)} parameters, "
+                f"({format_params(total_params)}, "
                 f"{format_bytes(total_bytes)})"
             )
 
@@ -145,18 +158,18 @@ class Module:
 
     training: bool = True
 
-    def __init_subclass__(cls, **kwargs: tp.Any) -> None:
+    def __init_subclass__(cls, **kwargs: Any) -> None:
         """
         Initializes subclasses and registers them as PyTree nodes.
         """
         super().__init_subclass__(**kwargs)
         register_pytree_node_class(cls)
 
-    def train(self) -> tp.Self:
+    def train(self) -> Self:
         """Sets the module and all its children to training mode.
 
         Returns:
-            tp.Self: The module itself.
+            Self: The module itself.
         """
         self.training = True
         for _, child in iter_children(self):
@@ -164,11 +177,11 @@ class Module:
                 child.train()
         return self
 
-    def eval(self) -> tp.Self:
+    def eval(self) -> Self:
         """Sets the module and all its children to evaluation mode.
 
         Returns:
-            tp.Self: The module itself.
+            Self: The module itself.
         """
         self.training = False
         for _, child in iter_children(self):
@@ -180,10 +193,9 @@ class Module:
     def __repr__(self) -> str:
         lines, _, _ = build_tree_repr("", self, is_root=True)
         return "\n".join(lines)
-
     def tree_flatten(
         self,
-    ) -> tuple[tuple[PyTree, ...], tuple[tuple[str, ...], dict[str, tp.Any]]]:
+    ) -> tuple[tuple[PyTree, ...], tuple[tuple[str, ...], dict[str, Any]]]:
         dynamic_names = []
         dynamic_vals = []
         static_data = {}
@@ -200,9 +212,9 @@ class Module:
     @classmethod
     def tree_unflatten(
         cls,
-        aux_data: tuple[Sequence[str], Mapping[str, tp.Any]],
+        aux_data: Any,
         children: Sequence[PyTree],
-    ) -> tp.Self:
+    ) -> Self:
         obj = object.__new__(cls)
         dynamic_names, static_data = aux_data
 
@@ -275,7 +287,7 @@ class Module:
             if isinstance(child, Parameter):
                 full_name = prefix + name
                 if full_name in state:
-                    child.value = state[full_name]
+                    child._value = state[full_name]
             elif isinstance(child, Module):
                 child.load_flat_state_dict(state, prefix + name + '.')
 
@@ -288,96 +300,246 @@ class Module:
         for name, child in iter_children(self):
             if isinstance(child, Parameter):
                 if name in state:
-                    child.value = state[name]
+                    child._value = state[name]
             elif isinstance(child, Module) and name in state:
                 child.load_state_dict(state[name])
 
-    def __call__(self, *args: tp.Any, **kwds: tp.Any) -> tp.Any:
-        """
-        Forward pass of the module.
-        """
+    def __call__(self, *args: Any, **kwds: Any) -> Any:
+        ...
 
 class Parameter(Module):
-    """
-    A kind of Module that represents a single array parameter.
+    """A PyTree node that wraps a JAX array or quantized tensor as a layer parameter.
+
+    Parameters delegate attribute access and arithmetic operations to their underlying
+    values, allowing them to be used seamlessly in JAX mathematical operations.
+
+    Args:
+        array (PyTree): The underlying tensor data (e.g., a jax.Array or qwix.QArray).
+        trainable (bool, optional): A metadata flag indicating if the parameter should be updated. 
+            Note that this does not automatically freeze the parameter in raw JAX; it must be explicitly 
+            filtered (e.g., by Taktiny's Trainer or JAX tree utilities) before being passed to an optimizer. Defaults to True.
+        axis_names (AxisNames | None, optional): Logical axis names for advanced sharding or tensor parallelism. Defaults to None.
+        partition_spec (PartitionSpec | None, optional): Explicit hardware sharding specification. If provided along with axis_names, active logical mapping rules will override this value. Defaults to None.
+        metadata (dict[str, Any] | Sequence[tuple[str, Any]] | None, optional): Optional metadata dictionary for custom layer logic. Defaults to None.
+
+    Example:
+        >>> from taktiny.nn import Parameter
+        >>> 
+        >>> z = Parameter(jnp.ones((4, 4)))
+        >>> output = jnp.dot(x, z)  # Parameter behaves like a normal array
     """
 
     def __init__(
-        self, array: PyTree, *,
+        self, 
+        array: PyTree, 
+        *,
         trainable: bool = True,
-        axis_names: AxisNames | None = None
+        axis_names: AxisNames | None = None,
+        partition_spec: PartitionSpec | None = None,
+        metadata: dict[str, Any] | Sequence[tuple[str, Any]] | None = None 
     ) -> None:
-        """Initializes a parameter object.
-
-        Args:
-            array (PyTree): The underlying array value.
-            trainable (bool, optional): Whether the parameter should be updated during training. Defaults to True.
-            axis_names (AxisNames | None, optional): Optional logical axis names for the parameter. Defaults to None.
-        """
-        self.value = array
-        self.trainable = trainable
         self.axis_names = axis_names
-        # tmp
-        self.quantization = None
-        self.quantization_kind = None
-        self.input_axis_count = None
-        self.quantization_batch_axis_count = None
+        self.partition_spec = partition_spec
+        self._value = array
+        self.trainable = trainable
+        self.metadata = dict(metadata) if metadata is not None else None
+        if axis_names is not None:
+            if isinstance(
+                axis_names, 
+                (list, tuple)
+            ) and len(axis_names) != array.ndim:
+                raise ValueError(
+                    f'axis_names length {len(axis_names)} must match '
+                    f'array ndim {array.ndim}'
+                )
+
+            if isinstance(axis_names, PartitionSpec):
+                raise TypeError(
+                    "Passing a PartitionSpec to 'axis_names' is forbidden. "
+                    "Use the 'partition_spec' argument instead."
+                )
+
+            # map to partition spec
+            mapped_axes = logical_to_mesh_axes(axis_names)
+            if mapped_axes is not None:
+                self.partition_spec = mapped_axes
+                
+        # Automatically shard the array if a mesh and partition spec are present
+        if self.partition_spec is not None:
+            active_mesh = config.device_context.value
+            if active_mesh is not None and not active_mesh.empty:
+                try:
+                    self._value = jax.device_put(self._value, device=NamedSharding(active_mesh, self.partition_spec))
+                except Exception:  # noqa: BLE001, S110
+                    pass
+
+    @property
+    def value(self) -> PyTree:
+        """Returns the underlying tensor data."""
+        return self._value
 
     def tree_flatten(
         self,
-    ) -> tuple[tuple[PyTree], dict[str, tp.Any]]:
+    ) -> tuple[tuple[PyTree, ...], Any]:
         static_data = {
             name: value
             for name, value in self.__dict__.items()
-            if name != 'value'
+            if name != '_value'
         }
-        return (self.value,), static_data
+        return (self._value,), static_data
 
     @classmethod
     def tree_unflatten(
         cls,
-        aux_data: dict[str, tp.Any],
+        aux_data: Any,
         children: tp.Sequence[PyTree],
-    ) -> tp.Self:
+    ) -> Self:
         parameter = object.__new__(cls)
         parameter.__dict__.update(aux_data)
-        parameter.value = children[0]
+        parameter._value = children[0]
         return parameter
 
     def __repr__(self) -> str:
         return (
             "Parameter("
-            f"shape={getattr(self.value, 'shape', 'None')}, "
-            f"dtype={getattr(self.value, 'dtype', 'None')}, "
+            f"shape={getattr(self._value, 'shape', 'None')}, "
+            f"dtype={getattr(self._value, 'dtype', 'None')}, "
             f"trainable={self.trainable}"
             ")"
         )
 
     def __jax_array__(self) -> jax.Array:
-        if isinstance(self.value, qwix.QArray):
-            return qwix.dequantize(self.value)
-        return self.value
+        if isinstance(self._value, qwix.QArray):
+            return qwix.dequantize(self._value)
+        return self._value
 
-    def __getattr__(self, name: str) -> tp.Any:
-        return getattr(self.value, name)
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._value, name)
 
-def _make_magic_methods() -> None:
-    """
-    Attaches common array magic methods to the Parameter class.
-    """
-    for op in ['add', 'sub', 'mul', 'truediv', 'floordiv', 'mod', 'pow', 'matmul',
-               'eq', 'ne', 'lt', 'le', 'gt', 'ge']:
-        magic = f'__{op}__'
-        rmagic = f'__r{op}__'
-        setattr(Parameter, magic, lambda self, other, o=op: getattr(operator, o)(self.value, other))
-        setattr(Parameter, rmagic, lambda self, other, o=op: getattr(operator, o)(other, self.value))
-    for op in ['neg', 'pos', 'abs', 'invert']:
-        magic = f'__{op}__'
-        setattr(Parameter, magic, lambda self, o=op: getattr(operator, o)(self.value))
+    def __add__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return self._value + other
 
-    Parameter.__getitem__ = lambda self, key: operator.getitem(self.value, key)
+    def __radd__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return other + self._value
 
-_make_magic_methods()
+    def __sub__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return self._value - other
+
+    def __rsub__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return other - self._value
+
+    def __mul__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return self._value * other
+
+    def __rmul__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return other * self._value
+
+    def __truediv__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return self._value / other
+
+    def __rtruediv__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return other / self._value
+
+    def __floordiv__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return self._value // other
+
+    def __rfloordiv__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return other // self._value
+
+    def __mod__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return self._value % other
+
+    def __rmod__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return other % self._value
+
+    def __pow__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return self._value**other
+
+    def __rpow__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return other**self._value
+
+    def __matmul__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return self._value @ other
+
+    def __rmatmul__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return other @ self._value
+
+    def __eq__(self, other: object) -> Any:
+        return self._value == other
+
+    def __ne__(self, other: object) -> Any:
+        return self._value != other
+
+    def __lt__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return self._value < other
+
+    def __le__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return self._value <= other
+
+    def __gt__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return self._value > other
+
+    def __ge__(self, other: ArrayLike | Parameter) -> jax.Array:
+        return self._value >= other
+
+    def __neg__(self) -> jax.Array:
+        return -self._value
+
+    def __pos__(self) -> jax.Array:
+        return +self._value
+
+    def __abs__(self) -> jax.Array:
+        return abs(self._value)
+
+    def __invert__(self) -> jax.Array:
+        return ~self._value
+
+    def __getitem__(self, key: Any) -> Any:
+        sliced_value = self._value[key]
+        
+        def slice_axes(axes):
+            if axes is None:
+                return None
+            _key = key if isinstance(key, tuple) else (key,)
+            old_idx = 0
+            names = []
+            valid = True
+            for k in _key:
+                if k is Ellipsis:
+                    valid = False; break
+                elif k is None:
+                    names.append(None)
+                elif isinstance(k, (int, slice)):
+                    if isinstance(k, slice) and old_idx < len(axes):
+                        names.append(axes[old_idx])
+                    old_idx += 1
+                elif hasattr(k, 'ndim') and k.ndim == 0:
+                    old_idx += 1
+                else:
+                    valid = False; break
+            if valid:
+                while old_idx < len(axes):
+                    names.append(axes[old_idx])
+                    old_idx += 1
+                if len(names) == sliced_value.ndim:
+                    return tuple(names)
+            return None
+            
+        sliced_axis_names = slice_axes(self.axis_names)
+        sliced_partition_spec = slice_axes(self.partition_spec)
+        
+        if sliced_partition_spec is not None:
+            sliced_partition_spec = PartitionSpec(*sliced_partition_spec)
+            
+        p = Parameter(
+            sliced_value, 
+            axis_names=sliced_axis_names,
+            partition_spec=sliced_partition_spec,
+            trainable=self.trainable, 
+            metadata=self.metadata
+        )
+        return p
+
 
 def module(cls):
     """Class decorator to transform a generic class into a Module subclass.

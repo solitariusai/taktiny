@@ -13,24 +13,86 @@
 # limitations under the License.
 """Linear modules."""
 from __future__ import annotations
+from jax.sharding import PartitionSpec
 
 import typing as tp
+from collections.abc import Sequence
+from typing import Any, Protocol
 
 import jax
 import jax.numpy as jnp
 import qwix
+from jax.lax import PrecisionLike
 from jax.nn.initializers import lecun_uniform
+from jax.typing import DTypeLike
 
 from taktiny.nn.base import Module, Parameter
 from taktiny.nn.rng import Rngs
 from taktiny.nn.utils import _constrain, _normalize_shape
-from taktiny.utils.typing import AxisNames, DType, Initializer, ShardMode
+from taktiny.utils.quantization import (
+    quantize_linear_weight,
+    resolve_quantization_rule,
+)
+from taktiny.utils.spmd import with_logical_partitioning
+from taktiny.utils.typing import ArrayLike, AxisNames, DType, Initializer, QuantConfig
 
-default_linear_initializer = lecun_uniform()
+default_kernel_initializer = lecun_uniform()
+default_bias_initializer = jax.nn.initializers.zeros
 
+
+class DotGeneral(Protocol):
+    def __call__(
+        self, 
+        lhs: ArrayLike,
+        rhs: ArrayLike,
+        dimension_numbers: tuple[
+            tuple[Sequence[int], Sequence[int]], 
+            tuple[Sequence[int], Sequence[int]],
+        ],
+        precision: PrecisionLike,
+        preferred_element_type: DTypeLike | None,
+        *,
+        out_sharding: Any,
+    ) -> jax.Array:
+        ...
 
 class Linear(Module):
-    """Applies a linear transformation to the incoming data."""
+    """Applies a linear transformation to the incoming data.
+
+    .. math::
+        y = x W + b
+
+    Args:
+        in_features (int | tuple[int, ...]): Size of each input sample. Can be a tuple for higher dimensional contraction.
+        out_features (int | tuple[int, ...]): Size of each output sample.
+        bias (bool, optional): If set to False, the layer will not learn an additive bias. Defaults to True.
+        dtype (DType | None, optional): The data type of the computation. Defaults to 'float32'.
+        rngs (Rngs | None): Random number generator for weight initialization. Required if weights are initialized.
+        kernel_initializer (Initializer, optional): Initializer function for the weight matrix. Defaults to lecun_uniform.
+        bias_initializer (Initializer, optional): Initializer function for the bias vector. Defaults to zeros.
+        quant (tp.Any, optional): Optional quantization configuration for the weight. Defaults to None.
+        dot_general (tp.Any, optional): Optional custom dot_general implementation. Defaults to None.
+        axis_names (AxisNames | None, optional): Logical axis names for parameter sharding metadata. Defaults to None.
+        partition_spec (PartitionSpec | None, optional): Explicit hardware sharding specification. Defaults to None.
+        kernel_meta_data (dict[str, Any] | Sequence[tuple[str, Any]] | None, optional): Additional metadata for the kernel parameter. Defaults to None.
+        bias_meta_data (dict[str, Any] | Sequence[tuple[str, Any]] | None, optional): Additional metadata for the bias parameter. Defaults to None.
+        precision (PrecisionLike, optional): Numerical precision for the dot product (e.g. jax.lax.Precision). Defaults to None.
+        preferred_element_type (DTypeLike | None, optional): Preferred accumulation type for the dot product. Defaults to None.
+
+    Example:
+        ```python
+        import jax
+        import jax.numpy as jnp
+        from taktiny import nn
+
+        # Create a linear layer
+        linear = nn.Linear(64, 128, rngs=nn.Rngs(0))
+        
+        # Apply transformation
+        x = jnp.ones((32, 64))
+        y = linear(x)  # shape: (32, 128)
+        ```
+    """
     
     def __init__(
         self,
@@ -38,28 +100,19 @@ class Linear(Module):
         out_features: int | tuple[int, ...],
         *,
         bias: bool = True,
-        dtype: DType | None = 'float32',
-        rngs: Rngs | None,
-        initializer: Initializer = default_linear_initializer,
-        quant: tp.Any = None,
-        dot_general: tp.Any = None,
+        dtype: DType | None = None,
+        rngs: Rngs,
+        kernel_initializer: Initializer = default_kernel_initializer,
+        bias_initializer: Initializer = default_bias_initializer,
+        quant: QuantConfig = None,
+        dot_general: DotGeneral | None = None,
         axis_names: AxisNames | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
+        partition_spec: PartitionSpec | None = None,
+        kernel_metadata: dict[str, Any] | Sequence[tuple[str, Any]] | None = None,
+        bias_metadata: dict[str, Any] | Sequence[tuple[str, Any]] | None = None,
+        precision: PrecisionLike = None,
+        preferred_element_type: DTypeLike | None = None,
     ) -> None:
-        """Initializes the linear module.
-
-        Args:
-            in_features (int | tuple[int, ...]): Size of each input sample.
-            out_features (int | tuple[int, ...]): Size of each output sample.
-            rngs (Rngs | None): Random number generators for initialization.
-            bias (bool, optional): If set to False, the layer will not learn an additive bias. Defaults to True.
-            dtype (DType | None, optional): The dtype of the computation. Defaults to 'float32'.
-            initializer (Initializer, optional): Initializer for the weight matrix. Defaults to default_linear_initializer.
-            quant (tp.Any, optional): Quantization configuration. Defaults to None.
-            dot_general (tp.Any, optional): Custom dot_general implementation. Defaults to None.
-            axis_names (AxisNames | None, optional): Names for the axes of the weight and bias parameters. Defaults to None.
-            shard_mode (ShardMode, optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
-        """
         if isinstance(in_features, int):
             in_features = (in_features,)
         else:
@@ -72,34 +125,56 @@ class Linear(Module):
 
         self.in_features = in_features
         self.out_features = out_features
-        self.has_bias = bias
         self.dot_general = dot_general
-        self.shard_mode = shard_mode
+        self.precision = precision
+        self.preferred_element_type = preferred_element_type
 
-        if rngs is None:
-            raise ValueError('A rngs must be provided to initialize Linear layer')
+        kernel_shape = in_features + out_features
+        if axis_names is not None or partition_spec is not None:
+            kernel_initializer = with_logical_partitioning(kernel_initializer, axis_names, partition_spec)
+            
+        kernel_array = kernel_initializer(rngs(), kernel_shape, dtype)
 
-        weight_shape = in_features + out_features
-        self.weight = Parameter(
-            initializer(rngs(), weight_shape, dtype)
-        )
-        self.weight.quantization = quant
-        self.weight.quantization_kind = 'dot_general'
-        self.weight.input_axis_count = len(in_features)
-        self.weight.quantization_batch_axis_count = 0
-
-        if axis_names is not None:
-            if len(axis_names) != len(weight_shape):
-                raise ValueError(
-                    f'axis_names length {len(axis_names)} must match '
-                    f'weight dimensions {len(weight_shape)}'
+        if quant is not None:
+            rule = resolve_quantization_rule(
+                quant, 
+                '', 
+                op_name='dot_general'
+            )
+            if rule is not None:
+                kernel_array = quantize_linear_weight(
+                    kernel_array,
+                    rule,
+                    input_axis_count=len(in_features),
+                    batch_axis_count=0,
                 )
-            self.weight.axis_names = axis_names
 
+        self.kernel = Parameter(
+            kernel_array, 
+            axis_names=axis_names, 
+            partition_spec=partition_spec,
+            metadata=kernel_metadata
+        )
+
+        self.bias = None
         if bias:
-            self.bias = Parameter(jnp.zeros(out_features, dtype=dtype))
+            bias_axis_names = None
+            bias_partition_spec = None
             if axis_names is not None:
-                self.bias.axis_names = axis_names[-len(out_features):]
+                bias_axis_names = axis_names[-len(out_features):]
+                
+            if partition_spec is not None:
+                bias_partition_spec = partition_spec[-len(out_features):]
+                
+            if bias_axis_names is not None or bias_partition_spec is not None:
+                bias_initializer = with_logical_partitioning(bias_initializer, bias_axis_names, bias_partition_spec)
+
+            self.bias = Parameter(
+                bias_initializer(rngs(), out_features, dtype),
+                axis_names=bias_axis_names,
+                partition_spec=bias_partition_spec,
+                metadata=bias_metadata
+            )
 
     def __call__(
         self,
@@ -122,38 +197,45 @@ class Linear(Module):
             (x_contracting_dims, weight_contracting_dims),
             ((), ()),
         )
-        weight = self.weight.value
-
-        explicit_out_sharding = (
-            out_sharding
-            if self.shard_mode == ShardMode.EXPLICIT
-            else None
-        )
+        weight = self.kernel.value
 
         if isinstance(weight, qwix.QArray):
-            out = qwix.dot_general(x, weight, dimension_numbers)
+            out = qwix.dot_general(
+                x, 
+                weight, 
+                dimension_numbers,
+                precision=self.precision,
+                preferred_element_type=self.preferred_element_type,
+                out_sharding=out_sharding,
+            )
         elif self.dot_general is not None:
-            out = self.dot_general(x, weight, dimension_numbers)
+            out = self.dot_general(
+                x, 
+                weight, 
+                dimension_numbers,
+                precision=self.precision,
+                preferred_element_type=self.preferred_element_type,
+                out_sharding=out_sharding,
+            )
         else:
             out = jax.lax.dot_general(
                 x,
                 weight,
                 dimension_numbers,
-                out_sharding=explicit_out_sharding,
+                precision=self.precision,
+                preferred_element_type=self.preferred_element_type,
+                out_sharding=out_sharding,
             )
 
-        if self.has_bias:
+        if self.bias is not None:
             out += self.bias.value
 
-        return _constrain(out, out_sharding, self.shard_mode)
+        return _constrain(out, out_sharding)
 
     def extra_repr(self) -> str:
         in_str = 'x'.join(map(str, self.in_features))
         out_str = 'x'.join(map(str, self.out_features))
-        quantized = (
-            isinstance(self.weight.value, qwix.QArray)
-            or self.weight.quantization is not None
-        )
+        quantized = isinstance(self.kernel.value, qwix.QArray)
         quant_str = ' (Qwix PTQ)' if quantized else ''
         custom_dot = ' (custom dot_general)' if self.dot_general is not None else ''
         return f'{in_str} -> {out_str}{quant_str}{custom_dot}'
@@ -171,11 +253,11 @@ class Bilinear(Module):
         bias: bool = True,
         dtype: DType | None = jnp.float32,
         rngs: Rngs | None = None,
-        initializer: Initializer = default_linear_initializer,
-        quant: tp.Any = None,
+        initializer: Initializer = default_kernel_initializer,
+        quant: QuantConfig = None,
         dot_general: tp.Any = None,
         axis_names: AxisNames | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
+        partition_spec: tp.Any | None = None,
     ) -> None:
         """Initializes the bilinear module.
 
@@ -190,14 +272,14 @@ class Bilinear(Module):
             quant (tp.Any, optional): Quantization configuration. Defaults to None.
             dot_general (tp.Any, optional): Custom dot_general implementation. Defaults to None.
             axis_names (AxisNames | None, optional): Names for the axes of the weight and bias parameters. Defaults to None.
-            shard_mode (ShardMode, optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
+            partition_spec (PartitionSpec | None, optional): Explicit hardware sharding specification. Defaults to None.
+            shard_mode (optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
         """
         self.in1_features = _normalize_shape(in1_features, 'in1_features')
         self.in2_features = _normalize_shape(in2_features, 'in2_features')
         self.out_features = _normalize_shape(out_features, 'out_features')
         self.has_bias = bias
         self.dot_general = dot_general
-        self.shard_mode = shard_mode
 
         if rngs is None:
             raise ValueError('A rngs must be provided to initialize Bilinear layer')
@@ -207,14 +289,22 @@ class Bilinear(Module):
             + self.in2_features
             + self.out_features
         )
-        self.weight = Parameter(initializer(rngs(), weight_shape, dtype))
-        self.weight.quantization = quant
-        self.weight.quantization_kind = 'dot_general'
-        self.weight.input_axis_count = (
-            len(self.in1_features) + len(self.in2_features)
-        )
-        self.weight.quantization_batch_axis_count = 0
+        weight_array = initializer(rngs(), weight_shape, dtype)
+        
+        if quant is not None:
+            from taktiny.utils.quantization import resolve_quantization_rule, quantize_linear_weight
+            rule = resolve_quantization_rule(quant, '', op_name='dot_general')
+            if rule is not None:
+                weight_array = quantize_linear_weight(
+                    weight_array,
+                    rule,
+                    input_axis_count=len(self.in1_features) + len(self.in2_features),
+                    batch_axis_count=0,
+                )
 
+        self.weight = Parameter(weight_array)
+
+        # Note: Bilinear hasn't been updated to use with_logical_partitioning yet. Let's just pass partition_spec to Parameter.
         if axis_names is not None:
             if len(axis_names) != len(weight_shape):
                 raise ValueError(
@@ -222,11 +312,15 @@ class Bilinear(Module):
                     f'weight dimensions {len(weight_shape)}'
                 )
             self.weight.axis_names = axis_names
+        if partition_spec is not None:
+            self.weight.partition_spec = partition_spec
 
         if bias:
             self.bias = Parameter(jnp.zeros(self.out_features, dtype=dtype))
             if axis_names is not None:
                 self.bias.axis_names = axis_names[-len(self.out_features):]
+            if partition_spec is not None:
+                self.bias.partition_spec = partition_spec[-len(self.out_features):]
 
     def __call__(
         self,
@@ -305,30 +399,22 @@ class Bilinear(Module):
                 tuple(range(leading_dims)),
             ),
         )
-        explicit_out_sharding = (
-            out_sharding
-            if self.shard_mode == ShardMode.EXPLICIT
-            else None
-        )
         output = jax.lax.dot_general(
             intermediate,
             x1,
             second_dimension_numbers,
-            out_sharding=explicit_out_sharding,
+            out_sharding=out_sharding,
         )
 
         if self.has_bias:
             output += self.bias.value
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         in1 = 'x'.join(map(str, self.in1_features))
         in2 = 'x'.join(map(str, self.in2_features))
         output = 'x'.join(map(str, self.out_features))
-        quantized = (
-            isinstance(self.weight.value, qwix.QArray)
-            or self.weight.quantization is not None
-        )
+        quantized = isinstance(self.weight.value, qwix.QArray)
         quant = ' (Qwix PTQ)' if quantized else ''
         custom_dot = ' (custom dot_general)' if self.dot_general is not None else ''
         return f'{in1}, {in2} -> {output}{quant}{custom_dot}'
