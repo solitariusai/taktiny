@@ -67,7 +67,7 @@ The `Takt` namespace provides functions for applying PEFT adapters to an existin
 
 ```python
 from taktiny import Takt
-from taktiny.takt.peft import LoRAAdapter
+from taktiny.takt.adapter import LoRAAdapter
 
 model = Takt.apply_peft(
     model,

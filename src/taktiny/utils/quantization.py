@@ -116,17 +116,7 @@ def resolve_quantization_rule(
     return None
 
 
-def quantize_linear_weight(array: Any, parameter: Any, rule: Any) -> Any:
-    batch_axis_count = getattr(
-        parameter,
-        'quantization_batch_axis_count',
-        0,
-    )
-    input_axis_count = getattr(parameter, 'input_axis_count', None)
-    if input_axis_count is None:
-        raise ValueError(
-            'Qwix quantization metadata is missing from Linear weight'
-        )
+def quantize_linear_weight(array: Any, rule: Any, input_axis_count: int, batch_axis_count: int = 0, scale_dtype: Any = None) -> Any:
 
     output_start = batch_axis_count + input_axis_count
     channelwise_axes = tuple(range(batch_axis_count)) + tuple(
@@ -148,11 +138,11 @@ def quantize_linear_weight(array: Any, parameter: Any, rule: Any) -> Any:
         channelwise_axes=channelwise_axes,
         tiled_axes=tiled_axes,
         calibration_method=rule.weight_calibration_method,
-        scale_dtype=parameter.dtype,
+        scale_dtype=scale_dtype or getattr(array, "dtype", None),
     )
 
 
-def quantize_embedding_weight(array: Any, parameter: Any, rule: Any) -> Any:
+def quantize_embedding_weight(array: Any, rule: Any, scale_dtype: Any = None) -> Any:
     tiled_axes = None
     if rule.tile_size is not None:
         tiled_axes = {1: rule.tile_size}
@@ -163,7 +153,7 @@ def quantize_embedding_weight(array: Any, parameter: Any, rule: Any) -> Any:
         channelwise_axes=(0,),
         tiled_axes=tiled_axes,
         calibration_method=rule.weight_calibration_method,
-        scale_dtype=parameter.dtype,
+        scale_dtype=scale_dtype or getattr(array, "dtype", None),
     )
 
 

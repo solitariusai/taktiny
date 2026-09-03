@@ -18,8 +18,7 @@ from __future__ import annotations
 from typing import Any, TypeVar
 
 from taktiny.nn.base import Module, iter_children
-from taktiny.takt.peft.adapter import BaseAdapter
-
+from taktiny.takt.adapter.base import BaseAdapter
 
 M = TypeVar('M', bound=Module)
 

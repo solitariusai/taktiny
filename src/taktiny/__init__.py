@@ -21,7 +21,7 @@ __description__ = (
 )
 
 from taktiny import nn
-from taktiny.takt import Takt
+# from taktiny.takt import Takt
 from taktiny.trainer import (
     DatasetConfig,
     TensorBoardCallback,
