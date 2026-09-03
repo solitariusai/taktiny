@@ -40,7 +40,7 @@ from taktiny.nn.utils import (
     _scatter_indices,
     _window_output_shape,
 )
-from taktiny.utils.typing import AxisNames, DType, Initializer, ShardMode
+from taktiny.utils.typing import AxisNames, DType, Initializer
 
 default_conv_initializer = lecun_uniform()
 
@@ -67,7 +67,6 @@ class Conv(Module):
         initializer: Initializer = default_conv_initializer,
         bias_initializer: Initializer = zeros,
         axis_names: AxisNames | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
         """
         The spatial rank is inferred from ``kernel_size``. For example,
@@ -90,7 +89,7 @@ class Conv(Module):
             initializer (Initializer, optional): Initializer for the weights. Defaults to default_conv_initializer.
             bias_initializer (Initializer, optional): Initializer for the bias. Defaults to zeros.
             axis_names (AxisNames | None, optional): Logical axis names for sharding. Defaults to None.
-            shard_mode (ShardMode, optional): Sharding mode. Defaults to ShardMode.AUTO.
+            shard_mode (optional): Sharding mode. Defaults to ShardMode.AUTO.
         """
         if not isinstance(in_channels, int) or in_channels <= 0:
             raise ValueError('in_channels must be a positive integer')
@@ -150,7 +149,6 @@ class Conv(Module):
         self.has_bias = bias
         self.padding_mode = padding_mode
         self.spatial_rank = spatial_rank
-        self.shard_mode = shard_mode
 
         weight_shape = (
             *kernel_size,
@@ -325,7 +323,7 @@ class Conv(Module):
             output = output + self.bias.value
         if unbatched:
             output = output[0]
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         return (
@@ -356,7 +354,6 @@ class ConvTranspose(Module):
         initializer: Initializer = default_conv_initializer,
         bias_initializer: Initializer = zeros,
         axis_names: AxisNames | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
         """Initializes the ConvTranspose module.
 
@@ -376,7 +373,7 @@ class ConvTranspose(Module):
             initializer (Initializer, optional): Initializer for the weights. Defaults to default_conv_initializer.
             bias_initializer (Initializer, optional): Initializer for the bias. Defaults to zeros.
             axis_names (AxisNames | None, optional): Logical axis names for sharding. Defaults to None.
-            shard_mode (ShardMode, optional): Sharding mode. Defaults to ShardMode.AUTO.
+            shard_mode (optional): Sharding mode. Defaults to ShardMode.AUTO.
         """
         if not isinstance(in_channels, int) or in_channels <= 0:
             raise ValueError('in_channels must be a positive integer')
@@ -434,7 +431,6 @@ class ConvTranspose(Module):
         self.dilation = dilation
         self.padding_mode = padding_mode
         self.spatial_rank = rank
-        self.shard_mode = shard_mode
 
         weight_shape = (
             *kernel_size,
@@ -518,7 +514,7 @@ class ConvTranspose(Module):
         if self.has_bias:
             output = output + self.bias.value
         output = _restore_batch(output, unbatched)
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         return (

@@ -98,8 +98,7 @@ def _stack_modules(modules: Iterable[Module]) -> tuple[Module, int]:
     for parameter in stacked.flat_parameter_dict().values():
         if hasattr(parameter, 'axis_names') and parameter.axis_names is not None:
             parameter.axis_names = (None,) + tuple(parameter.axis_names)
-        if hasattr(parameter, 'quantization_batch_axis_count'):
-            parameter.quantization_batch_axis_count += 1
+
 
     return stacked, len(modules)
 

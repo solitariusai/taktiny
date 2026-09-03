@@ -17,11 +17,8 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import jax
-import jax.numpy as jnp
 
 from taktiny.nn.base import Module
-from taktiny.nn.utils import _identity
-from taktiny.utils.typing import Activation
 
 
 class _ActivationBase(Module):
@@ -266,72 +263,6 @@ class HardSigmoid(_ActivationBase):
         return super().__call__(x)
 
 
-def _relu6(value: jax.Array) -> jax.Array:
-    """Computes ReLU6 activation.
-
-    Args:
-        value (jax.Array): The input array.
-
-    Returns:
-        jax.Array: The activated output array.
-    """
-    return jnp.minimum(jax.nn.relu(value), 6)
-
-
-def _approximate_gelu(value: jax.Array) -> jax.Array:
-    """Computes approximate GELU activation.
-
-    Args:
-        value (jax.Array): The input array.
-
-    Returns:
-        jax.Array: The activated output array.
-    """
-    return jax.nn.gelu(value, approximate=True)
-
-
-def _resolve_activation(
-    activation: Activation | None,
-    *,
-    allow_none: bool = False,
-) -> Callable:
-    """Resolves an activation function from a string or callable.
-
-    Args:
-        activation (Activation | None): The activation name or function.
-        allow_none (bool, optional): Whether to allow None as input. Defaults to False.
-
-    Returns:
-        Callable: The resolved activation function.
-    """
-    if activation is None:
-        if allow_none:
-            return _identity
-        raise TypeError('activation must be a string or callable')
-    if callable(activation):
-        return activation
-    if not isinstance(activation, str):
-        expected = 'a string, callable, or None' if allow_none else 'a string or callable'
-        raise TypeError(f'activation must be {expected}')
-    normalized = activation.lower().replace('-', '_')
-    compact = normalized.replace('_', '')
-    if compact == 'relu6':
-        return _relu6
-    if compact in {
-        'gelupytorchtanh',
-        'gelunew',
-        'gelufast',
-        'geluapproximate',
-    }:
-        return _approximate_gelu
-    if compact == 'swish':
-        return jax.nn.silu
-    function = getattr(jax.nn, normalized, None)
-    if function is None or not callable(function):
-        raise ValueError(f'unsupported activation: {activation!r}')
-    return function
-    
-
 __all__ = [
     'ELU',
     'GELU',
@@ -347,7 +278,4 @@ __all__ = [
     'SoftSign',
     'Swish',
     'Tanh',
-    '_approximate_gelu',
-    '_relu6',
-    '_resolve_activation',
 ]

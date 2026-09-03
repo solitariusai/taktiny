@@ -29,7 +29,7 @@ from taktiny.nn.utils import (
     _constrain,
     _validate_probability,
 )
-from taktiny.utils.typing import Axes, ShardMode
+from taktiny.utils.typing import Axes
 
 type StochasticDepthMode = Literal['batch', 'row']
 
@@ -128,7 +128,6 @@ class Dropout(Module):
         *,
         broadcast_axes: Axes = (),
         rngs: Rngs | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
         """Initializes a Dropout module.
 
@@ -136,7 +135,7 @@ class Dropout(Module):
             p (float, optional): The probability of an element to be zeroed. Defaults to 0.5.
             broadcast_axes (Axes, optional): Axes along which the dropout mask is broadcast. Defaults to ().
             rngs (Rngs | None, optional): An instance of Rngs for random number generation. Defaults to None.
-            shard_mode (ShardMode, optional): The sharding mode for the output. Defaults to ShardMode.AUTO.
+            shard_mode (optional): The sharding mode for the output. Defaults to ShardMode.AUTO.
         """
 
         self.p = _validate_probability(p)
@@ -146,7 +145,6 @@ class Dropout(Module):
             else tuple(broadcast_axes)
         )
         self.rngs = _validate_rngs(rngs)
-        self.shard_mode = shard_mode
 
     def _apply(
         self,
@@ -205,7 +203,7 @@ class Dropout(Module):
             x,
             broadcast_axes=axes,
         )
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         return f'p={self.p:g}, broadcast_axes={self.broadcast_axes}'
@@ -223,7 +221,6 @@ class FeatureDropout(Dropout):
         channel_axis: int = -1,
         batch_axis: int | None = 0,
         rngs: Rngs | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
         """Initializes a FeatureDropout module.
 
@@ -232,10 +229,10 @@ class FeatureDropout(Dropout):
             channel_axis (int, optional): The axis corresponding to features/channels. Defaults to -1.
             batch_axis (int | None, optional): The axis corresponding to the batch size, if any. Defaults to 0.
             rngs (Rngs | None, optional): An instance of Rngs for random number generation. Defaults to None.
-            shard_mode (ShardMode, optional): The sharding mode for the output. Defaults to ShardMode.AUTO.
+            shard_mode (optional): The sharding mode for the output. Defaults to ShardMode.AUTO.
         """
 
-        super().__init__(p, rngs=rngs, shard_mode=shard_mode)
+        super().__init__(p, rngs=rngs)
         self.channel_axis = channel_axis
         self.batch_axis = batch_axis
 
@@ -263,7 +260,7 @@ class FeatureDropout(Dropout):
                 self.batch_axis,
             ),
         )
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         return (
@@ -285,7 +282,6 @@ class AlphaDropout(Module):
         *,
         broadcast_axes: Axes = (),
         rngs: Rngs | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
         """Initializes an AlphaDropout module.
 
@@ -293,7 +289,7 @@ class AlphaDropout(Module):
             p (float, optional): The probability of an element to be dropped. Defaults to 0.5.
             broadcast_axes (Axes, optional): Axes along which the dropout mask is broadcast. Defaults to ().
             rngs (Rngs | None, optional): An instance of Rngs for random number generation. Defaults to None.
-            shard_mode (ShardMode, optional): The sharding mode for the output. Defaults to ShardMode.AUTO.
+            shard_mode (optional): The sharding mode for the output. Defaults to ShardMode.AUTO.
         """
         self.p = _validate_probability(p, allow_one=False)
         self.broadcast_axes = (
@@ -302,7 +298,6 @@ class AlphaDropout(Module):
             else tuple(broadcast_axes)
         )
         self.rngs = _validate_rngs(rngs)
-        self.shard_mode = shard_mode
 
     def _apply(
         self,
@@ -368,7 +363,7 @@ class AlphaDropout(Module):
             x,
             broadcast_axes=axes,
         )
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         return f'p={self.p:g}, broadcast_axes={self.broadcast_axes}'
@@ -386,7 +381,6 @@ class FeatureAlphaDropout(AlphaDropout):
         channel_axis: int = -1,
         batch_axis: int | None = 0,
         rngs: Rngs | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
         """Initializes a FeatureAlphaDropout module.
 
@@ -395,9 +389,9 @@ class FeatureAlphaDropout(AlphaDropout):
             channel_axis (int, optional): The axis corresponding to features/channels. Defaults to -1.
             batch_axis (int | None, optional): The axis corresponding to the batch size, if any. Defaults to 0.
             rngs (Rngs | None, optional): An instance of Rngs for random number generation. Defaults to None.
-            shard_mode (ShardMode, optional): The sharding mode for the output. Defaults to ShardMode.AUTO.
+            shard_mode (optional): The sharding mode for the output. Defaults to ShardMode.AUTO.
         """
-        super().__init__(p, rngs=rngs, shard_mode=shard_mode)
+        super().__init__(p, rngs=rngs)
         self.channel_axis = channel_axis
         self.batch_axis = batch_axis
 
@@ -425,7 +419,7 @@ class FeatureAlphaDropout(AlphaDropout):
                 self.batch_axis,
             ),
         )
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         return (
@@ -446,7 +440,6 @@ class StochasticDepth(Dropout):
         *,
         batch_axis: int = 0,
         rngs: Rngs | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
         """Initializes a StochasticDepth module.
 
@@ -455,9 +448,9 @@ class StochasticDepth(Dropout):
             mode (StochasticDepthMode, optional): The stochastic depth mode, either 'batch' or 'row'. Defaults to 'row'.
             batch_axis (int, optional): The axis corresponding to the batch size. Defaults to 0.
             rngs (Rngs | None, optional): An instance of Rngs for random number generation. Defaults to None.
-            shard_mode (ShardMode, optional): The sharding mode for the output. Defaults to ShardMode.AUTO.
+            shard_mode (optional): The sharding mode for the output. Defaults to ShardMode.AUTO.
         """
-        super().__init__(p, rngs=rngs, shard_mode=shard_mode)
+        super().__init__(p, rngs=rngs)
         if mode not in {'batch', 'row'}:
             raise ValueError("mode must be 'batch' or 'row'")
         self.mode = mode
@@ -494,7 +487,7 @@ class StochasticDepth(Dropout):
             x,
             broadcast_axes=broadcast_axes,
         )
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         return f'p={self.p:g}, mode={self.mode!r}, batch_axis={self.batch_axis}'

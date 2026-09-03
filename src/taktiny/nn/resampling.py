@@ -28,7 +28,6 @@ from taktiny.nn.utils import (
     _restore_batch,
     _validate_positive_float,
 )
-from taktiny.utils.typing import ShardMode
 
 _METHOD_ALIASES = {
     'bilinear': 'linear',
@@ -48,8 +47,7 @@ class _Resize(Module):
         default_scale_factor: float,
         method: str,
         antialias: bool,
-        shard_mode: ShardMode,
-    ) -> None:
+        ) -> None:
         """Initializes the resize module.
 
         Args:
@@ -58,7 +56,6 @@ class _Resize(Module):
             default_scale_factor (float): Default scaling factor if none is provided.
             method (str): Resampling method to use (e.g., 'linear', 'nearest').
             antialias (bool): Whether to apply antialiasing.
-            shard_mode (ShardMode): Sharding mode for the output array.
         """
         if size is not None and scale_factor is not None:
             raise ValueError('size and scale_factor are mutually exclusive')
@@ -97,7 +94,6 @@ class _Resize(Module):
         self.method = _METHOD_ALIASES.get(method, method)
         self.antialias = bool(antialias)
         self.spatial_rank = spatial_rank
-        self.shard_mode = shard_mode
 
     def _scaled_size(self, current: int, scale: float) -> int:
         """Computes the scaled size for a single dimension.
@@ -153,7 +149,7 @@ class _Resize(Module):
             antialias=self.antialias,
         )
         output = _restore_batch(output, unbatched)
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         """Returns extra representation string for the module.
@@ -177,7 +173,6 @@ class Upsample(_Resize):
         scale_factor: float | Sequence[float] | None = None,
         method: str = 'nearest',
         antialias: bool = True,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
         """Initializes the upsampling module.
 
@@ -186,7 +181,7 @@ class Upsample(_Resize):
             scale_factor (float | Sequence[float] | None, optional): Scaling factor for spatial dimensions. Defaults to None.
             method (str, optional): Resampling method. Defaults to 'nearest'.
             antialias (bool, optional): Whether to apply antialiasing. Defaults to True.
-            shard_mode (ShardMode, optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
+            shard_mode (optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
         """
         super().__init__(
             size,
@@ -194,7 +189,6 @@ class Upsample(_Resize):
             default_scale_factor=2.0,
             method=method,
             antialias=antialias,
-            shard_mode=shard_mode,
         )
 
     def _scaled_size(self, current: int, scale: float) -> int:
@@ -219,7 +213,6 @@ class Downsample(_Resize):
         scale_factor: float | Sequence[float] | None = None,
         method: str = 'linear',
         antialias: bool = True,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
         """Initializes the downsampling module.
 
@@ -228,7 +221,7 @@ class Downsample(_Resize):
             scale_factor (float | Sequence[float] | None, optional): Reduction factor for spatial dimensions. Defaults to None.
             method (str, optional): Resampling method. Defaults to 'linear'.
             antialias (bool, optional): Whether to apply antialiasing. Defaults to True.
-            shard_mode (ShardMode, optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
+            shard_mode (optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
         """
         super().__init__(
             size,
@@ -236,7 +229,6 @@ class Downsample(_Resize):
             default_scale_factor=2.0,
             method=method,
             antialias=antialias,
-            shard_mode=shard_mode,
         )
         if self.scale_factor is not None and any(
             scale < 1.0 for scale in self.scale_factor

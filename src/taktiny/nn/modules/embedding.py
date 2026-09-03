@@ -24,7 +24,7 @@ from jax.nn import initializers
 from taktiny.nn.base import Module, Parameter
 from taktiny.nn.rng import Rngs
 from taktiny.nn.utils import _constrain
-from taktiny.utils.typing import AxisNames, DType, Initializer, ShardMode
+from taktiny.utils.typing import AxisNames, DType, Initializer
 
 default_embedding_initializer = initializers.normal(0.02)
 
@@ -40,9 +40,8 @@ class Embedding(Module):
         rngs: Rngs | None = None,
         dtype: DType = jnp.float32,
         initializer: Initializer | None = None,
-        quant: Any = None,
+        quant: QuantConfig = None,
         axis_names: AxisNames | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
         """Initializes the Embedding module.
 
@@ -54,7 +53,7 @@ class Embedding(Module):
             initializer (Initializer | None, optional): Initialization function for the weights. Defaults to None.
             quant (Any, optional): Quantization configuration. Defaults to None.
             axis_names (AxisNames | None, optional): Axis names for sharding. Defaults to None.
-            shard_mode (ShardMode, optional): Mode for sharding the output. Defaults to ShardMode.AUTO.
+            shard_mode (optional): Mode for sharding the output. Defaults to ShardMode.AUTO.
         """
         initializer = initializer or default_embedding_initializer
         if not isinstance(num_embeddings, int) or num_embeddings <= 0:
@@ -70,16 +69,20 @@ class Embedding(Module):
 
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        self.shard_mode = shard_mode
         if rngs is None:
             raise ValueError("A rngs must be provided to initialize Embedding layer")
 
         key = rngs()
-        self.embedding = Parameter(
-            initializer(key, (num_embeddings, embedding_dim), dtype)
-        )
-        self.embedding.quantization = quant
-        self.embedding.quantization_kind = 'embedding'
+        embedding_array = initializer(key, (num_embeddings, embedding_dim), dtype)
+        
+        if quant is not None:
+            from taktiny.utils.quantization import resolve_quantization_rule, quantize_embedding_weight
+            rule = resolve_quantization_rule(quant, '', op_name='embedding')
+            if rule is not None:
+                embedding_array = quantize_embedding_weight(embedding_array, rule)
+                
+        self.embedding = Parameter(embedding_array)
+        
         if axis_names is not None:
             self.embedding.axis_names = axis_names
 
@@ -103,7 +106,7 @@ class Embedding(Module):
         else:
             output = table[indices]
 
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     # will bring back
     # @classmethod
