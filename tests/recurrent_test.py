@@ -5,7 +5,7 @@ import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from taktiny import nn
-from taktiny.cosette.layers import GRU, LSTM, RNN
+from taktiny.nn.modules import GRU, LSTM, RNN
 from taktiny.utils.typing import ShardMode
 
 
