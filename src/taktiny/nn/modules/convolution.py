@@ -15,13 +15,16 @@
 from __future__ import annotations
 
 import math
-import typing as tp
 from collections.abc import Sequence
 from itertools import product
 
 import jax
 import jax.numpy as jnp
+import qwix
+from jax.lax import PrecisionLike
 from jax.nn.initializers import lecun_uniform, zeros
+from jax.sharding import PartitionSpec
+from jax.typing import DTypeLike
 
 from taktiny.nn.base import Module, Parameter
 from taktiny.nn.rng import Rngs
@@ -34,75 +37,192 @@ from taktiny.nn.utils import (
     _max_identity,
     _normalize_adaptive_size,
     _normalize_nonnegative,
+    _normalize_shape,
     _pool_padding,
     _reduce_window_config,
     _restore_batch,
     _scatter_indices,
     _window_output_shape,
 )
-from taktiny.utils.typing import AxisNames, DType, Initializer
+from taktiny.utils.quantization import (
+    quantize_conv_weight,
+    resolve_quantization_rule,
+)
+from taktiny.utils.spmd import with_logical_partitioning
+from taktiny.utils.typing import (
+    AxisNames,
+    ConvGeneralDilated,
+    DType,
+    GenericShape,
+    Initializer,
+    MetaData,
+    QuantConfig,
+)
 
-default_conv_initializer = lecun_uniform()
+default_kernel_initializer = lecun_uniform()
+default_bias_initializer = jax.nn.initializers.zeros
+# Kept for modules that have not migrated to the new initializer name yet.
+default_conv_initializer = default_kernel_initializer
 
 
 class Conv(Module):
-    """
-    Applies a convolution over an input signal.
+    """Applies an N-dimensional convolution to channels-last inputs.
+
+    The spatial rank is inferred from ``kernel_size``. Scalar channel counts
+    behave like a conventional convolution. Tuple-shaped channels are stored
+    as structured trailing axes and flattened only for the underlying JAX
+    convolution. Thus an input of shape
+    ``[batch, *spatial, *in_channels]`` produces
+    ``[batch, *output_spatial, *out_channels]``.
+
+    When ``groups`` is greater than one, groups partition the first input and
+    output channel axes. Both first channel-axis sizes must therefore be
+    divisible by ``groups``.
+
+    ``padding`` and ``pad_mode`` control different aspects of boundary
+    handling. ``padding`` determines how many elements are added before and
+    after each spatial axis, while ``pad_mode`` determines the values used for
+    those elements. With the default ``pad_mode='zeros'``, padding is handled
+    directly by the convolution and the added values are zero. The other
+    modes explicitly extend the input before applying a ``VALID`` convolution:
+    ``'reflect'`` mirrors the input without repeating its edge, ``'replicate'``
+    repeats the edge value, and ``'circular'`` wraps values from the opposite
+    edge.
+
+    ``padding`` accepts ``'VALID'`` for no automatic padding and ``'SAME'`` or
+    ``'SAME_LOWER'`` for the padding required to produce
+    ``ceil(input_size / stride)`` positions along each spatial axis. When the
+    total padding is odd, ``'SAME'`` places the extra element after the input,
+    while ``'SAME_LOWER'`` places it before the input. String padding is
+    supported only with ``pad_mode='zeros'``. Numeric padding can be expressed
+    in several ways:
+
+    - An integer applies that amount symmetrically to every spatial axis.
+    - A sequence of integers supplies one symmetric amount per spatial axis.
+    - A sequence of ``(before, after)`` pairs supplies asymmetric padding for
+      every spatial axis.
+    - For a one-dimensional convolution, a two-integer sequence is interpreted
+      directly as ``(before, after)``.
+
+    For example, ``padding=2`` pads every axis by two elements on each side;
+    for a two-dimensional convolution, ``padding=(1, 2)`` pads the first axis
+    by one and the second by two on each side, while
+    ``padding=((1, 0), (2, 3))`` specifies every side independently.
+
+    Args:
+        in_channels: Shape of the trailing input-channel axes.
+        out_channels: Shape of the trailing output-channel axes.
+        kernel_size: Size of the spatial convolution window.
+        stride: Step of the convolution window.
+        padding: Spatial padding geometry. Use ``'VALID'`` for no automatic
+            padding, ``'SAME'`` or ``'SAME_LOWER'`` to preserve the
+            stride-scaled spatial size, a non-negative integer for symmetric
+            padding on every axis, one integer per axis for per-axis symmetric
+            padding, or a sequence of ``n`` ``(before, after)`` pairs—one for
+            each spatial axis—for asymmetric padding. Defaults to ``0``.
+        dilation: Spacing between kernel elements.
+        groups: Number of feature groups.
+        pad_mode: How values outside the input boundary are produced. One of
+            ``'zeros'``, ``'reflect'``, ``'replicate'``, or ``'circular'``.
+            Nonzero modes require explicit numeric ``padding``; ``'SAME'``,
+            ``'SAME_LOWER'``, and ``'VALID'`` can only be used with ``'zeros'``.
+            Defaults to ``'zeros'``.
+        bias: Whether to add a learnable output bias.
+        dtype: Data type passed to the parameter initializers.
+        rngs: Random number generator used to initialize parameters.
+        kernel_initializer: Function used to initialize the kernel.
+        bias_initializer: Function used to initialize the bias.
+        quant: Optional Qwix quantization configuration for the kernel.
+        dot_general: Optional drop-in convolution callable. The name is kept
+            for compatibility with other parameterized modules.
+        axis_names: Optional logical names for every kernel axis.
+        partition_spec: Optional partition specification for the kernel.
+        kernel_metadata: Optional metadata attached to the kernel parameter.
+        bias_metadata: Optional metadata attached to the bias parameter.
+        precision: Convolution precision forwarded to the convolution callable.
+        preferred_element_type: Preferred accumulation and result data type.
+
+    Examples:
+        Apply a one-dimensional convolution to a channels-last batch while
+        preserving its spatial length:
+
+        >>> import jax.numpy as jnp
+        >>> from taktiny import nn
+        >>> conv = nn.Conv(
+        ...     3, 8, kernel_size=3, padding='SAME', rngs=nn.Rngs(0)
+        ... )
+        >>> x = jnp.ones((4, 16, 3))
+        >>> conv(x).shape
+        (4, 16, 8)
+
+        Structured channel shapes remain visible in both the input and output.
+        This example applies an unbatched two-dimensional convolution:
+
+        >>> conv = nn.Conv(
+        ...     (2, 3),
+        ...     (4, 5),
+        ...     kernel_size=(3, 3),
+        ...     padding='SAME',
+        ...     rngs=nn.Rngs(1),
+        ... )
+        >>> x = jnp.ones((8, 8, 2, 3))
+        >>> conv(x).shape
+        (8, 8, 4, 5)
+
+        Nonzero boundary modes require explicit numeric padding. Here the
+        spatial input is reflected by one element on each side:
+
+        >>> conv = nn.Conv(
+        ...     1,
+        ...     4,
+        ...     kernel_size=3,
+        ...     padding=1,
+        ...     pad_mode='reflect',
+        ...     rngs=nn.Rngs(2),
+        ... )
+        >>> x = jnp.ones((6, 1))
+        >>> conv(x).shape
+        (6, 4)
     """
 
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int | Sequence[int],
-        stride: int | Sequence[int] = 1,
-        padding: str | int | Sequence[int | tuple[int, int]] = 0,
-        dilation: int | Sequence[int] = 1,
-        groups: int = 1,
-        padding_mode: str = 'zeros',
-        dtype: DType = jnp.float32,
+        in_channels: GenericShape,
+        out_channels: GenericShape,
+        kernel_size: GenericShape,
         *,
+        stride: GenericShape = 1,
+        padding: str | int | Sequence[int | tuple[int, int]] = 0,
+        dilation: GenericShape = 1,
+        groups: int = 1,
+        pad_mode: str = 'zeros',
         bias: bool = True,
+        dtype: DType | None = None,
         rngs: Rngs,
-        initializer: Initializer = default_conv_initializer,
-        bias_initializer: Initializer = zeros,
+        kernel_initializer: Initializer = default_kernel_initializer,
+        bias_initializer: Initializer = default_bias_initializer,
+        quant: QuantConfig = None,
+        dot_general: ConvGeneralDilated | None = None,
         axis_names: AxisNames | None = None,
+        partition_spec: PartitionSpec | None = None,
+        kernel_metadata: MetaData | None = None,
+        bias_metadata: MetaData | None = None,
+        precision: PrecisionLike = None,
+        preferred_element_type: DTypeLike | None = None,
     ) -> None:
-        """
-        The spatial rank is inferred from ``kernel_size``. For example,
-        ``kernel_size=3`` creates a 1D convolution, while ``kernel_size=(3, 3)``
-        creates a 2D convolution. Inputs may be batched as
-        ``[batch, *spatial, channels]`` or unbatched as ``[*spatial, channels]``.
+        in_channels = _normalize_shape(in_channels, 'in_channels')
+        out_channels = _normalize_shape(out_channels, 'out_channels')
 
-        Args:
-            in_channels (int): Number of channels in the input image.
-            out_channels (int): Number of channels produced by the convolution.
-            kernel_size (int | Sequence[int]): Size of the convolving kernel.
-            rngs (Rngs): PRNG key generator for parameter initialization.
-            stride (int | Sequence[int], optional): Stride of the convolution. Defaults to 1.
-            padding (str | int | Sequence[int | tuple[int, int]], optional): Padding added to all sides of the input. Defaults to 0.
-            dilation (int | Sequence[int], optional): Spacing between kernel elements. Defaults to 1.
-            groups (int, optional): Number of blocked connections from input channels to output channels. Defaults to 1.
-            padding_mode (str, optional): Padding mode. Defaults to 'zeros'.
-            dtype (DType, optional): Data type of the parameters. Defaults to jnp.float32.
-            bias (bool, optional): If True, adds a learnable bias to the output. Defaults to True.
-            initializer (Initializer, optional): Initializer for the weights. Defaults to default_conv_initializer.
-            bias_initializer (Initializer, optional): Initializer for the bias. Defaults to zeros.
-            axis_names (AxisNames | None, optional): Logical axis names for sharding. Defaults to None.
-            shard_mode (optional): Sharding mode. Defaults to ShardMode.AUTO.
-        """
-        if not isinstance(in_channels, int) or in_channels <= 0:
-            raise ValueError('in_channels must be a positive integer')
-        if not isinstance(out_channels, int) or out_channels <= 0:
-            raise ValueError('out_channels must be a positive integer')
         if not isinstance(groups, int) or groups <= 0:
             raise ValueError('groups must be a positive integer')
-        if in_channels % groups != 0:
+
+        if in_channels[0] % groups != 0:
             raise ValueError(
-                f'in_channels ({in_channels}) must be divisible by groups '
+                f'in_channels[0] ({in_channels[0]}) must be divisible by groups '
                 f'({groups})'
             )
-        if out_channels % groups != 0:
+
+        if out_channels[0] % groups != 0:
             raise ValueError(
                 f'out_channels ({out_channels}) must be divisible by groups '
                 f'({groups})'
@@ -122,19 +242,19 @@ class Conv(Module):
         )
         padding = self._normalize_padding(padding, spatial_rank)
 
-        padding_mode = padding_mode.lower()
-        padding_modes = {
+        pad_mode = pad_mode.lower()
+        pad_modes = {
             'zeros': 'constant',
             'reflect': 'reflect',
             'replicate': 'edge',
             'circular': 'wrap',
         }
-        if padding_mode not in padding_modes:
-            choices = ', '.join(padding_modes)
+        if pad_mode not in pad_modes:
+            choices = ', '.join(pad_modes)
             raise ValueError(
-                f'padding_mode must be one of {choices}, got {padding_mode!r}'
+                f'pad_mode must be one of {choices}, got {pad_mode!r}'
             )
-        if padding_mode != 'zeros' and isinstance(padding, str):
+        if pad_mode != 'zeros' and isinstance(padding, str):
             raise ValueError(
                 'nonzero padding modes require explicit numeric padding'
             )
@@ -147,31 +267,73 @@ class Conv(Module):
         self.dilation = dilation
         self.groups = groups
         self.has_bias = bias
-        self.padding_mode = padding_mode
+        self.pad_mode = pad_mode
         self.spatial_rank = spatial_rank
+        self.dot_general = dot_general
+        self.precision = precision
+        self.preferred_element_type = preferred_element_type
+        self._in_channel_count = math.prod(in_channels)
+        self._out_channel_count = math.prod(out_channels)
 
-        weight_shape = (
-            *kernel_size,
-            in_channels // groups,
-            out_channels,
+        grouped_in_channels = (
+            in_channels[0] // groups,
+            *in_channels[1:],
         )
-        self.weight = Parameter(
-            initializer(rngs(), weight_shape, dtype)
-        )
+        weight_shape = kernel_size + grouped_in_channels + out_channels
         if axis_names is not None:
-            if len(axis_names) != len(weight_shape):
-                raise ValueError(
-                    f'axis_names length {len(axis_names)} must match '
-                    f'weight dimensions {len(weight_shape)}'
-                )
-            self.weight.axis_names = axis_names
+            axis_names = tuple(axis_names)
 
-        if bias:
-            self.bias = Parameter(
-                bias_initializer(rngs(), (out_channels,), dtype)
+        if axis_names is not None or partition_spec is not None:
+            kernel_initializer = with_logical_partitioning(
+                kernel_initializer,
+                axis_names,
+                partition_spec,
             )
+
+        kernel_array = kernel_initializer(rngs(), weight_shape, dtype)
+        if quant is not None:
+            rule = resolve_quantization_rule(
+                quant,
+                '',
+                op_name='conv_general_dilated',
+            )
+            if rule is not None:
+                kernel_array = quantize_conv_weight(
+                    kernel_array,
+                    rule,
+                    output_axis_count=len(out_channels),
+                )
+
+        self.kernel = Parameter(
+            kernel_array,
+            axis_names=axis_names,
+            partition_spec=partition_spec,
+            metadata=kernel_metadata,
+        )
+
+        self.bias = None
+        if bias:
+            bias_axis_names = None
+            bias_partition_spec = None
             if axis_names is not None:
-                self.bias.axis_names = axis_names[-1:]
+                bias_axis_names = axis_names[-len(out_channels):]
+            if partition_spec is not None:
+                bias_partition_spec = PartitionSpec(
+                    *partition_spec[-len(out_channels):]
+                )
+            if bias_axis_names is not None or bias_partition_spec is not None:
+                bias_initializer = with_logical_partitioning(
+                    bias_initializer,
+                    bias_axis_names,
+                    bias_partition_spec,
+                )
+
+            self.bias = Parameter(
+                bias_initializer(rngs(), out_channels, dtype),
+                axis_names=bias_axis_names,
+                partition_spec=bias_partition_spec,
+                metadata=bias_metadata,
+            )
 
     @staticmethod
     def _normalize_spatial(
@@ -194,14 +356,18 @@ class Conv(Module):
             values = (value,) if rank is None else (value,) * rank
         else:
             values = tuple(value)
+
         if not values:
             raise ValueError(f'{name} must contain at least one dimension')
+
         if rank is not None and len(values) != rank:
             raise ValueError(
                 f'{name} must contain {rank} values, got {len(values)}'
             )
+
         if any(not isinstance(item, int) or item <= 0 for item in values):
             raise ValueError(f'{name} values must be positive integers')
+
         return values
 
     @staticmethod
@@ -220,39 +386,66 @@ class Conv(Module):
         """
         if isinstance(padding, str):
             padding = padding.upper()
-            if padding not in {'SAME', 'VALID'}:
+            if padding not in {'SAME', 'SAME_LOWER', 'VALID'}:
                 raise ValueError(
-                    "padding must be 'SAME', 'VALID', or explicit integers"
+                    "padding must be 'SAME', 'SAME_LOWER', 'VALID', or "
+                    'explicit integers'
                 )
             return padding
+
         if isinstance(padding, int):
             pairs = ((padding, padding),) * rank
         else:
             values = tuple(padding)
-            if rank == 1 and len(values) == 2 and all(
-                isinstance(value, int) for value in values
-            ):
-                pairs = (tp.cast(tuple[int, int], values),)
-            elif len(values) == rank and all(
-                isinstance(value, int) for value in values
-            ):
-                pairs = tuple((value, value) for value in values)
-            elif len(values) == rank and all(
-                isinstance(value, Sequence)
-                and len(value) == 2
-                and all(isinstance(side, int) for side in value)
-                for value in values
-            ):
-                pairs = tuple(
-                    tp.cast(tuple[int, int], tuple(value))
-                    for value in values
-                )
-            else:
+            if rank == 1 and len(values) == 2:
+                low, high = values
+                if isinstance(low, int) and isinstance(high, int):
+                    pairs = ((low, high),)
+                else:
+                    raise ValueError(
+                        'padding must describe 1 spatial dimension'
+                    )
+
+            elif len(values) != rank:
                 raise ValueError(
                     f'padding must describe {rank} spatial dimensions'
                 )
+
+            elif isinstance(values[0], int):
+                symmetric_pairs: list[tuple[int, int]] = []
+                for value in values:
+                    if not isinstance(value, int):
+                        raise TypeError(
+                            'padding values must either all be integers or '
+                            'all be (before, after) pairs'
+                        )
+                    symmetric_pairs.append((value, value))
+                pairs = tuple(symmetric_pairs)
+
+            else:
+                explicit_pairs: list[tuple[int, int]] = []
+                for value in values:
+                    if not isinstance(value, Sequence):
+                        raise TypeError(
+                            'padding values must either all be integers or '
+                            'all be (before, after) pairs'
+                        )
+                    sides = tuple(value)
+                    if len(sides) != 2:
+                        raise ValueError(
+                            'each padding pair must contain two integers'
+                        )
+                    low, high = sides
+                    if not isinstance(low, int) or not isinstance(high, int):
+                        raise TypeError(
+                            'each padding pair must contain two integers'
+                        )
+                    explicit_pairs.append((low, high))
+                pairs = tuple(explicit_pairs)
+
         if any(side < 0 for pair in pairs for side in pair):
             raise ValueError('padding values must be non-negative')
+
         return pairs
 
     def __call__(
@@ -260,24 +453,33 @@ class Conv(Module):
         x: jax.Array,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
-        """Applies the convolution operation.
+        """Applies the convolution to a batched or unbatched input.
 
         Args:
-            x (jax.Array): The input array.
-            out_sharding (jax.sharding.Sharding | None, optional): Optional sharding constraint for the output. Defaults to None.
+            x: Channels-last input whose trailing axes match ``in_channels``.
+            out_sharding: Optional sharding constraint for the final output.
 
         Returns:
-            jax.Array: The result of the convolution.
+            The convolved array with trailing axes matching ``out_channels``.
+
+        Raises:
+            ValueError: If the input rank or channels are invalid, or if the
+                kernel and padding would produce an empty spatial output.
         """
-        expected_batched_rank = self.spatial_rank + 2
+        expected_batched_rank = (
+            self.spatial_rank
+            + len(self.in_channels)
+            + 1
+        )
         if x.ndim not in {expected_batched_rank - 1, expected_batched_rank}:
             raise ValueError(
                 f'expected an unbatched rank-{expected_batched_rank - 1} or '
                 f'batched rank-{expected_batched_rank} input, got rank {x.ndim}'
             )
-        if x.shape[-1] != self.in_channels:
+        if x.shape[-len(self.in_channels):] != self.in_channels:
             raise ValueError(
-                f'expected {self.in_channels} input channels, got {x.shape[-1]}'
+                f'expected trailing input channels {self.in_channels}, got '
+                f'{x.shape[-len(self.in_channels):]}'
             )
 
         unbatched = x.ndim == expected_batched_rank - 1
@@ -285,15 +487,55 @@ class Conv(Module):
             x = x[None, ...]
 
         padding = self.padding
-        if self.padding_mode != 'zeros':
-            pad_width = ((0, 0), *padding, (0, 0))
+        input_spatial_shape = x.shape[1:self.spatial_rank + 1]
+        explicit_padding = _canonical_padding(
+            padding,
+            input_spatial_shape,
+            self.kernel_size,
+            self.stride,
+            self.dilation,
+        )
+        try:
+            _window_output_shape(
+                input_spatial_shape,
+                self.kernel_size,
+                self.stride,
+                self.dilation,
+                explicit_padding,
+            )
+        except ValueError as error:
+            effective_kernel = tuple(
+                spacing * (size - 1) + 1
+                for size, spacing in zip(self.kernel_size, self.dilation)
+            )
+            raise ValueError(
+                f'input spatial shape {input_spatial_shape} is too small for '
+                f'effective kernel shape {effective_kernel} with padding '
+                f'{explicit_padding}'
+            ) from error
+
+        if self.pad_mode != 'zeros':
+            if isinstance(padding, str):
+                raise ValueError(
+                    'nonzero padding modes require explicit numeric padding'
+                )
+            pad_width = (
+                ((0, 0),)
+                + padding
+                + ((0, 0),) * len(self.in_channels)
+            )
             mode = {
                 'reflect': 'reflect',
                 'replicate': 'edge',
                 'circular': 'wrap',
-            }[self.padding_mode]
+            }[self.pad_mode]
             x = jnp.pad(x, pad_width, mode=mode)
             padding = 'VALID'
+
+        x = x.reshape(
+            *x.shape[:self.spatial_rank + 1],
+            self._in_channel_count,
+        )
 
         lhs_spec = (
             0,
@@ -310,101 +552,187 @@ class Conv(Module):
             rhs_spec,
             lhs_spec,
         )
-        output = jax.lax.conv_general_dilated(
+        kernel = self.kernel.value.reshape(
+            *self.kernel_size,
+            self._in_channel_count // self.groups,
+            self._out_channel_count,
+        )
+        conv_general_dilated = (
+            qwix.conv_general_dilated
+            if isinstance(kernel, qwix.QArray)
+            else self.dot_general or jax.lax.conv_general_dilated
+        )
+        output = conv_general_dilated(
             lhs=x,
-            rhs=self.weight.value,
+            rhs=kernel,
             window_strides=self.stride,
             padding=padding,
             rhs_dilation=self.dilation,
             dimension_numbers=dimension_numbers,
             feature_group_count=self.groups,
+            precision=self.precision,
+            preferred_element_type=self.preferred_element_type,
         )
-        if self.has_bias:
-            output = output + self.bias.value
+        output = output.reshape(*output.shape[:-1], *self.out_channels)
+        if self.bias is not None:
+            output = output + self.bias
         if unbatched:
             output = output[0]
+
         return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
+        inputs = '×'.join(map(str, self.in_channels))
+        outputs = '×'.join(map(str, self.out_channels))
+        kernel = '×'.join(map(str, self.kernel_size))
+        stride = '×'.join(map(str, self.stride))
+        quantized = isinstance(self.kernel.value, qwix.QArray)
+        quant = ' (Qwix PTQ)' if quantized else ''
         return (
-            f'{self.in_channels} -> {self.out_channels}, '
-            f'k={self.kernel_size}, s={self.stride}'
+            f'{inputs} ➤ {outputs}, k={kernel}, s={stride}{quant}'
         )
 
 class ConvTranspose(Module):
-    """
-    Applies a transposed convolution over an input signal.
+    """Applies an N-dimensional transposed convolution.
+
+    Inputs use the same channels-last layout as :class:`Conv`. An unbatched
+    input has shape ``[*spatial, *in_channels]`` and a batched input has shape
+    ``[batch, *spatial, *in_channels]``. Structured channel axes are flattened
+    only for the underlying convolution and restored in the output.
+
+    Numeric ``padding`` describes the padding of the corresponding forward
+    convolution. Increasing it crops more values from the transposed output.
+    For each spatial axis, the output size is
+
+    ``(input - 1) * stride - before - after + effective_kernel + output_padding``,
+
+    where ``effective_kernel = dilation * (kernel_size - 1) + 1``.
+    ``'VALID'`` produces the full transposed-convolution output. ``'SAME'`` and
+    ``'SAME_LOWER'`` produce ``input_size * stride`` positions and differ only
+    in which boundary receives an odd extra amount. String padding cannot be
+    combined with ``output_padding``.
+
+    When ``groups`` is greater than one, groups partition the first input and
+    output channel axes. Both first channel-axis sizes must be divisible by
+    ``groups``.
+
+    Args:
+        in_channels: Shape of the trailing input-channel axes.
+        out_channels: Shape of the trailing output-channel axes.
+        kernel_size: Size of the spatial convolution window.
+        stride: Factor by which each input position expands the spatial output.
+        padding: Forward-convolution padding to remove from the transposed
+            output. Accepts ``'VALID'``, ``'SAME'``, ``'SAME_LOWER'``, a
+            non-negative integer, one symmetric integer per spatial axis, or
+            one ``(before, after)`` pair per spatial axis. Defaults to ``0``.
+        dilation: Spacing between kernel elements.
+        groups: Number of independent channel groups.
+        output_padding: Additional size added to the end of each output spatial
+            axis. It resolves shape ambiguity when ``stride > 1`` and does not
+            pad the output with values. Each amount must be smaller than either
+            its stride or dilation. Defaults to ``0``.
+        bias: Whether to add a learnable output bias.
+        dtype: Data type passed to the parameter initializers.
+        rngs: Random number generator used to initialize parameters.
+        kernel_initializer: Function used to initialize the kernel.
+        bias_initializer: Function used to initialize the bias.
+        quant: Optional Qwix quantization configuration for the kernel.
+        dot_general: Optional replacement for ``conv_general_dilated``.
+        axis_names: Optional logical names for every kernel axis.
+        partition_spec: Optional partition specification for the kernel.
+        kernel_metadata: Optional metadata attached to the kernel parameter.
+        bias_metadata: Optional metadata attached to the bias parameter.
+        precision: Convolution precision forwarded to the convolution callable.
+        preferred_element_type: Preferred accumulation and result data type.
+
+    Attributes:
+        kernel: Learnable kernel with shape
+            ``(*kernel_size, *in_channels, *grouped_out_channels)``.
+        bias: Learnable bias with shape ``out_channels``, or ``None``.
+
+    Examples:
+        Upsample a one-dimensional input by a factor of two:
+
+        >>> import jax.numpy as jnp
+        >>> from taktiny import nn
+        >>> conv = nn.ConvTranspose(
+        ...     3, 4, kernel_size=3, stride=2, rngs=nn.Rngs(0)
+        ... )
+        >>> conv(jnp.ones((5, 3))).shape
+        (11, 4)
+
+        Structured channel shapes are preserved:
+
+        >>> conv = nn.ConvTranspose(
+        ...     (2, 3),
+        ...     (4, 5),
+        ...     kernel_size=(2, 2),
+        ...     stride=2,
+        ...     rngs=nn.Rngs(1),
+        ... )
+        >>> conv(jnp.ones((3, 3, 2, 3))).shape
+        (6, 6, 4, 5)
     """
 
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int | Sequence[int],
-        stride: int | Sequence[int] = 1,
-        padding: str | int | Sequence[int | tuple[int, int]] = 0,
-        output_padding: int | Sequence[int] = 0,
-        groups: int = 1,
-        dilation: int | Sequence[int] = 1,
-        padding_mode: str = 'zeros',
-        dtype: DType = jnp.float32,
+        in_channels: GenericShape,
+        out_channels: GenericShape,
+        kernel_size: GenericShape,
         *,
+        stride: GenericShape = 1,
+        padding: str | int | Sequence[int | tuple[int, int]] = 0,
+        dilation: GenericShape = 1,
+        groups: int = 1,
+        output_padding: GenericShape = 0,
         bias: bool = True,
+        dtype: DType | None = None,
         rngs: Rngs,
-        initializer: Initializer = default_conv_initializer,
-        bias_initializer: Initializer = zeros,
+        kernel_initializer: Initializer = default_kernel_initializer,
+        bias_initializer: Initializer = default_bias_initializer,
+        quant: QuantConfig = None,
+        dot_general: ConvGeneralDilated | None = None,
         axis_names: AxisNames | None = None,
+        partition_spec: PartitionSpec | None = None,
+        kernel_metadata: MetaData | None = None,
+        bias_metadata: MetaData | None = None,
+        precision: PrecisionLike = None,
+        preferred_element_type: DTypeLike | None = None,
     ) -> None:
-        """Initializes the ConvTranspose module.
+        in_channels = _normalize_shape(in_channels, 'in_channels')
+        out_channels = _normalize_shape(out_channels, 'out_channels')
 
-        Args:
-            in_channels (int): Number of channels in the input image.
-            out_channels (int): Number of channels produced by the convolution.
-            kernel_size (int | Sequence[int]): Size of the convolving kernel.
-            rngs (Rngs): PRNG key generator for parameter initialization.
-            stride (int | Sequence[int], optional): Stride of the convolution. Defaults to 1.
-            padding (str | int | Sequence[int | tuple[int, int]], optional): Padding added to all sides of the input. Defaults to 0.
-            output_padding (int | Sequence[int], optional): Additional size added to one side of each dimension in the output shape. Defaults to 0.
-            groups (int, optional): Number of blocked connections from input channels to output channels. Defaults to 1.
-            dilation (int | Sequence[int], optional): Spacing between kernel elements. Defaults to 1.
-            padding_mode (str, optional): Padding mode. Defaults to 'zeros'.
-            dtype (DType, optional): Data type of the parameters. Defaults to jnp.float32.
-            bias (bool, optional): If True, adds a learnable bias to the output. Defaults to True.
-            initializer (Initializer, optional): Initializer for the weights. Defaults to default_conv_initializer.
-            bias_initializer (Initializer, optional): Initializer for the bias. Defaults to zeros.
-            axis_names (AxisNames | None, optional): Logical axis names for sharding. Defaults to None.
-            shard_mode (optional): Sharding mode. Defaults to ShardMode.AUTO.
-        """
-        if not isinstance(in_channels, int) or in_channels <= 0:
-            raise ValueError('in_channels must be a positive integer')
-        if not isinstance(out_channels, int) or out_channels <= 0:
-            raise ValueError('out_channels must be a positive integer')
         if not isinstance(groups, int) or groups <= 0:
             raise ValueError('groups must be a positive integer')
-        if in_channels % groups != 0:
+
+        if in_channels[0] % groups != 0:
             raise ValueError(
-                f'in_channels ({in_channels}) must be divisible by groups '
-                f'({groups})'
+                f'in_channels[0] ({in_channels[0]}) must be divisible by '
+                f'groups ({groups})'
             )
-        if out_channels % groups != 0:
+
+        if out_channels[0] % groups != 0:
             raise ValueError(
-                f'out_channels ({out_channels}) must be divisible by groups '
-                f'({groups})'
+                f'out_channels[0] ({out_channels[0]}) must be divisible by '
+                f'groups ({groups})'
             )
-        if padding_mode != 'zeros':
-            raise ValueError("ConvTranspose supports only padding_mode='zeros'")
+
         kernel_size = Conv._normalize_spatial(kernel_size, name='kernel_size')
-        rank = len(kernel_size)
-        stride = Conv._normalize_spatial(stride, rank=rank, name='stride')
+        spatial_rank = len(kernel_size)
+        stride = Conv._normalize_spatial(
+            stride,
+            rank=spatial_rank,
+            name='stride',
+        )
         dilation = Conv._normalize_spatial(
             dilation,
-            rank=rank,
+            rank=spatial_rank,
             name='dilation',
         )
-        padding = Conv._normalize_padding(padding, rank)
+        padding = Conv._normalize_padding(padding, spatial_rank)
         output_padding = _normalize_nonnegative(
             output_padding,
-            rank,
+            spatial_rank,
             name='output_padding',
         )
         for index, (extra, step, spacing) in enumerate(
@@ -415,6 +743,7 @@ class ConvTranspose(Module):
                     f'output_padding[{index}] must be smaller than stride or '
                     'dilation'
                 )
+
         if isinstance(padding, str) and any(output_padding):
             raise ValueError(
                 'output_padding requires explicit numeric padding'
@@ -425,101 +754,250 @@ class ConvTranspose(Module):
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
-        self.output_padding = output_padding
-        self.groups = groups
-        self.has_bias = bias
         self.dilation = dilation
-        self.padding_mode = padding_mode
-        self.spatial_rank = rank
+        self.groups = groups
+        self.output_padding = output_padding
+        self.has_bias = bias
+        self.spatial_rank = spatial_rank
+        self.dot_general = dot_general
+        self.precision = precision
+        self.preferred_element_type = preferred_element_type
+        self._in_channel_count = math.prod(in_channels)
+        self._out_channel_count = math.prod(out_channels)
 
-        weight_shape = (
-            *kernel_size,
-            in_channels,
-            out_channels // groups,
+        grouped_out_channels = (
+            out_channels[0] // groups,
+            *out_channels[1:],
         )
-        self.weight = Parameter(
-            initializer(rngs(), weight_shape, dtype)
-        )
+        kernel_shape = kernel_size + in_channels + grouped_out_channels
         if axis_names is not None:
-            if len(axis_names) != len(weight_shape):
-                raise ValueError(
-                    f'axis_names length {len(axis_names)} must match '
-                    f'weight dimensions {len(weight_shape)}'
-                )
-            self.weight.axis_names = axis_names
+            axis_names = tuple(axis_names)
 
-        if bias:
-            self.bias = Parameter(
-                bias_initializer(rngs(), (out_channels,), dtype)
+        if axis_names is not None or partition_spec is not None:
+            kernel_initializer = with_logical_partitioning(
+                kernel_initializer,
+                axis_names,
+                partition_spec,
             )
+
+        kernel_array = kernel_initializer(rngs(), kernel_shape, dtype)
+        if quant is not None:
+            rule = resolve_quantization_rule(
+                quant,
+                '',
+                op_name='conv_general_dilated',
+            )
+            if rule is not None:
+                kernel_array = quantize_conv_weight(
+                    kernel_array,
+                    rule,
+                    output_axis_count=len(out_channels),
+                )
+
+        self.kernel = Parameter(
+            kernel_array,
+            axis_names=axis_names,
+            partition_spec=partition_spec,
+            metadata=kernel_metadata,
+        )
+
+        self.bias = None
+        if bias:
+            bias_axis_names = None
+            bias_partition_spec = None
             if axis_names is not None:
-                self.bias.axis_names = axis_names[-1:]
+                bias_axis_names = axis_names[-len(out_channels):]
+            if partition_spec is not None:
+                bias_partition_spec = PartitionSpec(
+                    *partition_spec[-len(out_channels):]
+                )
+            if bias_axis_names is not None or bias_partition_spec is not None:
+                bias_initializer = with_logical_partitioning(
+                    bias_initializer,
+                    bias_axis_names,
+                    bias_partition_spec,
+                )
+            self.bias = Parameter(
+                bias_initializer(rngs(), out_channels, dtype),
+                axis_names=bias_axis_names,
+                partition_spec=bias_partition_spec,
+                metadata=bias_metadata,
+            )
+
+    @staticmethod
+    def _transpose_padding(
+        kernel_size: tuple[int, ...],
+        stride: tuple[int, ...],
+        dilation: tuple[int, ...],
+        padding: str | tuple[tuple[int, int], ...],
+        output_padding: tuple[int, ...],
+    ) -> tuple[tuple[int, int], ...]:
+        """Converts forward padding into direct-convolution padding."""
+        pairs: list[tuple[int, int]] = []
+        for axis, (kernel, step, spacing, extra) in enumerate(
+            zip(kernel_size, stride, dilation, output_padding)
+        ):
+            effective_kernel = spacing * (kernel - 1) + 1
+            if isinstance(padding, str):
+                if padding in {'SAME', 'SAME_LOWER'}:
+                    total = effective_kernel + step - 2
+                    if step > effective_kernel - 1:
+                        low = effective_kernel - 1
+                    else:
+                        low = math.ceil(total / 2)
+                    high = total - low
+                    if padding == 'SAME_LOWER':
+                        low, high = high, low
+                else:
+                    total = (
+                        effective_kernel
+                        + step
+                        - 2
+                        + max(effective_kernel - step, 0)
+                    )
+                    low = effective_kernel - 1
+                    high = total - low
+            else:
+                forward_low, forward_high = padding[axis]
+                low = effective_kernel - 1 - forward_low
+                high = effective_kernel - 1 - forward_high + extra
+            pairs.append((low, high))
+
+        return tuple(pairs)
 
     def __call__(
         self,
         x: jax.Array,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
-        """Applies the transposed convolution operation.
+        """Applies the transposed convolution.
 
         Args:
-            x (jax.Array): The input array.
-            out_sharding (jax.sharding.Sharding | None, optional): Optional sharding constraint for the output. Defaults to None.
+            x: Channels-last input whose trailing axes match ``in_channels``.
+            out_sharding: Optional sharding constraint for the final output.
 
         Returns:
-            jax.Array: The result of the transposed convolution.
+            The transposed convolution with trailing axes matching
+            ``out_channels``.
+
+        Raises:
+            ValueError: If the input rank or channels are invalid, or if the
+                configuration would produce an empty spatial output.
         """
-        x, unbatched = _as_batched(
-            x,
-            self.spatial_rank,
-            channels=self.in_channels,
+        expected_batched_rank = (
+            self.spatial_rank
+            + len(self.in_channels)
+            + 1
         )
-        dimension_numbers = _conv_dimension_numbers(self.spatial_rank)
-        if isinstance(self.padding, str):
-            transpose_padding = self.padding
-        else:
-            transpose_padding = tuple(
-                (
-                    dilation * (kernel - 1) - low,
-                    dilation * (kernel - 1) - high + extra,
-                )
-                for kernel, dilation, (low, high), extra in zip(
-                    self.kernel_size,
-                    self.dilation,
-                    self.padding,
-                    self.output_padding,
-                )
+        if x.ndim not in {expected_batched_rank - 1, expected_batched_rank}:
+            raise ValueError(
+                f'expected an unbatched rank-{expected_batched_rank - 1} or '
+                f'batched rank-{expected_batched_rank} input, got rank {x.ndim}'
+            )
+        if x.shape[-len(self.in_channels):] != self.in_channels:
+            raise ValueError(
+                f'expected trailing input channels {self.in_channels}, got '
+                f'{x.shape[-len(self.in_channels):]}'
             )
 
-        inputs_per_group = self.in_channels // self.groups
-        outputs = []
+        unbatched = x.ndim == expected_batched_rank - 1
+        if unbatched:
+            x = x[None, ...]
+
+        transpose_padding = self._transpose_padding(
+            self.kernel_size,
+            self.stride,
+            self.dilation,
+            self.padding,
+            self.output_padding,
+        )
+        input_spatial_shape = x.shape[1:self.spatial_rank + 1]
+        effective_kernel = tuple(
+            spacing * (size - 1) + 1
+            for size, spacing in zip(self.kernel_size, self.dilation)
+        )
+        output_spatial_shape = tuple(
+            (size - 1) * step + low + high - kernel + 2
+            for size, step, kernel, (low, high) in zip(
+                input_spatial_shape,
+                self.stride,
+                effective_kernel,
+                transpose_padding,
+            )
+        )
+        if any(size <= 0 for size in output_spatial_shape):
+            raise ValueError(
+                f'input spatial shape {input_spatial_shape} and transpose '
+                f'padding {transpose_padding} produce empty output shape '
+                f'{output_spatial_shape}'
+            )
+
+        x = x.reshape(
+            *x.shape[:self.spatial_rank + 1],
+            self._in_channel_count,
+        )
+        dimension_numbers = _conv_dimension_numbers(self.spatial_rank)
+        kernel = self.kernel.value.reshape(
+            *self.kernel_size,
+            self._in_channel_count,
+            self._out_channel_count // self.groups,
+        )
+        inputs_per_group = self._in_channel_count // self.groups
+        reverse_slices = (
+            (slice(None, None, -1),) * self.spatial_rank
+            + (slice(None), slice(None))
+        )
+        outputs: list[jax.Array] = []
         for group in range(self.groups):
             start = group * inputs_per_group
             stop = start + inputs_per_group
-            kernel = jnp.flip(
-                self.weight.value[..., start:stop, :],
-                axis=tuple(range(self.spatial_rank)),
+            group_kernel = kernel[
+                (slice(None),) * self.spatial_rank
+                + (slice(start, stop), slice(None))
+            ]
+            group_kernel = group_kernel[reverse_slices]
+            conv_general_dilated = (
+                qwix.conv_general_dilated
+                if isinstance(group_kernel, qwix.QArray)
+                else self.dot_general or jax.lax.conv_general_dilated
             )
             outputs.append(
-                jax.lax.conv_transpose(
-                    x[..., start:stop],
-                    kernel,
-                    strides=self.stride,
+                conv_general_dilated(
+                    lhs=x[..., start:stop],
+                    rhs=group_kernel,
+                    window_strides=(1,) * self.spatial_rank,
                     padding=transpose_padding,
+                    lhs_dilation=self.stride,
                     rhs_dilation=self.dilation,
                     dimension_numbers=dimension_numbers,
+                    feature_group_count=1,
+                    precision=self.precision,
+                    preferred_element_type=self.preferred_element_type,
                 )
             )
         output = jnp.concatenate(outputs, axis=-1)
-        if self.has_bias:
-            output = output + self.bias.value
-        output = _restore_batch(output, unbatched)
+        output = output.reshape(*output.shape[:-1], *self.out_channels)
+        if self.bias is not None:
+            output = output + self.bias
+        if unbatched:
+            output = output[0]
         return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
+        inputs = '×'.join(map(str, self.in_channels))
+        outputs = '×'.join(map(str, self.out_channels))
+        kernel = '×'.join(map(str, self.kernel_size))
+        stride = '×'.join(map(str, self.stride))
+        quantized = isinstance(self.kernel.value, qwix.QArray)
+        quant = ' (Qwix PTQ)' if quantized else ''
+        custom_conv = (
+            ' (custom conv_general_dilated)'
+            if self.dot_general is not None
+            else ''
+        )
         return (
-            f'{self.in_channels} -> {self.out_channels}, '
-            f'k={self.kernel_size}, s={self.stride}'
+            f'{inputs} ➤ {outputs}, k={kernel}, s={stride}'
+            f'{quant}{custom_conv}'
         )
 
 class Unfold(Module):

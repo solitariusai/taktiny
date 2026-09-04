@@ -17,5 +17,7 @@ from taktiny.nn.modules.activation import *
 from taktiny.nn.modules.convolution import *
 from taktiny.nn.modules.embedding import *
 from taktiny.nn.modules.linear import *
-from taktiny.nn.modules.peft import *
 from taktiny.nn.modules.normalization import *
+from taktiny.nn.modules.peft import *
+from taktiny.nn.modules.recurrent import *
+from taktiny.nn.modules.transformer import *

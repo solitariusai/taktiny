@@ -11,67 +11,80 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Generic encoder-decoder transformer modules."""
+"""Generic encoder-decoder Transformer modules."""
 
 from __future__ import annotations
 
-import inspect
 import math
-from collections.abc import Mapping, Sequence
-from typing import Any, Callable
+from collections.abc import Callable, Mapping, Sequence
+from typing import cast
 
 import jax
 import jax.numpy as jnp
-from taktiny import nn
-from taktiny.nn.continuo import (
+from jax.lax import PrecisionLike
+from jax.nn import initializers
+from jax.sharding import PartitionSpec
+from jax.typing import DTypeLike
+
+from taktiny.nn.base import Module
+from taktiny.nn.block import List
+from taktiny.nn.modules.linear import Linear
+from taktiny.nn.modules.normalization import LayerNorm
+from taktiny.nn.regularization import Dropout
+from taktiny.nn.rng import Rngs
+from taktiny.nn.utils import (
     _constrain,
-    _resolve_activation,
     _validate_integer,
     _validate_probability,
 )
-
-from taktiny.nn.layers.attention import Attention
-from taktiny.nn.layers.ffn import FeedForward
-from taktiny.nn.utils import AxisName
 from taktiny.utils.typing import (
-    QuantConfig,
     Activation,
+    AxisNames,
+    DotGeneral,
     DType,
-    Sharding,
+    GenericShape,
+    Initializer,
+    MetaData,
+    QuantConfig,
 )
 
-ModuleSpec = nn.Module | type[nn.Module]
+type AxisNamesMap = Mapping[str, AxisNames]
+type PartitionSpecMap = Mapping[str, PartitionSpec]
+type AttentionContext = jax.Array | tuple[jax.Array, jax.Array]
+
+default_transformer_initializer = initializers.xavier_uniform()
+default_transformer_bias_initializer = initializers.zeros
 
 
-def _instantiate_module(
-    module: ModuleSpec,
-    *,
+def _mapping_value[T](
+    values: Mapping[str, T] | None,
     name: str,
-    options: dict[str, Any],
-) -> nn.Module:
-    if isinstance(module, nn.Module):
-        return module
-    if not isinstance(module, type) or not issubclass(module, nn.Module):
-        raise TypeError(f'{name} must be an nn.Module subclass or instance')
-    parameters = inspect.signature(module).parameters.values()
-    accepts_kwargs = any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters
-    )
-    if not accepts_kwargs:
-        accepted = {
-            parameter.name
-            for parameter in parameters
-            if parameter.kind
-            in {
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                inspect.Parameter.KEYWORD_ONLY,
-            }
+) -> T | None:
+    return None if values is None else values.get(name)
+
+
+def _resolve_activation(
+    activation: Activation
+) -> tuple[Callable[[jax.Array], jax.Array], str]:
+    if isinstance(activation, str):
+        name = activation.lower()
+        functions: dict[str, Callable[[jax.Array], jax.Array]] = {
+            'gelu': jax.nn.gelu,
+            'relu': jax.nn.relu,
+            'silu': jax.nn.silu,
         }
-        options = {
-            key: value for key, value in options.items() if key in accepted
-        }
-    return module(**options)
+        if name not in functions:
+            raise ValueError(
+                "activation must be 'relu', 'gelu', 'silu', or callable"
+            )
+        return functions[name], name
+
+    if not callable(activation):
+        raise TypeError('activation must be a string or callable')
+    function = cast(Callable[[jax.Array], jax.Array], activation)
+    name = str(getattr(function, '__name__', type(function).__name__))
+    return function, name
+
 
 def _normalize_input(
     value: jax.Array,
@@ -99,6 +112,29 @@ def _normalize_input(
         value = jnp.swapaxes(value, 0, 1)
     return value, unbatched
 
+
+def _normalize_batch_first_input(
+    value: jax.Array,
+    *,
+    name: str,
+    hidden_size: int,
+) -> tuple[jax.Array, bool]:
+    value = jnp.asarray(value)
+    if value.ndim not in {2, 3}:
+        raise ValueError(
+            f'{name} must have shape [sequence, hidden] or '
+            '[batch, sequence, hidden]'
+        )
+    if value.shape[-1] != hidden_size:
+        raise ValueError(
+            f'{name} trailing size must be {hidden_size}, got {value.shape[-1]}'
+        )
+    if not jnp.issubdtype(value.dtype, jnp.floating):
+        raise TypeError(f'{name} must have a floating-point dtype')
+    unbatched = value.ndim == 2
+    return (value[None, ...] if unbatched else value), unbatched
+
+
 def _normalize_attention_mask(
     mask: jax.Array | None,
     *,
@@ -113,9 +149,9 @@ def _normalize_attention_mask(
     if mask.dtype != jnp.bool_:
         raise TypeError(f'{name} must be a boolean array')
     if mask.shape == (query_length, key_length):
-        return mask[None, None, :, :]
-    if mask.shape == (batch_size, query_length, key_length):
-        return mask[:, None, :, :]
+        mask = mask[None, None, :, :]
+    elif mask.shape == (batch_size, query_length, key_length):
+        mask = mask[:, None, :, :]
     target_shape = (batch_size, 1, query_length, key_length)
     try:
         return jnp.broadcast_to(mask, target_shape)
@@ -123,6 +159,30 @@ def _normalize_attention_mask(
         raise ValueError(
             f'{name} with shape {mask.shape} cannot broadcast to {target_shape}'
         ) from error
+
+
+def _normalize_attention_bias(
+    bias: jax.Array | None,
+    *,
+    batch_size: int,
+    num_heads: int,
+    query_length: int,
+    key_length: int,
+) -> jax.Array | None:
+    if bias is None:
+        return None
+    bias = jnp.asarray(bias)
+    if not jnp.issubdtype(bias.dtype, jnp.floating):
+        raise TypeError('attention_bias must have a floating-point dtype')
+    target_shape = (batch_size, num_heads, query_length, key_length)
+    try:
+        return jnp.broadcast_to(bias, target_shape)
+    except ValueError as error:
+        raise ValueError(
+            f'attention_bias with shape {bias.shape} cannot broadcast to '
+            f'{target_shape}'
+        ) from error
+
 
 def _normalize_padding_mask(
     mask: jax.Array | None,
@@ -142,8 +202,9 @@ def _normalize_padding_mask(
         raise ValueError(
             f'{name} must have shape {(batch_size, key_length)}, got {mask.shape}'
         )
-    # Padding masks follow the common convention: True marks ignored tokens.
+    # Padding masks use the common convention where True means "ignore".
     return (~mask)[:, None, None, :]
+
 
 def _merge_masks(
     attention_mask: jax.Array | None,
@@ -174,846 +235,825 @@ def _merge_masks(
         return attention_mask
     return attention_mask & padding_mask
 
+
 def _apply_causal_mask(
     mask: jax.Array | None,
-    is_causal: bool | jax.Array,
+    is_causal: bool,
     *,
     query_length: int,
     key_length: int,
 ) -> jax.Array | None:
-    if isinstance(is_causal, bool) and not is_causal:
+    if not isinstance(is_causal, bool):
+        raise TypeError('is_causal must be a boolean')
+    if not is_causal:
         return mask
     query_positions = jnp.arange(query_length)[:, None]
     key_positions = jnp.arange(key_length)[None, :]
-    causal = key_positions <= query_positions
-    if not isinstance(is_causal, bool):
-        causal = jnp.where(jnp.asarray(is_causal), causal, True)
-    causal = causal[None, None, :, :]
+    causal = (key_positions <= query_positions)[None, None, :, :]
     return causal if mask is None else mask & causal
 
-def _attention_output(value: Any) -> jax.Array:
-    return value[0] if isinstance(value, tuple) else value
 
-class Attention(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        head_dim: int,
-        *,
-        num_kv_heads: int | None = None,
-        context_dim: int | None = None,
-        apply_position_fn: Callable | None = None,
-        bias: bool | list[bool] | tuple[bool] = False,
-        q_norm: bool | nn.Module = False,
-        k_norm: bool | nn.Module = False,
-        qk_norm: bool = False,
-        qk_norm_across_heads: bool | list[bool] | tuple[bool] = False,
-        epsilon: float = 1e-5,
-        window_size: int | None = None,
-        scaling: float | None = None,
-        softcap: float | None = None,
-        dropout: float = 0.0,
-        dtype: DType | None = None,
-        rngs: nn.Rngs,
-        quant: QuantConfig = None,
-        axis_names: AxisName | None = None,
-        dot_general: Any = None,
-    ) -> None:
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
-        if self.num_heads % self.num_kv_heads != 0:
-            raise ValueError(
-                'num_heads must be divisible by num_kv_heads, got '
-                f'{self.num_heads} and {self.num_kv_heads}'
-            )
-        self.context_dim = hidden_size if context_dim is None else context_dim
-        self.use_qk_norm = qk_norm
-        self.qk_norm_across_heads = qk_norm_across_heads
-        self.qk_norm_eps = epsilon
-        self.window_size = window_size
-        self.scaling = scaling
-        self.softcap = softcap
-        self.dropout = dropout
-
-        # For Grouped Query Attention (GQA)
-        self.num_kv_groups = self.num_heads // self.num_kv_heads
-
-        self.apply_position_fn = apply_position_fn
-        q_bias = k_bias = v_bias = o_bias = False
-        if isinstance(bias, (list, tuple)):
-            if len(bias) != 4:
-                raise ValueError('bias must contain q, k, v, and o values')
-            if not all(isinstance(value, bool) for value in bias):
-                raise TypeError('bias values must be booleans')
-            q_bias, k_bias, v_bias, o_bias = bias
-            bias = all(bias)
-        elif not isinstance(bias, bool):
-            raise TypeError('bias must be a boolean or four booleans')
-
-        q_proj_axis_names = None if axis_names is None else axis_names.get('q_proj')
-        k_proj_axis_names = None if axis_names is None else axis_names.get('k_proj')
-        v_proj_axis_names = None if axis_names is None else axis_names.get('v_proj')
-        o_proj_axis_names = None if axis_names is None else axis_names.get('o_proj')
-
-        self.q_proj = nn.Linear(
-            hidden_size, 
-            (self.num_heads, self.head_dim),
-            dtype=dtype, 
-            bias=q_bias or bias, 
-            rngs=rngs,
-            axis_names=q_proj_axis_names,
-            quant=quant, 
-            dot_general=dot_general
-        )
-        self.k_proj = nn.Linear(
-            self.context_dim, 
-            (self.num_kv_heads, self.head_dim),
-            dtype=dtype, 
-            bias=k_bias or bias, 
-            rngs=rngs, 
-            axis_names=k_proj_axis_names, 
-            quant=quant, 
-            dot_general=dot_general
-        )
-        self.v_proj = nn.Linear(
-            self.context_dim, 
-            (self.num_kv_heads, self.head_dim),
-            dtype=dtype, 
-            bias=v_bias or bias, 
-            rngs=rngs, 
-            axis_names=v_proj_axis_names, 
-            quant=quant, 
-            dot_general=dot_general
-        )
-        self.o_proj = nn.Linear(
-            (self.num_heads, self.head_dim), 
-            hidden_size,
-            dtype=dtype, 
-            bias=o_bias or bias, 
-            rngs=rngs, 
-            axis_names=o_proj_axis_names, 
-            quant=quant, 
-            dot_general=dot_general
-        )
-
-        self.q_norm = q_norm if isinstance(q_norm, nn.Module) else None
-        self.k_norm = k_norm if isinstance(k_norm, nn.Module) else None
-        q_norm_across_heads = k_norm_across_heads = False
-        if isinstance(qk_norm_across_heads, (list, tuple)):
-            if len(qk_norm_across_heads) != 2:
-                raise ValueError(
-                    'qk_norm_across_heads must contain q and k values'
-                )
-            if not all(
-                isinstance(value, bool) for value in qk_norm_across_heads
-            ):
-                raise TypeError('qk_norm_across_heads values must be booleans')
-            q_norm_across_heads = qk_norm_across_heads[0]
-            k_norm_across_heads = qk_norm_across_heads[1]
-        elif not isinstance(qk_norm_across_heads, bool):
-            raise TypeError(
-                'qk_norm_across_heads must be a boolean or two booleans'
-            )
-
-        if self.q_norm is None and (qk_norm or q_norm):
-            q_norm_shape = (
-                (self.num_heads, self.head_dim)
-                if q_norm_across_heads
-                else self.head_dim
-            )
-            q_norm_axis_names = (
-                q_proj_axis_names[1:]
-                if q_norm_across_heads and q_proj_axis_names is not None
-                else (
-                    q_proj_axis_names[-1:]
-                    if q_proj_axis_names is not None
-                    else None
-                )
-            )
-            self.q_norm = nn.RMSNorm(
-                q_norm_shape,
-                epsilon=epsilon,
-                dtype=dtype,
-                axis_names=q_norm_axis_names,
-                axes=(-2, -1) if q_norm_across_heads else -1,
-            )
-
-        if self.k_norm is None and (qk_norm or k_norm):
-            k_norm_shape = (
-                (self.num_kv_heads, self.head_dim)
-                if k_norm_across_heads
-                else self.head_dim
-            )
-            k_norm_axis_names = (
-                k_proj_axis_names[1:]
-                if k_norm_across_heads and k_proj_axis_names is not None
-                else (
-                    k_proj_axis_names[-1:]
-                    if k_proj_axis_names is not None
-                    else None
-                )
-            )
-            self.k_norm = nn.RMSNorm(
-                k_norm_shape,
-                epsilon=epsilon,
-                dtype=dtype,
-                axis_names=k_norm_axis_names,
-                axes=(-2, -1) if k_norm_across_heads else -1,
-            )
-
-    @staticmethod
-    def _validate_qkv(
-        query: jax.Array,
-        key: jax.Array,
-        value: jax.Array,
-    ) -> tuple[int, int, int, int, int, int]:
-        if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
-            raise ValueError(
-                'Attention kernels expect query, key, and value in '
-                '[batch, sequence, heads, head_dim] layout'
-            )
-
-        batch_size, query_length, query_heads, head_dim = query.shape
-        key_batch, key_length, key_heads, key_head_dim = key.shape
-        if value.shape[:3] != (key_batch, key_length, key_heads):
-            raise ValueError(
-                'key and value must have matching batch, sequence, and head '
-                f'dimensions, got {key.shape} and {value.shape}'
-            )
-        if batch_size != key_batch or head_dim != key_head_dim:
-            raise ValueError(
-                'query and key must have matching batch and head dimensions, '
-                f'got {query.shape} and {key.shape}'
-            )
-        if query_heads % key_heads != 0:
-            raise ValueError(
-                'query heads must be divisible by key/value heads, got '
-                f'{query_heads} and {key_heads}'
-            )
-        return (
-            batch_size,
-            query_length,
-            key_length,
-            query_heads,
-            key_heads,
-            head_dim,
-        )
-
-    @classmethod
-    def apply(
-        cls,
-        query: jax.Array,
-        key: jax.Array,
-        value: jax.Array,
-        kernel: str = 'dot_product',
-        mask: jax.Array | tp.Callable[..., jax.Array] | None = None,
-        bias: jax.Array | None = None,
-        scale: float | None = None,
-        is_causal: bool = False,
-        boundary_ids: jax.Array | None = None,
-        query_offset: int | jax.Array = 0,
-        respect_boundaries: bool = True,
-        **kwargs: tp.Any,
-    ) -> jax.Array:
-        """Use JAX dot-product attention unless another kernel is selected."""
-        if not isinstance(kernel, str):
-            raise TypeError(
-                f'kernel must be a string, got {type(kernel).__name__}'
-            )
-        kernel = kernel.lower()
-        if kernel in ("ragged", "ragged_attention", "splash", "splash_attention", "ring", "ring_attention"):
-            import warnings
-            warnings.warn(f'{kernel} is unsupported right now fallback to `flash_attention`')
-            kernel = 'flash'
-
-        if kernel in ('flash', 'flash_attention'):
-            if bias is not None:
-                raise ValueError(
-                    'boundary FlashAttention does not support additive bias'
-                )
-            return cls.apply_flash_attention(
-                query,
-                key,
-                value,
-                boundary_ids=boundary_ids,
-                mask=mask,
-                scale=scale,
-                is_causal=is_causal,
-                query_offset=query_offset,
-                respect_boundaries=respect_boundaries,
-                **kwargs,
-            )
-
-        if boundary_ids is not None or callable(mask):
-            from taktiny.cosette.kernels.attention.flash_attention import (
-                materialize_attention_mask,
-            )
-
-            mask = materialize_attention_mask(
-                mask,
-                batch_size=query.shape[0],
-                num_heads=query.shape[2],
-                query_length=query.shape[1],
-                key_length=key.shape[1],
-                boundary_ids=boundary_ids,
-                is_causal=is_causal,
-                query_offset=query_offset,
-                respect_boundaries=respect_boundaries,
-            )
-            is_causal = False
-
-        if kernel in ('dot_product', 'standard'):
-            return jax.nn.dot_product_attention(
-                query=query,
-                key=key,
-                value=value,
-                bias=bias,
-                mask=mask,
-                scale=scale,
-                is_causal=is_causal,
-                **kwargs,
-            )
-
-        raise ValueError(
-            f"Unknown attention kernel method: '{kernel}'. "
-            "Choose 'dot_product' or 'flash'."
-        )
-
-    def __call__(
-        self,
-        x: jax.Array,
-        context: jax.Array | tp.Tuple[jax.Array, jax.Array] | None = None,
-        attention_mask: jax.Array | tp.Callable[..., jax.Array] | None = None,
-        is_causal: bool = False,
-        kv_cache: tuple[jax.Array, jax.Array] | None = None,
-        position_ids: jax.Array | None = None,
-        cache_position: jax.Array | None = None,
-        position_embedding: jax.Array | None = None,
-        boundary_ids: jax.Array | None = None,
-        use_sliding_window: bool | jax.Array = False,
-        kernel: str = "dot_product",
-        out_sharding: jax.sharding.Sharding | None = None,
-    ) -> jax.Array | tuple[jax.Array, tuple[jax.Array, jax.Array]]:
-        
-        context_in = context if context is not None else x
-
-        q = self.q_proj(x)
-        k = self.k_proj(
-            context_in[0] if isinstance(context_in, tuple) else context_in
-        )
-        v = self.v_proj(
-            context_in[1] if isinstance(context_in, tuple) else context_in
-        )
-
-        if self.q_norm is not None:
-            q = self.q_norm(q)
-        if self.k_norm is not None:
-            k = self.k_norm(k)
-
-        # Apply Positional Embeddings (if provided)
-        if self.apply_position_fn is not None:
-            q, k = self.apply_position_fn(q, k, position_embedding)
-
-        normalized_cache_position = None
-        if kv_cache is not None:
-            k_cache, v_cache = kv_cache
-            if k_cache.ndim != k.ndim or v_cache.ndim != v.ndim:
-                raise ValueError(
-                    'KV caches and projected updates must have equal ranks'
-                )
-            if k_cache.shape[0] != k.shape[0] or k_cache.shape[2:] != k.shape[2:]:
-                raise ValueError(
-                    'key cache shape must match key updates except for the '
-                    f'sequence axis, got {k_cache.shape} and {k.shape}'
-                )
-            if v_cache.shape[0] != v.shape[0] or v_cache.shape[2:] != v.shape[2:]:
-                raise ValueError(
-                    'value cache shape must match value updates except for the '
-                    f'sequence axis, got {v_cache.shape} and {v.shape}'
-                )
-
-            if cache_position is None:
-                if position_ids is None:
-                    raise ValueError(
-                        'cache_position or position_ids is required with a KV cache'
-                    )
-                cache_position = position_ids
-
-            normalized_cache_position = jnp.asarray(
-                cache_position,
-                dtype=jnp.int32,
-            )
-            expected_shape = (k.shape[0], k.shape[1])
-            if normalized_cache_position.shape != expected_shape:
-                raise ValueError(
-                    'cache_position must have shape [batch, sequence], got '
-                    f'{normalized_cache_position.shape}; expected {expected_shape}'
-                )
-
-            def update_cache_row(
-                cache_row: jax.Array,
-                update_row: jax.Array,
-                row_positions: jax.Array,
-            ) -> jax.Array:
-                return cache_row.at[row_positions].set(update_row)
-
-            k_cache = jax.vmap(update_cache_row)(
-                k_cache,
-                k,
-                normalized_cache_position,
-            )
-            v_cache = jax.vmap(update_cache_row)(
-                v_cache,
-                v,
-                normalized_cache_position,
-            )
-            k = k_cache
-            v = v_cache
-
-        # Sliding Window / Causal Masking
-        if is_causal or self.window_size is not None:
-            if self.window_size is not None:
-                q_len = q.shape[1]
-                k_len = k.shape[1]
-
-                if position_ids is not None:
-                    query_positions = jnp.asarray(position_ids, dtype=jnp.int32)
-                elif normalized_cache_position is not None:
-                    query_positions = normalized_cache_position
-                else:
-                    query_positions = jnp.broadcast_to(
-                        jnp.arange(q_len, dtype=jnp.int32)[None, :],
-                        (q.shape[0], q_len),
-                    )
-                if query_positions.shape != (q.shape[0], q_len):
-                    raise ValueError(
-                        'position_ids must have shape [batch, sequence], got '
-                        f'{query_positions.shape}'
-                    )
-
-                # Cached keys use absolute positions from the start of the
-                # sequence. Uncached keys belong to the same local chunk as Q.
-                if kv_cache is not None:
-                    key_positions = jnp.arange(k_len, dtype=jnp.int32)
-                else:
-                    key_positions = query_positions
-
-                if key_positions.ndim == 1:
-                    key_positions = key_positions[None, :]
-                causal_mask = (
-                    key_positions[:, None, :]
-                    <= query_positions[:, :, None]
-                )
-                window_mask = key_positions[:, None, :] >= (
-                    query_positions[:, :, None]
-                    - self.window_size
-                    + 1
-                )
-                causal_mask = causal_mask[:, None, :, :]
-                window_mask = window_mask[:, None, :, :]
-                sliding_mask = causal_mask & window_mask
-
-                if isinstance(use_sliding_window, bool):
-                    if use_sliding_window:
-                        effective_mask = sliding_mask
-                    elif is_causal:
-                        effective_mask = causal_mask
-                    else:
-                        effective_mask = jnp.ones_like(causal_mask)
-                else:
-                    fallback_mask = (
-                        causal_mask
-                        if is_causal
-                        else jnp.ones_like(causal_mask)
-                    )
-                    effective_mask = jnp.where(
-                        jnp.asarray(use_sliding_window, dtype=jnp.bool_),
-                        sliding_mask,
-                        fallback_mask,
-                    )
-
-                if attention_mask is not None:
-                    attention_mask = attention_mask & effective_mask # pyright: ignore[reportOperatorIssue]
-                else:
-                    attention_mask = effective_mask
-
-                # The absolute-position mask handles causality itself.
-                is_causal = False
-
-        kernel_name = kernel.lower() if isinstance(kernel, str) else kernel
-        is_boundary_flash = kernel_name in {'flash', 'flash_attention'}
-        if (
-            kv_cache is not None
-            and is_causal
-            and not is_boundary_flash
-            and self.window_size is None
-        ):
-            key_positions = jnp.arange(k.shape[1], dtype=jnp.int32)
-            causal_mask = (
-                key_positions[None, None, None, :]
-                <= normalized_cache_position[:, None, :, None] # pyright: ignore[reportOptionalSubscript]
-            )
-            if attention_mask is None:
-                attention_mask = causal_mask
-            elif callable(attention_mask):
-                raise ValueError(
-                    'callable attention masks cannot be combined with cached '
-                    'JAX causal attention'
-                )
-            else:
-                attention_mask = (
-                    jnp.asarray(attention_mask, dtype=jnp.bool_) & causal_mask
-                )
-            is_causal = False
-
-        attention_bias = None
-        if self.softcap is not None and not is_boundary_flash:
-            scale = (
-                self.scaling
-                if self.scaling is not None
-                else self.head_dim ** -0.5
-            )
-            batch_size, query_length, _, _ = q.shape
-            key_length = k.shape[1]
-            grouped_q = q.reshape(
-                batch_size,
-                query_length,
-                self.num_kv_heads,
-                self.num_kv_groups,
-                self.head_dim,
-            )
-            scores = jnp.einsum(
-                'btkgh,bskh->bkgts',
-                grouped_q,
-                k,
-            ) * scale
-            capped_scores = self.softcap * jnp.tanh(scores / self.softcap)
-            attention_bias = (capped_scores - scores).reshape(
-                batch_size,
-                self.num_heads,
-                query_length,
-                key_length,
-            )
-
-        # Apply either JAX dot-product or boundary FlashAttention.
-        query_offset: int | jax.Array = 0
-        if normalized_cache_position is not None:
-            query_offset = normalized_cache_position[:, 0]
-
-        kernel_kwargs: dict[str, tp.Any] = {}
-        if is_boundary_flash and self.softcap is not None:
-            kernel_kwargs['cap'] = self.softcap
-
-        out = self.apply(
-            query=q,
-            key=k,
-            value=v,
-            kernel=kernel,
-            bias=attention_bias,
-            mask=attention_mask,
-            scale=self.scaling,
-            is_causal=is_causal,
-            boundary_ids=boundary_ids,
-            query_offset=query_offset,
-            **kernel_kwargs,
-        )
-
-        # Output projection from (Batch, SeqLen, Heads, HeadDim) directly to (Batch, SeqLen, HiddenSize)
-        out = self.o_proj(out, out_sharding=out_sharding)
-
-        if kv_cache is not None:
-            return out, (k_cache, v_cache) # pyright: ignore[reportPossiblyUnboundVariable]
-
-        return out, None # pyright: ignore[reportReturnType]
+def _parse_projection_bias(
+    bias: bool | Sequence[bool],
+) -> tuple[bool, bool, bool, bool]:
+    if isinstance(bias, bool):
+        return (bias, bias, bias, bias)
+    values = tuple(bias)
+    if len(values) != 4 or not all(isinstance(value, bool) for value in values):
+        raise ValueError('bias must be a boolean or four q, k, v, o booleans')
+    return values
 
 
-class TransformerEncoderLayer(nn.Module):
-    """A self-attention and feed-forward transformer encoder block."""
+def _new_linear(
+    in_features: GenericShape,
+    out_features: GenericShape,
+    *,
+    bias: bool,
+    dtype: DType | None,
+    rngs: Rngs,
+    kernel_initializer: Initializer,
+    bias_initializer: Initializer,
+    quant: QuantConfig,
+    dot_general: DotGeneral | None,
+    axis_names: AxisNames | None,
+    partition_spec: PartitionSpec | None,
+    kernel_metadata: MetaData | None,
+    bias_metadata: MetaData | None,
+    precision: PrecisionLike,
+    preferred_element_type: DTypeLike | None,
+) -> Linear:
+    return Linear(
+        in_features,
+        out_features,
+        bias=bias,
+        dtype=dtype,
+        rngs=rngs,
+        kernel_initializer=kernel_initializer,
+        bias_initializer=bias_initializer,
+        quant=quant,
+        dot_general=dot_general,
+        axis_names=axis_names,
+        partition_spec=partition_spec,
+        kernel_metadata=kernel_metadata,
+        bias_metadata=bias_metadata,
+        precision=precision,
+        preferred_element_type=preferred_element_type,
+    )
 
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        intermediate_size: int,
-        *,
-        dropout: float,
-        activation: Activation,
-        norm_first: bool,
-        norm_eps: float,
-        bias: bool,
-        dtype: DType,
-        rngs: nn.Rngs,
-        quant: QuantConfig,
-        dot_general: Any,
-    ) -> None:
-        head_dim = hidden_size // num_heads
-        self.self_attention = Attention(
-            hidden_size,
-            num_heads,
-            head_dim,
-            bias=bias,
-            dtype=dtype,
-            rngs=rngs,
-            axis_names=AxisName.set_axis_names(
-                q_proj=('embed', 'heads', 'head_dim'),
-                k_proj=('embed', 'heads', 'head_dim'),
-                v_proj=('embed', 'heads', 'head_dim'),
-                o_proj=('heads', 'head_dim', 'embed'),
-            ),
-            quant=quant,
-            dot_general=dot_general,
-        )
-        self.feed_forward = FeedForward(
-            hidden_size,
-            intermediate_size,
-            activation=activation,
-            dropout=dropout,
-            bias=bias,
-            dtype=dtype,
-            rngs=rngs,
-            axis_names=AxisName.set_axis_names(
-                input=('embed', 'mlp'),
-                output=('mlp', 'embed'),
-            ),
-            quant=quant,
-            dot_general=dot_general,
-        )
-        self.norm1 = nn.LayerNorm(
-            hidden_size,
-            eps=norm_eps,
-            dtype=dtype,
-            bias=bias,
-            axis_names=('embed',),
-        )
-        self.norm2 = nn.LayerNorm(
-            hidden_size,
-            eps=norm_eps,
-            dtype=dtype,
-            bias=bias,
-            axis_names=('embed',),
-        )
-        self.attention_dropout = nn.Dropout(
-            dropout,
-            rngs=rngs,
-        )
-        self.output_dropout = nn.Dropout(
-            dropout,
-            rngs=rngs,
-        )
-        self.norm_first = norm_first
-        self.dropout = dropout
 
-    def __call__(
-        self,
-        x: jax.Array,
-        *,
-        mask: jax.Array | None,
-        is_causal: bool,
-        out_sharding: jax.sharding.Sharding | None,
-    ) -> jax.Array:
-        mask = _apply_causal_mask(
-            mask,
-            is_causal,
-            query_length=x.shape[1],
-            key_length=x.shape[1],
-        )
+class Attention(Module):
+    r"""Apply scaled dot-product multi-head attention.
 
-        attention_input = self.norm1(x) if self.norm_first else x
-        attention = _attention_output(
-            self.self_attention(
-                attention_input,
-                attention_mask=mask,
-                is_causal=False,
-                out_sharding=out_sharding,
-            )
-        )
-        x = x + self.attention_dropout(
-            attention,
-        )
-        if not self.norm_first:
-            x = self.norm1(x, out_sharding=out_sharding)
+    Query, key, and value projections split ``hidden_size`` into
+    ``num_heads`` heads. Attention is computed as
+    ``softmax(Q K^T / sqrt(head_dim)) V`` and projected back to
+    ``hidden_size``. Passing ``context`` enables cross-attention; otherwise
+    the module performs self-attention. Boolean masks use JAX semantics:
+    ``True`` permits a query-key pair and ``False`` blocks it.
 
-        feed_input = self.norm2(x) if self.norm_first else x
-        feed = self.feed_forward(
-            feed_input,
-            out_sharding=out_sharding,
-        )
-        x = x + self.output_dropout(
-            feed,
-            out_sharding=out_sharding,
-        )
-        if not self.norm_first:
-            x = self.norm2(x, out_sharding=out_sharding)
-        return x
+    ``axis_names`` and ``partition_spec`` are optional mappings with
+    ``q_proj``, ``k_proj``, ``v_proj``, and ``o_proj`` keys.
 
-class TransformerDecoderLayer(nn.Module):
-    """A transformer decoder block with optional cross-attention memory."""
+    Example:
+        >>> import jax.numpy as jnp
+        >>> from taktiny import nn
+        >>> attention = nn.Attention(8, 2, rngs=nn.Rngs(0), dropout=0.0)
+        >>> attention(jnp.ones((3, 5, 8))).shape
+        (3, 5, 8)
 
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        intermediate_size: int,
-        *,
-        dropout: float,
-        activation: Activation,
-        norm_first: bool,
-        norm_eps: float,
-        bias: bool,
-        dtype: DType,
-        rngs: nn.Rngs,
-        quant: QuantConfig,
-        dot_general: Any,
-    ) -> None:
-        head_dim = hidden_size // num_heads
-        attention_options = {
-            'hidden_size': hidden_size,
-            'num_heads': num_heads,
-            'head_dim': head_dim,
-            'bias': bias,
-            'dtype': dtype,
-            'rngs': rngs,
-            'axis_names': AxisName.set_axis_names(
-                q_proj=('embed', 'heads', 'head_dim'),
-                k_proj=('embed', 'heads', 'head_dim'),
-                v_proj=('embed', 'heads', 'head_dim'),
-                o_proj=('heads', 'head_dim', 'embed'),
-            ),
-            'shard_mode': shard_mode,
-            'quant': quant,
-            'dot_general': dot_general,
-        }
-        self.self_attention = Attention(**attention_options)
-        self.cross_attention = Attention(**attention_options)
-        self.feed_forward = FeedForward(
-            hidden_size,
-            intermediate_size,
-            activation=activation,
-            dropout=dropout,
-            bias=bias,
-            dtype=dtype,
-            rngs=rngs,
-            axis_names=AxisName.set_axis_names(
-                input=('embed', 'mlp'),
-                output=('mlp', 'embed'),
-            ),
-            quant=quant,
-            dot_general=dot_general,
-        )
-        norm_options = {
-            'eps': norm_eps,
-            'dtype': dtype,
-            'bias': bias,
-            'axis_names': ('embed',),
-            'shard_mode': shard_mode,
-        }
-        self.norm1 = nn.LayerNorm(hidden_size, **norm_options)
-        self.norm2 = nn.LayerNorm(hidden_size, **norm_options)
-        self.norm3 = nn.LayerNorm(hidden_size, **norm_options)
-        self.self_attention_dropout = nn.Dropout(
-            dropout,
-            rngs=rngs,
-        )
-        self.cross_attention_dropout = nn.Dropout(
-            dropout,
-            rngs=rngs,
-        )
-        self.output_dropout = nn.Dropout(
-            dropout,
-            rngs=rngs,
-        )
-        self.norm_first = norm_first
-        self.dropout = dropout
-
-    def __call__(
-        self,
-        x: jax.Array,
-        memory: jax.Array | None,
-        *,
-        self_mask: jax.Array | None,
-        memory_mask: jax.Array | None,
-        self_is_causal: bool,
-        memory_is_causal: bool,
-        out_sharding: jax.sharding.Sharding | None,
-    ) -> jax.Array:
-        self_mask = _apply_causal_mask(
-            self_mask,
-            self_is_causal,
-            query_length=x.shape[1],
-            key_length=x.shape[1],
-        )
-        if memory is not None:
-            memory_mask = _apply_causal_mask(
-                memory_mask,
-                memory_is_causal,
-                query_length=x.shape[1],
-                key_length=memory.shape[1],
-            )
-
-        attention_input = self.norm1(x) if self.norm_first else x
-        self_attention = _attention_output(
-            self.self_attention(
-                attention_input,
-                attention_mask=self_mask,
-                is_causal=False,
-                out_sharding=out_sharding,
-            )
-        )
-        x = x + self.self_attention_dropout(
-            self_attention,
-        )
-        if not self.norm_first:
-            x = self.norm1(x, out_sharding=out_sharding)
-
-        if memory is not None:
-            cross_input = self.norm2(x) if self.norm_first else x
-            cross_attention = _attention_output(
-                self.cross_attention(
-                    cross_input,
-                    context=memory,
-                    attention_mask=memory_mask,
-                    is_causal=False,
-                    out_sharding=out_sharding,
-                )
-            )
-            x = x + self.cross_attention_dropout(
-                cross_attention,
-            )
-            if not self.norm_first:
-                x = self.norm2(x, out_sharding=out_sharding)
-
-        feed_input = self.norm3(x) if self.norm_first else x
-        feed = self.feed_forward(
-            feed_input,
-            out_sharding=out_sharding,
-        )
-        x = x + self.output_dropout(
-            feed,
-            out_sharding=out_sharding,
-        )
-        if not self.norm_first:
-            x = self.norm3(x, out_sharding=out_sharding)
-        return x
-
-class TransformerEncoder(nn.Module):
-    """Apply encoder layers to batch-first hidden states.
-
-    Each supplied layer must follow ``TransformerEncoderLayer.__call__``.
+    Reference:
+        Ashish Vaswani et al., "Attention Is All You Need" (2017),
+        https://arxiv.org/abs/1706.03762
     """
 
     def __init__(
         self,
-        layers: Sequence[nn.Module],
-        norm: nn.Module | None = None,
+        hidden_size: int,
+        num_heads: int,
+        head_dim: int | None = None,
+        *,
+        context_dim: int | None = None,
+        dropout: float = 0.0,
+        scaling: float | None = None,
+        bias: bool | Sequence[bool] = True,
+        dtype: DType | None = None,
+        rngs: Rngs,
+        kernel_initializer: Initializer = default_transformer_initializer,
+        bias_initializer: Initializer = default_transformer_bias_initializer,
+        quant: QuantConfig = None,
+        dot_general: DotGeneral | None = None,
+        axis_names: AxisNamesMap | None = None,
+        partition_spec: PartitionSpecMap | None = None,
+        kernel_metadata: MetaData | None = None,
+        bias_metadata: MetaData | None = None,
+        precision: PrecisionLike = None,
+        preferred_element_type: DTypeLike | None = None,
+    ) -> None:
+        self.hidden_size = _validate_integer(hidden_size, 'hidden_size')
+        self.num_heads = _validate_integer(num_heads, 'num_heads')
+        if head_dim is None:
+            if hidden_size % num_heads:
+                raise ValueError('hidden_size must be divisible by num_heads')
+            head_dim = hidden_size // num_heads
+        self.head_dim = _validate_integer(head_dim, 'head_dim')
+        if self.num_heads * self.head_dim != self.hidden_size:
+            raise ValueError('num_heads * head_dim must equal hidden_size')
+        self.context_dim = (
+            hidden_size
+            if context_dim is None
+            else _validate_integer(context_dim, 'context_dim')
+        )
+        self.dropout = _validate_probability(
+            dropout,
+            'dropout',
+            allow_one=False,
+        )
+        if scaling is not None and (
+            isinstance(scaling, bool)
+            or not isinstance(scaling, (int, float))
+            or not math.isfinite(scaling)
+            or scaling <= 0
+        ):
+            raise ValueError('scaling must be finite and positive')
+        self.scaling = (
+            float(scaling) if scaling is not None else self.head_dim**-0.5
+        )
+        q_bias, k_bias, v_bias, o_bias = _parse_projection_bias(bias)
+
+        self.q_proj = _new_linear(
+            hidden_size,
+            (num_heads, self.head_dim),
+            bias=q_bias,
+            dtype=dtype,
+            rngs=rngs,
+            kernel_initializer=kernel_initializer,
+            bias_initializer=bias_initializer,
+            quant=quant,
+            dot_general=dot_general,
+            axis_names=_mapping_value(axis_names, 'q_proj'),
+            partition_spec=_mapping_value(partition_spec, 'q_proj'),
+            kernel_metadata=kernel_metadata,
+            bias_metadata=bias_metadata,
+            precision=precision,
+            preferred_element_type=preferred_element_type,
+        )
+        self.k_proj = _new_linear(
+            self.context_dim,
+            (num_heads, self.head_dim),
+            bias=k_bias,
+            dtype=dtype,
+            rngs=rngs,
+            kernel_initializer=kernel_initializer,
+            bias_initializer=bias_initializer,
+            quant=quant,
+            dot_general=dot_general,
+            axis_names=_mapping_value(axis_names, 'k_proj'),
+            partition_spec=_mapping_value(partition_spec, 'k_proj'),
+            kernel_metadata=kernel_metadata,
+            bias_metadata=bias_metadata,
+            precision=precision,
+            preferred_element_type=preferred_element_type,
+        )
+        self.v_proj = _new_linear(
+            self.context_dim,
+            (num_heads, self.head_dim),
+            bias=v_bias,
+            dtype=dtype,
+            rngs=rngs,
+            kernel_initializer=kernel_initializer,
+            bias_initializer=bias_initializer,
+            quant=quant,
+            dot_general=dot_general,
+            axis_names=_mapping_value(axis_names, 'v_proj'),
+            partition_spec=_mapping_value(partition_spec, 'v_proj'),
+            kernel_metadata=kernel_metadata,
+            bias_metadata=bias_metadata,
+            precision=precision,
+            preferred_element_type=preferred_element_type,
+        )
+        self.o_proj = _new_linear(
+            (num_heads, self.head_dim),
+            hidden_size,
+            bias=o_bias,
+            dtype=dtype,
+            rngs=rngs,
+            kernel_initializer=kernel_initializer,
+            bias_initializer=bias_initializer,
+            quant=quant,
+            dot_general=dot_general,
+            axis_names=_mapping_value(axis_names, 'o_proj'),
+            partition_spec=_mapping_value(partition_spec, 'o_proj'),
+            kernel_metadata=kernel_metadata,
+            bias_metadata=bias_metadata,
+            precision=precision,
+            preferred_element_type=preferred_element_type,
+        )
+        self.attention_dropout = Dropout(self.dropout, rngs=rngs)
+        self.precision = precision
+        self.preferred_element_type = preferred_element_type
+
+    def __call__(
+        self,
+        x: jax.Array,
+        context: AttentionContext | None = None,
+        attention_mask: jax.Array | None = None,
+        attention_bias: jax.Array | None = None,
+        is_causal: bool = False,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array:
+        """Apply self-attention or cross-attention to batch-first inputs."""
+        query_input, unbatched = _normalize_batch_first_input(
+            x,
+            name='x',
+            hidden_size=self.hidden_size,
+        )
+        key_unbatched = unbatched
+        value_unbatched = unbatched
+        if context is None:
+            key_input = value_input = query_input
+        elif isinstance(context, tuple):
+            key_input, key_unbatched = _normalize_batch_first_input(
+                context[0],
+                name='context key',
+                hidden_size=self.context_dim,
+            )
+            value_input, value_unbatched = _normalize_batch_first_input(
+                context[1],
+                name='context value',
+                hidden_size=self.context_dim,
+            )
+        else:
+            key_input, key_unbatched = _normalize_batch_first_input(
+                context,
+                name='context',
+                hidden_size=self.context_dim,
+            )
+            value_input = key_input
+            value_unbatched = key_unbatched
+
+        if key_unbatched != value_unbatched:
+            raise ValueError('context key and value must use the same batching')
+        if unbatched != key_unbatched:
+            raise ValueError('x and context must both be batched or unbatched')
+        if query_input.shape[0] != key_input.shape[0]:
+            raise ValueError('x and context batch sizes must match')
+        if key_input.shape[:2] != value_input.shape[:2]:
+            raise ValueError('context key and value leading shapes must match')
+
+        query = self.q_proj(query_input)
+        key = self.k_proj(key_input)
+        value = self.v_proj(value_input)
+        batch_size, query_length = query.shape[:2]
+        key_length = key.shape[1]
+        mask = _normalize_attention_mask(
+            attention_mask,
+            batch_size=batch_size,
+            query_length=query_length,
+            key_length=key_length,
+            name='attention_mask',
+        )
+        mask = _apply_causal_mask(
+            mask,
+            is_causal,
+            query_length=query_length,
+            key_length=key_length,
+        )
+        normalized_bias = _normalize_attention_bias(
+            attention_bias,
+            batch_size=batch_size,
+            num_heads=self.num_heads,
+            query_length=query_length,
+            key_length=key_length,
+        )
+
+        scores = jnp.einsum(
+            'bqhd,bkhd->bhqk',
+            query,
+            key,
+            precision=self.precision,
+            preferred_element_type=self.preferred_element_type,
+        ) * self.scaling
+        if normalized_bias is not None:
+            scores += normalized_bias
+        if mask is None:
+            weights = jax.nn.softmax(scores, axis=-1)
+        else:
+            scores = jnp.where(mask, scores, jnp.finfo(scores.dtype).min)
+            weights = jax.nn.softmax(scores, axis=-1)
+            weights = jnp.where(mask, weights, 0)
+        weights = self.attention_dropout(weights)
+        output = jnp.einsum(
+            'bhqk,bkhd->bqhd',
+            weights,
+            value,
+            precision=self.precision,
+            preferred_element_type=self.preferred_element_type,
+        )
+        output = self.o_proj(output, out_sharding=out_sharding)
+        return output[0] if unbatched else output
+
+    def extra_repr(self) -> str:
+        context = (
+            ''
+            if self.context_dim == self.hidden_size
+            else f', context={self.context_dim}'
+        )
+        return (
+            f'{self.hidden_size} ➤ {self.num_heads}×{self.head_dim}'
+            f'{context}, dropout={self.dropout:g}'
+        )
+
+
+class FeedForward(Module):
+    """Apply the Transformer's position-wise feed-forward network.
+
+    Every sequence position is transformed independently by
+    ``Linear(hidden, intermediate)``, an activation, dropout, and
+    ``Linear(intermediate, hidden)``.
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>> from taktiny import nn
+        >>> feed_forward = nn.FeedForward(8, 32, rngs=nn.Rngs(0), dropout=0.0)
+        >>> feed_forward(jnp.ones((2, 5, 8))).shape
+        (2, 5, 8)
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        *,
+        activation: Activation = 'relu',
+        dropout: float = 0.0,
+        bias: bool = True,
+        dtype: DType | None = None,
+        rngs: Rngs,
+        kernel_initializer: Initializer = default_transformer_initializer,
+        bias_initializer: Initializer = default_transformer_bias_initializer,
+        quant: QuantConfig = None,
+        dot_general: DotGeneral | None = None,
+        axis_names: AxisNamesMap | None = None,
+        partition_spec: PartitionSpecMap | None = None,
+        kernel_metadata: MetaData | None = None,
+        bias_metadata: MetaData | None = None,
+        precision: PrecisionLike = None,
+        preferred_element_type: DTypeLike | None = None,
+    ) -> None:
+        self.hidden_size = _validate_integer(hidden_size, 'hidden_size')
+        self.intermediate_size = _validate_integer(
+            intermediate_size,
+            'intermediate_size',
+        )
+        self.activation, self.activation_name = _resolve_activation(activation)
+        self.dropout = _validate_probability(
+            dropout,
+            'dropout',
+            allow_one=False,
+        )
+        self.input = _new_linear(
+            hidden_size,
+            intermediate_size,
+            bias=bias,
+            dtype=dtype,
+            rngs=rngs,
+            kernel_initializer=kernel_initializer,
+            bias_initializer=bias_initializer,
+            quant=quant,
+            dot_general=dot_general,
+            axis_names=_mapping_value(axis_names, 'input'),
+            partition_spec=_mapping_value(partition_spec, 'input'),
+            kernel_metadata=kernel_metadata,
+            bias_metadata=bias_metadata,
+            precision=precision,
+            preferred_element_type=preferred_element_type,
+        )
+        self.output = _new_linear(
+            intermediate_size,
+            hidden_size,
+            bias=bias,
+            dtype=dtype,
+            rngs=rngs,
+            kernel_initializer=kernel_initializer,
+            bias_initializer=bias_initializer,
+            quant=quant,
+            dot_general=dot_general,
+            axis_names=_mapping_value(axis_names, 'output'),
+            partition_spec=_mapping_value(partition_spec, 'output'),
+            kernel_metadata=kernel_metadata,
+            bias_metadata=bias_metadata,
+            precision=precision,
+            preferred_element_type=preferred_element_type,
+        )
+        self.activation_dropout = Dropout(self.dropout, rngs=rngs)
+
+    def __call__(
+        self,
+        x: jax.Array,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array:
+        hidden = self.activation(self.input(x))
+        hidden = self.activation_dropout(hidden)
+        return self.output(hidden, out_sharding=out_sharding)
+
+    def extra_repr(self) -> str:
+        return (
+            f'{self.hidden_size} ➤ {self.intermediate_size} ➤ '
+            f'{self.hidden_size}, activation={self.activation_name}, '
+            f'dropout={self.dropout:g}'
+        )
+
+
+class TransformerEncoderLayer(Module):
+    """Apply one Transformer encoder layer.
+
+    The original post-normalization order is used by default. Set
+    ``norm_first=True`` for the common pre-normalization variant.
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>> from taktiny import nn
+        >>> layer = nn.TransformerEncoderLayer(8, 2, 32, rngs=nn.Rngs(0), dropout=0.0)
+        >>> layer(jnp.ones((2, 5, 8))).shape
+        (2, 5, 8)
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        intermediate_size: int,
+        *,
+        dropout: float = 0.1,
+        activation: Activation = 'relu',
+        norm_first: bool = False,
+        norm_eps: float = 1e-5,
+        bias: bool = True,
+        dtype: DType | None = None,
+        rngs: Rngs,
+        kernel_initializer: Initializer = default_transformer_initializer,
+        bias_initializer: Initializer = default_transformer_bias_initializer,
+        quant: QuantConfig = None,
+        dot_general: DotGeneral | None = None,
+        axis_names: AxisNamesMap | None = None,
+        partition_spec: PartitionSpecMap | None = None,
+        kernel_metadata: MetaData | None = None,
+        bias_metadata: MetaData | None = None,
+        precision: PrecisionLike = None,
+        preferred_element_type: DTypeLike | None = None,
+    ) -> None:
+        self.hidden_size = _validate_integer(hidden_size, 'hidden_size')
+        self.num_heads = _validate_integer(num_heads, 'num_heads')
+        self.intermediate_size = _validate_integer(
+            intermediate_size,
+            'intermediate_size',
+        )
+        if hidden_size % num_heads:
+            raise ValueError('hidden_size must be divisible by num_heads')
+        if not isinstance(norm_first, bool):
+            raise TypeError('norm_first must be a boolean')
+        self.norm_first = norm_first
+        self.dropout = _validate_probability(
+            dropout,
+            'dropout',
+            allow_one=False,
+        )
+        self.self_attention = Attention(
+            hidden_size,
+            num_heads,
+            dropout=self.dropout,
+            bias=bias,
+            dtype=dtype,
+            rngs=rngs,
+            kernel_initializer=kernel_initializer,
+            bias_initializer=bias_initializer,
+            quant=quant,
+            dot_general=dot_general,
+            axis_names=axis_names,
+            partition_spec=partition_spec,
+            kernel_metadata=kernel_metadata,
+            bias_metadata=bias_metadata,
+            precision=precision,
+            preferred_element_type=preferred_element_type,
+        )
+        self.feed_forward = FeedForward(
+            hidden_size,
+            intermediate_size,
+            activation=activation,
+            dropout=self.dropout,
+            bias=bias,
+            dtype=dtype,
+            rngs=rngs,
+            kernel_initializer=kernel_initializer,
+            bias_initializer=bias_initializer,
+            quant=quant,
+            dot_general=dot_general,
+            axis_names=axis_names,
+            partition_spec=partition_spec,
+            kernel_metadata=kernel_metadata,
+            bias_metadata=bias_metadata,
+            precision=precision,
+            preferred_element_type=preferred_element_type,
+        )
+        norm_axis_names = _mapping_value(axis_names, 'norm')
+        norm_partition_spec = _mapping_value(partition_spec, 'norm')
+        self.norm1 = LayerNorm(
+            hidden_size,
+            epsilon=norm_eps,
+            bias=bias,
+            dtype=dtype,
+            rngs=rngs,
+            axis_names=norm_axis_names,
+            partition_spec=norm_partition_spec,
+        )
+        self.norm2 = LayerNorm(
+            hidden_size,
+            epsilon=norm_eps,
+            bias=bias,
+            dtype=dtype,
+            rngs=rngs,
+            axis_names=norm_axis_names,
+            partition_spec=norm_partition_spec,
+        )
+        self.attention_dropout = Dropout(self.dropout, rngs=rngs)
+        self.output_dropout = Dropout(self.dropout, rngs=rngs)
+
+    def __call__(
+        self,
+        x: jax.Array,
+        mask: jax.Array | None = None,
+        is_causal: bool = False,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array:
+        x, unbatched = _normalize_batch_first_input(
+            x,
+            name='x',
+            hidden_size=self.hidden_size,
+        )
+        if self.norm_first:
+            attention = self.self_attention(
+                self.norm1(x),
+                attention_mask=mask,
+                is_causal=is_causal,
+            )
+            x = x + self.attention_dropout(attention)
+            feed = self.feed_forward(self.norm2(x))
+            x = x + self.output_dropout(feed)
+        else:
+            attention = self.self_attention(
+                x,
+                attention_mask=mask,
+                is_causal=is_causal,
+            )
+            x = self.norm1(x + self.attention_dropout(attention))
+            feed = self.feed_forward(x)
+            x = self.norm2(x + self.output_dropout(feed))
+        x = _constrain(x, out_sharding)
+        return x[0] if unbatched else x
+
+    def extra_repr(self) -> str:
+        return (
+            f'{self.hidden_size}, heads={self.num_heads}, '
+            f'intermediate={self.intermediate_size}, '
+            f'norm_first={self.norm_first}'
+        )
+
+
+class TransformerDecoderLayer(Module):
+    """Apply one Transformer decoder layer.
+
+    The layer contains masked self-attention, encoder-decoder cross-attention,
+    and a position-wise feed-forward network. ``memory=None`` skips the
+    cross-attention branch, allowing decoder-only use.
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>> from taktiny import nn
+        >>> layer = nn.TransformerDecoderLayer(8, 2, 32, rngs=nn.Rngs(0), dropout=0.0)
+        >>> layer(jnp.ones((2, 4, 8)), jnp.ones((2, 6, 8)), self_is_causal=True).shape
+        (2, 4, 8)
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        intermediate_size: int,
+        *,
+        dropout: float = 0.1,
+        activation: Activation = 'relu',
+        norm_first: bool = False,
+        norm_eps: float = 1e-5,
+        bias: bool = True,
+        dtype: DType | None = None,
+        rngs: Rngs,
+        kernel_initializer: Initializer = default_transformer_initializer,
+        bias_initializer: Initializer = default_transformer_bias_initializer,
+        quant: QuantConfig = None,
+        dot_general: DotGeneral | None = None,
+        axis_names: AxisNamesMap | None = None,
+        partition_spec: PartitionSpecMap | None = None,
+        kernel_metadata: MetaData | None = None,
+        bias_metadata: MetaData | None = None,
+        precision: PrecisionLike = None,
+        preferred_element_type: DTypeLike | None = None,
+    ) -> None:
+        self.hidden_size = _validate_integer(hidden_size, 'hidden_size')
+        self.num_heads = _validate_integer(num_heads, 'num_heads')
+        self.intermediate_size = _validate_integer(
+            intermediate_size,
+            'intermediate_size',
+        )
+        if hidden_size % num_heads:
+            raise ValueError('hidden_size must be divisible by num_heads')
+        if not isinstance(norm_first, bool):
+            raise TypeError('norm_first must be a boolean')
+        self.norm_first = norm_first
+        self.dropout = _validate_probability(
+            dropout,
+            'dropout',
+            allow_one=False,
+        )
+        self.self_attention = Attention(
+            hidden_size,
+            num_heads,
+            dropout=self.dropout,
+            bias=bias,
+            dtype=dtype,
+            rngs=rngs,
+            kernel_initializer=kernel_initializer,
+            bias_initializer=bias_initializer,
+            quant=quant,
+            dot_general=dot_general,
+            axis_names=axis_names,
+            partition_spec=partition_spec,
+            kernel_metadata=kernel_metadata,
+            bias_metadata=bias_metadata,
+            precision=precision,
+            preferred_element_type=preferred_element_type,
+        )
+        self.cross_attention = Attention(
+            hidden_size,
+            num_heads,
+            dropout=self.dropout,
+            bias=bias,
+            dtype=dtype,
+            rngs=rngs,
+            kernel_initializer=kernel_initializer,
+            bias_initializer=bias_initializer,
+            quant=quant,
+            dot_general=dot_general,
+            axis_names=axis_names,
+            partition_spec=partition_spec,
+            kernel_metadata=kernel_metadata,
+            bias_metadata=bias_metadata,
+            precision=precision,
+            preferred_element_type=preferred_element_type,
+        )
+        self.feed_forward = FeedForward(
+            hidden_size,
+            intermediate_size,
+            activation=activation,
+            dropout=self.dropout,
+            bias=bias,
+            dtype=dtype,
+            rngs=rngs,
+            kernel_initializer=kernel_initializer,
+            bias_initializer=bias_initializer,
+            quant=quant,
+            dot_general=dot_general,
+            axis_names=axis_names,
+            partition_spec=partition_spec,
+            kernel_metadata=kernel_metadata,
+            bias_metadata=bias_metadata,
+            precision=precision,
+            preferred_element_type=preferred_element_type,
+        )
+        norm_axis_names = _mapping_value(axis_names, 'norm')
+        norm_partition_spec = _mapping_value(partition_spec, 'norm')
+        self.norm1 = LayerNorm(
+            hidden_size,
+            epsilon=norm_eps,
+            bias=bias,
+            dtype=dtype,
+            rngs=rngs,
+            axis_names=norm_axis_names,
+            partition_spec=norm_partition_spec,
+        )
+        self.norm2 = LayerNorm(
+            hidden_size,
+            epsilon=norm_eps,
+            bias=bias,
+            dtype=dtype,
+            rngs=rngs,
+            axis_names=norm_axis_names,
+            partition_spec=norm_partition_spec,
+        )
+        self.norm3 = LayerNorm(
+            hidden_size,
+            epsilon=norm_eps,
+            bias=bias,
+            dtype=dtype,
+            rngs=rngs,
+            axis_names=norm_axis_names,
+            partition_spec=norm_partition_spec,
+        )
+        self.self_attention_dropout = Dropout(self.dropout, rngs=rngs)
+        self.cross_attention_dropout = Dropout(self.dropout, rngs=rngs)
+        self.output_dropout = Dropout(self.dropout, rngs=rngs)
+
+    def __call__(
+        self,
+        x: jax.Array,
+        memory: jax.Array | None = None,
+        self_mask: jax.Array | None = None,
+        memory_mask: jax.Array | None = None,
+        self_is_causal: bool = False,
+        memory_is_causal: bool = False,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array:
+        x, unbatched = _normalize_batch_first_input(
+            x,
+            name='x',
+            hidden_size=self.hidden_size,
+        )
+        if memory is not None:
+            memory, memory_unbatched = _normalize_batch_first_input(
+                memory,
+                name='memory',
+                hidden_size=self.hidden_size,
+            )
+            if memory_unbatched != unbatched:
+                raise ValueError('x and memory must both be batched or unbatched')
+            if x.shape[0] != memory.shape[0]:
+                raise ValueError('x and memory batch sizes must match')
+        elif memory_mask is not None:
+            raise ValueError('memory_mask requires memory')
+
+        if self.norm_first:
+            self_attention = self.self_attention(
+                self.norm1(x),
+                attention_mask=self_mask,
+                is_causal=self_is_causal,
+            )
+            x = x + self.self_attention_dropout(self_attention)
+            if memory is not None:
+                cross_attention = self.cross_attention(
+                    self.norm2(x),
+                    context=memory,
+                    attention_mask=memory_mask,
+                    is_causal=memory_is_causal,
+                )
+                x = x + self.cross_attention_dropout(cross_attention)
+            feed = self.feed_forward(self.norm3(x))
+            x = x + self.output_dropout(feed)
+        else:
+            self_attention = self.self_attention(
+                x,
+                attention_mask=self_mask,
+                is_causal=self_is_causal,
+            )
+            x = self.norm1(x + self.self_attention_dropout(self_attention))
+            if memory is not None:
+                cross_attention = self.cross_attention(
+                    x,
+                    context=memory,
+                    attention_mask=memory_mask,
+                    is_causal=memory_is_causal,
+                )
+                x = self.norm2(
+                    x + self.cross_attention_dropout(cross_attention)
+                )
+            feed = self.feed_forward(x)
+            x = self.norm3(x + self.output_dropout(feed))
+        x = _constrain(x, out_sharding)
+        return x[0] if unbatched else x
+
+    def extra_repr(self) -> str:
+        return (
+            f'{self.hidden_size}, heads={self.num_heads}, '
+            f'intermediate={self.intermediate_size}, '
+            f'norm_first={self.norm_first}'
+        )
+
+
+class TransformerEncoder(Module):
+    """Apply a stack of Transformer encoder layers to batch-first inputs."""
+
+    def __init__(
+        self,
+        layers: Sequence[Module],
+        norm: Module | None = None,
     ) -> None:
         if not layers:
             raise ValueError('layers must contain at least one encoder layer')
-        self.layers = nn.List(layers)
-        if norm is not None and not isinstance(norm, nn.Module):
-            raise TypeError('norm must be an nn.Module or None')
+        if norm is not None and not isinstance(norm, Module):
+            raise TypeError('norm must be a Module or None')
+        self.layers = List(layers)
         self.norm = norm
 
     def __len__(self) -> int:
@@ -1027,44 +1067,35 @@ class TransformerEncoder(nn.Module):
         *,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
-        mask = _apply_causal_mask(
-            mask,
-            is_causal,
-            query_length=source.shape[1],
-            key_length=source.shape[1],
-        )
         output = source
         for layer in self.layers:
             output = layer(
                 output,
                 mask=mask,
-                is_causal=False,
+                is_causal=is_causal,
                 out_sharding=out_sharding,
             )
         if self.norm is not None:
-            output = self.norm(output)
+            output = self.norm(output, out_sharding=out_sharding)
         return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         return f'layers={len(self.layers)}'
 
-class TransformerDecoder(nn.Module):
-    """Apply decoder layers to batch-first hidden states.
 
-    Each supplied layer must follow ``TransformerDecoderLayer.__call__``.
-    Passing ``memory=None`` omits every cross-attention branch.
-    """
+class TransformerDecoder(Module):
+    """Apply a stack of Transformer decoder layers to batch-first inputs."""
 
     def __init__(
         self,
-        layers: Sequence[nn.Module],
-        norm: nn.Module | None = None,
+        layers: Sequence[Module],
+        norm: Module | None = None,
     ) -> None:
         if not layers:
             raise ValueError('layers must contain at least one decoder layer')
-        self.layers = nn.List(layers)
-        if norm is not None and not isinstance(norm, nn.Module):
-            raise TypeError('norm must be an nn.Module or None')
+        if norm is not None and not isinstance(norm, Module):
+            raise TypeError('norm must be a Module or None')
+        self.layers = List(layers)
         self.norm = norm
 
     def __len__(self) -> int:
@@ -1081,19 +1112,6 @@ class TransformerDecoder(nn.Module):
         *,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
-        target_mask = _apply_causal_mask(
-            target_mask,
-            target_is_causal,
-            query_length=target.shape[1],
-            key_length=target.shape[1],
-        )
-        if memory is not None:
-            memory_mask = _apply_causal_mask(
-                memory_mask,
-                memory_is_causal,
-                query_length=target.shape[1],
-                key_length=memory.shape[1],
-            )
         output = target
         for layer in self.layers:
             output = layer(
@@ -1101,28 +1119,59 @@ class TransformerDecoder(nn.Module):
                 memory,
                 self_mask=target_mask,
                 memory_mask=memory_mask,
-                self_is_causal=False,
-                memory_is_causal=False,
+                self_is_causal=target_is_causal,
+                memory_is_causal=memory_is_causal,
                 out_sharding=out_sharding,
             )
         if self.norm is not None:
-            output = self.norm(output)
+            output = self.norm(output, out_sharding=out_sharding)
         return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         return f'layers={len(self.layers)}'
 
-class Transformer(nn.Module):
-    """
-    Apply a conventional encoder-decoder transformer.
 
-    Inputs contain precomputed embeddings; positional information must be
-    added by the caller. Attention masks use JAX semantics where ``True``
-    permits attention. Key-padding masks use the common inverse convention
-    where ``True`` marks a token that must be ignored. Passing ``target=None``
-    runs only the encoder; passing ``source=None`` runs only the decoder.
-    Custom components must follow the public ``TransformerEncoder`` and
-    ``TransformerDecoder`` call contracts.
+class Transformer(Module):
+    """Apply the encoder-decoder architecture from Attention Is All You Need.
+
+    Inputs are embedded hidden states; token embeddings and positional
+    encodings remain the caller's responsibility. By default, unbatched inputs
+    use ``[sequence, hidden]`` and batched inputs use
+    ``[sequence, batch, hidden]``. Set ``batch_first=True`` for
+    ``[batch, sequence, hidden]``.
+
+    Attention masks are boolean arrays where ``True`` permits attention.
+    Key-padding masks use the inverse convention where ``True`` marks an
+    ignored key position. The target is causal by default, matching the
+    autoregressive decoder in the original paper.
+
+    With the original ``norm_first=False`` layout, normalization occurs only
+    after each residual sublayer and no extra stack-final norm is created.
+    The ``norm_first=True`` variant adds a final norm after each complete
+    encoder or decoder stack.
+
+    ``axis_names`` and ``partition_spec`` accept ``q_proj``, ``k_proj``,
+    ``v_proj``, ``o_proj``, ``input``, ``output``, and ``norm`` keys.
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>> from taktiny import nn
+        >>> model = nn.Transformer(
+        ...     hidden_size=8,
+        ...     num_heads=2,
+        ...     num_encoder_layers=1,
+        ...     num_decoder_layers=1,
+        ...     intermediate_size=32,
+        ...     dropout=0.0,
+        ...     batch_first=True,
+        ...     rngs=nn.Rngs(0),
+        ... )
+        >>> model(jnp.ones((2, 5, 8)), jnp.ones((2, 3, 8))).shape
+        (2, 3, 8)
+
+    Reference:
+        Ashish Vaswani et al., "Attention Is All You Need" (2017),
+        https://arxiv.org/abs/1706.03762
     """
 
     def __init__(
@@ -1139,12 +1188,20 @@ class Transformer(nn.Module):
         batch_first: bool = False,
         norm_first: bool = False,
         bias: bool = True,
-        custom_encoder: nn.Module | None = None,
-        custom_decoder: nn.Module | None = None,
-        dtype: DType = jnp.float32,
-        rngs: nn.Rngs,
+        custom_encoder: Module | None = None,
+        custom_decoder: Module | None = None,
+        dtype: DType | None = None,
+        rngs: Rngs,
+        kernel_initializer: Initializer = default_transformer_initializer,
+        bias_initializer: Initializer = default_transformer_bias_initializer,
         quant: QuantConfig = None,
-        dot_general: Any = None,
+        dot_general: DotGeneral | None = None,
+        axis_names: AxisNamesMap | None = None,
+        partition_spec: PartitionSpecMap | None = None,
+        kernel_metadata: MetaData | None = None,
+        bias_metadata: MetaData | None = None,
+        precision: PrecisionLike = None,
+        preferred_element_type: DTypeLike | None = None,
     ) -> None:
         self.hidden_size = _validate_integer(hidden_size, 'hidden_size')
         self.num_heads = _validate_integer(num_heads, 'num_heads')
@@ -1166,71 +1223,112 @@ class Transformer(nn.Module):
             raise TypeError('batch_first must be a boolean')
         if not isinstance(norm_first, bool):
             raise TypeError('norm_first must be a boolean')
-        if custom_encoder is not None and not isinstance(custom_encoder, nn.Module):
-            raise TypeError('custom_encoder must be an nn.Module or None')
-        if custom_decoder is not None and not isinstance(custom_decoder, nn.Module):
-            raise TypeError('custom_decoder must be an nn.Module or None')
-        # Validate the activation before creating any parameters.
-        activation_function = _resolve_activation(activation)
-        self.activation_name = getattr(
-            activation_function,
-            '__name__',
-            type(activation_function).__name__,
+        if custom_encoder is not None and not isinstance(custom_encoder, Module):
+            raise TypeError('custom_encoder must be a Module or None')
+        if custom_decoder is not None and not isinstance(custom_decoder, Module):
+            raise TypeError('custom_decoder must be a Module or None')
+        _, self.activation_name = _resolve_activation(activation)
+        self.dropout = _validate_probability(
+            dropout,
+            'dropout',
+            allow_one=False,
         )
-        self.dropout = _validate_probability(dropout, 'dropout')
         self.batch_first = batch_first
         self.norm_first = norm_first
 
-        layer_options = {
-            'hidden_size': hidden_size,
-            'num_heads': num_heads,
-            'intermediate_size': intermediate_size,
-            'dropout': self.dropout,
-            'activation': activation,
-            'norm_first': norm_first,
-            'norm_eps': norm_eps,
-            'bias': bias,
-            'dtype': dtype,
-            'rngs': rngs,
-            'shard_mode': shard_mode,
-            'quant': quant,
-            'dot_general': dot_general,
-        }
+        norm_axis_names = _mapping_value(axis_names, 'norm')
+        norm_partition_spec = _mapping_value(partition_spec, 'norm')
         if custom_encoder is None:
-            encoder_norm = nn.LayerNorm(
-                hidden_size,
-                eps=norm_eps,
-                dtype=dtype,
-                bias=bias,
-                axis_names=('embed',),
+            encoder_norm = (
+                LayerNorm(
+                    hidden_size,
+                    epsilon=norm_eps,
+                    bias=bias,
+                    dtype=dtype,
+                    rngs=rngs,
+                    axis_names=norm_axis_names,
+                    partition_spec=norm_partition_spec,
+                )
+                if norm_first
+                else None
             )
-            self.encoder = TransformerEncoder(
+            encoder: Module = TransformerEncoder(
                 [
-                    TransformerEncoderLayer(**layer_options)
+                    TransformerEncoderLayer(
+                        hidden_size,
+                        num_heads,
+                        intermediate_size,
+                        dropout=self.dropout,
+                        activation=activation,
+                        norm_first=norm_first,
+                        norm_eps=norm_eps,
+                        bias=bias,
+                        dtype=dtype,
+                        rngs=rngs,
+                        kernel_initializer=kernel_initializer,
+                        bias_initializer=bias_initializer,
+                        quant=quant,
+                        dot_general=dot_general,
+                        axis_names=axis_names,
+                        partition_spec=partition_spec,
+                        kernel_metadata=kernel_metadata,
+                        bias_metadata=bias_metadata,
+                        precision=precision,
+                        preferred_element_type=preferred_element_type,
+                    )
                     for _ in range(num_encoder_layers)
                 ],
                 encoder_norm,
             )
         else:
-            self.encoder = custom_encoder
+            encoder = custom_encoder
+        self.encoder = encoder
 
         if custom_decoder is None:
-            decoder_norm = nn.LayerNorm(
-                hidden_size,
-                eps=norm_eps,
-                dtype=dtype,
-                bias=bias,
-                axis_names=('embed',),
+            decoder_norm = (
+                LayerNorm(
+                    hidden_size,
+                    epsilon=norm_eps,
+                    bias=bias,
+                    dtype=dtype,
+                    rngs=rngs,
+                    axis_names=norm_axis_names,
+                    partition_spec=norm_partition_spec,
+                )
+                if norm_first
+                else None
             )
-            self.decoder = TransformerDecoder(
+            decoder: Module = TransformerDecoder(
                 [
-                    TransformerDecoderLayer(**layer_options)
+                    TransformerDecoderLayer(
+                        hidden_size,
+                        num_heads,
+                        intermediate_size,
+                        dropout=self.dropout,
+                        activation=activation,
+                        norm_first=norm_first,
+                        norm_eps=norm_eps,
+                        bias=bias,
+                        dtype=dtype,
+                        rngs=rngs,
+                        kernel_initializer=kernel_initializer,
+                        bias_initializer=bias_initializer,
+                        quant=quant,
+                        dot_general=dot_general,
+                        axis_names=axis_names,
+                        partition_spec=partition_spec,
+                        kernel_metadata=kernel_metadata,
+                        bias_metadata=bias_metadata,
+                        precision=precision,
+                        preferred_element_type=preferred_element_type,
+                    )
                     for _ in range(num_decoder_layers)
                 ],
                 decoder_norm,
             )
         else:
-            self.decoder = custom_decoder
+            decoder = custom_decoder
+        self.decoder = decoder
 
     def __call__(
         self,
@@ -1243,7 +1341,7 @@ class Transformer(nn.Module):
         target_key_padding_mask: jax.Array | None = None,
         memory_key_padding_mask: jax.Array | None = None,
         source_is_causal: bool = False,
-        target_is_causal: bool = False,
+        target_is_causal: bool = True,
         memory_is_causal: bool = False,
         *,
         out_sharding: jax.sharding.Sharding | None = None,
@@ -1251,7 +1349,7 @@ class Transformer(nn.Module):
         if source is None and target is None:
             raise ValueError('source and target cannot both be None')
 
-        source_unbatched = None
+        source_unbatched: bool | None = None
         if source is not None:
             source, source_unbatched = _normalize_input(
                 source,
@@ -1262,7 +1360,7 @@ class Transformer(nn.Module):
         elif source_mask is not None or source_key_padding_mask is not None:
             raise ValueError('source masks require a source input')
 
-        target_unbatched = None
+        target_unbatched: bool | None = None
         if target is not None:
             target, target_unbatched = _normalize_input(
                 target,
@@ -1283,12 +1381,11 @@ class Transformer(nn.Module):
 
         if source is not None and target is not None:
             if source_unbatched != target_unbatched:
-                raise ValueError(
-                    'source and target must both be batched or unbatched'
-                )
+                raise ValueError('source and target must use the same batching')
             if source.shape[0] != target.shape[0]:
                 raise ValueError('source and target batch sizes must match')
-        memory = None
+
+        memory: jax.Array | None = None
         if source is not None:
             batch_size, source_length = source.shape[:2]
             source_attention_mask = _merge_masks(
@@ -1300,20 +1397,15 @@ class Transformer(nn.Module):
                 attention_name='source_mask',
                 padding_name='source_key_padding_mask',
             )
-            source_attention_mask = _apply_causal_mask(
-                source_attention_mask,
-                source_is_causal,
-                query_length=source_length,
-                key_length=source_length,
-            )
             memory = self.encoder(
                 source,
                 mask=source_attention_mask,
-                is_causal=False,
-                out_sharding=None,
+                is_causal=source_is_causal,
             )
 
         if target is None:
+            if memory is None:
+                raise RuntimeError('encoder did not produce an output')
             output = memory
             unbatched = source_unbatched
         else:
@@ -1327,13 +1419,6 @@ class Transformer(nn.Module):
                 attention_name='target_mask',
                 padding_name='target_key_padding_mask',
             )
-            target_attention_mask = _apply_causal_mask(
-                target_attention_mask,
-                target_is_causal,
-                query_length=target_length,
-                key_length=target_length,
-            )
-
             memory_attention_mask = None
             if memory is not None:
                 source_length = memory.shape[1]
@@ -1346,23 +1431,15 @@ class Transformer(nn.Module):
                     attention_name='memory_mask',
                     padding_name='memory_key_padding_mask',
                 )
-                memory_attention_mask = _apply_causal_mask(
-                    memory_attention_mask,
-                    memory_is_causal,
-                    query_length=target_length,
-                    key_length=source_length,
-                )
             elif memory_mask is not None or memory_key_padding_mask is not None:
                 raise ValueError('memory masks require a source input')
-
             output = self.decoder(
                 target,
                 memory,
                 target_mask=target_attention_mask,
                 memory_mask=memory_attention_mask,
-                target_is_causal=False,
-                memory_is_causal=False,
-                out_sharding=None,
+                target_is_causal=target_is_causal,
+                memory_is_causal=memory_is_causal,
             )
             unbatched = target_unbatched
 
@@ -1374,16 +1451,21 @@ class Transformer(nn.Module):
 
     def extra_repr(self) -> str:
         return (
-            f'hidden_size={self.hidden_size}, heads={self.num_heads}, '
+            f'{self.hidden_size}, heads={self.num_heads}, '
             f'encoder_layers={self.num_encoder_layers}, '
-            f'decoder_layers={self.num_decoder_layers}'
+            f'decoder_layers={self.num_decoder_layers}, '
+            f'intermediate={self.intermediate_size}'
         )
 
 
 __all__ = [
+    'Attention',
+    'FeedForward',
     'Transformer',
     'TransformerDecoder',
     'TransformerDecoderLayer',
     'TransformerEncoder',
     'TransformerEncoderLayer',
+    'default_transformer_bias_initializer',
+    'default_transformer_initializer',
 ]

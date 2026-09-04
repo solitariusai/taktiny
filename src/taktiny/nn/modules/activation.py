@@ -21,7 +21,7 @@ import jax
 from taktiny.nn.base import Module
 
 
-class _ActivationBase(Module):
+class ActivationBase(Module):
     """
     Base class for activation functions.
     """
@@ -52,7 +52,7 @@ class _ActivationBase(Module):
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}()"
 
-class SiLU(_ActivationBase):
+class SiLU(ActivationBase):
     """
     SiLU (Swish) activation function.
     """
@@ -67,7 +67,7 @@ class SiLU(_ActivationBase):
         """
         return super().__call__(x)
 
-class GELU(_ActivationBase):
+class GELU(ActivationBase):
     """
     GELU activation function.
     """
@@ -82,7 +82,7 @@ class GELU(_ActivationBase):
         """
         return super().__call__(x)
 
-class ReLU(_ActivationBase):
+class ReLU(ActivationBase):
     """
     ReLU activation function.
     """
@@ -97,7 +97,7 @@ class ReLU(_ActivationBase):
         """
         return super().__call__(x)
 
-class ELU(_ActivationBase):
+class ELU(ActivationBase):
     """
     ELU activation function.
     """
@@ -112,7 +112,7 @@ class ELU(_ActivationBase):
         """
         return super().__call__(x)
 
-class Swish(_ActivationBase):
+class Swish(ActivationBase):
     """
     Swish activation function.
     """
@@ -127,7 +127,7 @@ class Swish(_ActivationBase):
         """
         return super().__call__(x)
 
-class SELU(_ActivationBase):
+class SELU(ActivationBase):
     """
     SELU activation function.
     """
@@ -142,7 +142,7 @@ class SELU(_ActivationBase):
         """
         return super().__call__(x)
 
-class SoftPlus(_ActivationBase):
+class SoftPlus(ActivationBase):
     """
     SoftPlus activation function.
     """
@@ -157,7 +157,7 @@ class SoftPlus(_ActivationBase):
         """
         return super().__call__(x)
 
-class Mish(_ActivationBase):
+class Mish(ActivationBase):
     """
     Mish activation function.
     """
@@ -172,7 +172,7 @@ class Mish(_ActivationBase):
         """
         return super().__call__(x)
 
-class HardSwish(_ActivationBase):
+class HardSwish(ActivationBase):
     """
     HardSwish activation function.
     """
@@ -187,7 +187,7 @@ class HardSwish(_ActivationBase):
         """
         return super().__call__(x)
 
-class Sigmoid(_ActivationBase):
+class Sigmoid(ActivationBase):
     """
     Sigmoid activation function.
     """
@@ -202,7 +202,7 @@ class Sigmoid(_ActivationBase):
         """
         return super().__call__(x)
 
-class SoftSign(_ActivationBase):
+class SoftSign(ActivationBase):
     """
     SoftSign activation function.
     """
@@ -217,7 +217,7 @@ class SoftSign(_ActivationBase):
         """
         return super().__call__(x, jax.nn.soft_sign)
 
-class Tanh(_ActivationBase):
+class Tanh(ActivationBase):
     """
     Tanh activation function.
     """
@@ -232,7 +232,7 @@ class Tanh(_ActivationBase):
         """
         return super().__call__(x)
 
-class HardTanh(_ActivationBase):
+class HardTanh(ActivationBase):
     """
     HardTanh activation function.
     """
@@ -247,7 +247,7 @@ class HardTanh(_ActivationBase):
         """
         return super().__call__(x)
 
-class HardSigmoid(_ActivationBase):
+class HardSigmoid(ActivationBase):
     """
     HardSigmoid activation function.
     """

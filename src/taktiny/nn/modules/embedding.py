@@ -17,153 +17,185 @@ from __future__ import annotations
 from typing import Any
 
 import jax
-import jax.numpy as jnp
 import qwix
+from jax.lax import PrecisionLike
 from jax.nn import initializers
+from jax.sharding import PartitionSpec
+from jax.typing import DTypeLike
 
 from taktiny.nn.base import Module, Parameter
 from taktiny.nn.rng import Rngs
-from taktiny.nn.utils import _constrain
-from taktiny.utils.typing import AxisNames, DType, Initializer
+from taktiny.nn.utils import _constrain, _normalize_shape
+from taktiny.utils.quantization import (
+    quantize_embedding_weight,
+    resolve_quantization_rule,
+)
+from taktiny.utils.spmd import with_logical_partitioning
+from taktiny.utils.typing import (
+    AxisNames,
+    DType,
+    GenericShape,
+    Initializer,
+    MetaData,
+    QuantConfig,
+)
 
-default_embedding_initializer = initializers.normal(0.02)
+default_embed_initializer = initializers.normal(0.02)
 
 
 class Embedding(Module):
-    """
-    A simple lookup table that stores embeddings of a fixed dictionary and size.
+    """Stores and looks up embeddings from an N-dimensional table.
+
+    The embedding table has shape
+    ``(*num_embeddings, *embed_features)``. When ``num_embeddings`` is an
+    integer, ``indices`` follows conventional embedding semantics and an input
+    of shape ``(...)`` produces ``(..., *embed_features)``.
+
+    For an N-dimensional vocabulary, the final axis of ``indices`` contains a
+    coordinate for every vocabulary axis. An input of shape
+    ``(..., len(num_embeddings))`` therefore produces
+    ``(..., *embed_features)``.
+
+    Args:
+        num_embeddings: Size of the vocabulary axes. An integer is treated as
+            a one-dimensional vocabulary.
+        embed_features: Size of the embedding feature axes. An integer is
+            treated as a one-dimensional feature shape.
+        dtype: Data type passed to the table initializer.
+        rngs: Random number generator used to initialize the table.
+        initializer: Function used to initialize the table. Defaults to a
+            normal distribution with standard deviation 0.02.
+        quant: Optional Qwix quantization configuration for the table.
+        axis_names: Optional logical names for every vocabulary and embedding
+            axis.
+        partition_spec: Optional partition specification for the table.
+        metadata: Optional metadata attached to the embedding parameter.
+        precision: Precision reserved for embedding projection operations.
+        preferred_element_type: Preferred result type reserved for embedding
+            projection operations.
+
+    Attributes:
+        embedding: The learnable embedding-table parameter.
+
+    Examples:
+        Look up vectors from a conventional embedding table:
+
+        >>> import jax.numpy as jnp
+        >>> from taktiny import nn
+        >>> embedding = nn.Embedding(8, 4, rngs=nn.Rngs(0))
+        >>> embedding(jnp.asarray([1, 3])).shape
+        (2, 4)
+
+        Look up feature matrices using two-dimensional coordinates:
+
+        >>> embedding = nn.Embedding((2, 3), (4, 5), rngs=nn.Rngs(1))
+        >>> coordinates = jnp.asarray([[0, 1], [1, 2]])
+        >>> embedding(coordinates).shape
+        (2, 4, 5)
     """
 
     def __init__(
-        self, num_embeddings: int,
-        embedding_dim: int, *,
-        rngs: Rngs | None = None,
-        dtype: DType = jnp.float32,
-        initializer: Initializer | None = None,
+        self,
+        num_embeddings: GenericShape,
+        embed_features: GenericShape,
+        *,
+        dtype: DType | None = None,
+        rngs: Rngs,
+        initializer: Initializer = default_embed_initializer,
         quant: QuantConfig = None,
         axis_names: AxisNames | None = None,
+        partition_spec: PartitionSpec | None = None,
+        metadata: MetaData | None = None,
+        precision: PrecisionLike = None,
+        preferred_element_type: DTypeLike | None = None,
     ) -> None:
-        """Initializes the Embedding module.
+        self.num_embeddings = _normalize_shape(
+            num_embeddings,
+            'num_embeddings',
+        )
+        self.embed_features = _normalize_shape(
+            embed_features,
+            'embed_features',
+        )
+        self.precision = precision
+        self.preferred_element_type = preferred_element_type
 
-        Args:
-            num_embeddings (int): Size of the dictionary of embeddings.
-            embedding_dim (int): The size of each embedding vector.
-            rngs (Rngs | None, optional): Random number generators for initialization. Defaults to None.
-            dtype (DType, optional): The data type of the embedding weights. Defaults to jnp.float32.
-            initializer (Initializer | None, optional): Initialization function for the weights. Defaults to None.
-            quant (Any, optional): Quantization configuration. Defaults to None.
-            axis_names (AxisNames | None, optional): Axis names for sharding. Defaults to None.
-            shard_mode (optional): Mode for sharding the output. Defaults to ShardMode.AUTO.
-        """
-        initializer = initializer or default_embedding_initializer
-        if not isinstance(num_embeddings, int) or num_embeddings <= 0:
-            raise ValueError('num_embeddings must be a positive integer')
-        if not isinstance(embedding_dim, int) or embedding_dim <= 0:
-            raise ValueError('embedding_dim must be a positive integer')
         if axis_names is not None:
             axis_names = tuple(axis_names)
-            if len(axis_names) != 2:
-                raise ValueError(
-                    'axis_names must contain vocabulary and embedding axes'
-                )
 
-        self.num_embeddings = num_embeddings
-        self.embedding_dim = embedding_dim
-        if rngs is None:
-            raise ValueError("A rngs must be provided to initialize Embedding layer")
+        table_shape = self.num_embeddings + self.embed_features
+        if axis_names is not None or partition_spec is not None:
+            initializer = with_logical_partitioning(
+                initializer,
+                axis_names,
+                partition_spec,
+            )
 
-        key = rngs()
-        embedding_array = initializer(key, (num_embeddings, embedding_dim), dtype)
-        
+        embed_array = initializer(rngs(), table_shape, dtype)
         if quant is not None:
-            from taktiny.utils.quantization import resolve_quantization_rule, quantize_embedding_weight
             rule = resolve_quantization_rule(quant, '', op_name='embedding')
             if rule is not None:
-                embedding_array = quantize_embedding_weight(embedding_array, rule)
-                
-        self.embedding = Parameter(embedding_array)
-        
-        if axis_names is not None:
-            self.embedding.axis_names = axis_names
+                embed_array = quantize_embedding_weight(
+                    embed_array,
+                    rule,
+                    vocabulary_axis_count=len(self.num_embeddings),
+                )
+
+        self.embedding = Parameter(
+            embed_array,
+            axis_names=axis_names,
+            partition_spec=partition_spec,
+            metadata=metadata,
+        )
 
     def __call__(
         self,
         indices: jax.Array,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
-        """Looks up the embeddings for the given indices.
+        """Looks up embeddings for integer indices or N-D coordinates.
 
         Args:
-            indices (jax.Array): Tensor containing the indices to look up.
-            out_sharding (jax.sharding.Sharding | None, optional): Optional sharding specification for the output. Defaults to None.
+            indices: Integer indices. For an N-dimensional vocabulary, the
+                final dimension must contain one coordinate per vocabulary
+                axis.
+            out_sharding: Optional sharding constraint for the result.
 
         Returns:
-            jax.Array: The retrieved embeddings.
+            The gathered embeddings followed by ``embed_features`` axes.
+
+        Raises:
+            ValueError: If N-D coordinates do not have the required trailing
+                coordinate dimension.
         """
         table = self.embedding.value
-        if isinstance(table, qwix.QArray):
-            output = qwix.dequantize(table[indices])
+        vocabulary_rank = len(self.num_embeddings)
+        if vocabulary_rank == 1:
+            table_indices: Any = indices
         else:
-            output = table[indices]
+            if indices.ndim == 0 or indices.shape[-1] != vocabulary_rank:
+                raise ValueError(
+                    'indices trailing dimension must match the vocabulary '
+                    f'rank {vocabulary_rank}, got shape {indices.shape}'
+                )
+            table_indices = tuple(
+                indices[..., axis]
+                for axis in range(vocabulary_rank)
+            )
+
+        if isinstance(table, qwix.QArray):
+            output = qwix.dequantize(table[table_indices])
+        else:
+            output = table[table_indices]
 
         return _constrain(output, out_sharding)
 
-    # will bring back
-    # @classmethod
-    # def apply_gather_reduce(
-    #     cls,
-    #     operand: jax.Array,
-    #     indices: jax.Array,
-    #     weights: jax.Array | None = None,
-    #     reduce_group_size: int = 1,
-    #     **kwargs: Any,
-    # ) -> jax.Array:
-    #     """Apply Stream Gather Reduce kernel for sparse embeddings / reductions."""
-    #     from taktiny.cosette.kernels.gather_reduce_sc import sc_gather_reduce
-    #     if jax.default_backend() != "tpu":
-    #         gathered = operand[indices]
-    #         if weights is not None:
-    #             gathered = gathered * weights[..., None]
-    #         return gathered
-    #     return sc_gather_reduce(
-    #         operand,
-    #         indices,
-    #         topk_weights=weights,
-    #         reduce_group_size=reduce_group_size,
-    #         **kwargs,
-    #     )
-
-    # @classmethod
-    # def apply_ragged_gather(
-    #     cls,
-    #     operand: jax.Array,
-    #     offsets: jax.Array,
-    #     lengths: jax.Array,
-    #     **kwargs: Any,
-    # ) -> jax.Array:
-    #     """Apply Ragged Gather kernel."""
-    #     from taktiny.cosette.kernels.ragged.ragged_gather import ragged_gather
-    #     return ragged_gather(operand, offsets, lengths, **kwargs)
-
-    # @classmethod
-    # def apply(
-    #     cls,
-    #     operand: jax.Array,
-    #     indices: jax.Array,
-    #     kernel: str = "gather_reduce",
-    #     **kwargs: Any,
-    # ) -> jax.Array:
-    #     """Unified entry point for Embedding sparse gather kernels."""
-    #     if kernel in ("gather_reduce", "sc_gather_reduce"):
-    #         return cls.apply_gather_reduce(operand, indices, **kwargs)
-    #     elif kernel in ("ragged", "ragged_gather"):
-    #         return cls.apply_ragged_gather(operand, indices, **kwargs)
-    #     else:
-    #         return operand[indices]
-
     def extra_repr(self) -> str:
-        return f"{self.num_embeddings} → {self.embedding_dim}"
-
+        vocabulary = '×'.join(map(str, self.num_embeddings))
+        features = '×'.join(map(str, self.embed_features))
+        quantized = isinstance(self.embedding.value, qwix.QArray)
+        quant = ' (Qwix PTQ)' if quantized else ''
+        return f'{vocabulary} ➤ {features}{quant}'
 
 
 __all__ = [

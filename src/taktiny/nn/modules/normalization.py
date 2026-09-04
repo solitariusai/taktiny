@@ -12,65 +12,76 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Rank-generic normalization modules."""
+
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from itertools import chain
 
 import jax
 import jax.numpy as jnp
 from jax.core import Tracer
+from jax.nn import initializers
+from jax.sharding import PartitionSpec
 
 from taktiny.nn.base import Module, Parameter
+from taktiny.nn.rng import Rngs
 from taktiny.nn.utils import (
     _canonical_axes,
-    _canonical_axis,
     _constrain,
     _normalize_shape,
-    _resolve_training,
-    _validate_integer,
     _validate_positive_float,
 )
+from taktiny.utils.quantization import resolve_quantization_rule
+from taktiny.utils.spmd import with_logical_partitioning
 from taktiny.utils.typing import (
     Axes,
     AxisNames,
     DType,
+    GenericShape,
     Initializer,
-    MeshAxisName,
+    MetaData,
+    QuantConfig,
 )
 
 
 def _default_axes(rank: int) -> tuple[int, ...]:
-    """Returns the default normalized axes given a rank.
-
-    Args:
-        rank (int): The rank to get the default axes for.
-
-    Returns:
-        tuple[int, ...]: A tuple of axes `(-rank, ..., -1)`.
-    """
     return tuple(range(-rank, 0))
+
+
+def _as_axes(axes: Axes, name: str) -> tuple[int, ...]:
+    values = (axes,) if isinstance(axes, int) else tuple(axes)
+    if not all(
+        isinstance(axis, int) and not isinstance(axis, bool)
+        for axis in values
+    ):
+        raise TypeError(f'{name} must contain only integers')
+    return values
+
+
+def _feature_axes(
+    axes: Axes | None,
+    feature_rank: int,
+    name: str,
+) -> tuple[int, ...]:
+    values = _default_axes(feature_rank) if axes is None else _as_axes(axes, name)
+    if len(values) != feature_rank:
+        raise ValueError(
+            f'{name} and num_features must have the same number of dimensions'
+        )
+    return values
 
 
 def _parameter_axis_names(
     axis_names: AxisNames | None,
     rank: int,
 ) -> AxisNames | None:
-    """Validates and standardizes parameter axis names.
-
-    Args:
-        axis_names (AxisNames | None): Optional axis names for parameters.
-        rank (int): The required rank.
-
-    Returns:
-        AxisNames | None: The validated axis names.
-    """
     if axis_names is None:
         return None
     names = tuple(axis_names)
     if len(names) != rank:
         raise ValueError(
-            f'axis_names length {len(names)} must match normalized rank {rank}'
+            f'axis_names length {len(names)} must match feature rank {rank}'
         )
     return names
 
@@ -80,17 +91,10 @@ def _validate_input_shape(
     shape: tuple[int, ...],
     axes: tuple[int, ...],
 ) -> None:
-    """Validates that the input tensor matches the normalized shape.
-
-    Args:
-        x (jax.Array): The input tensor.
-        shape (tuple[int, ...]): The expected normalized shape.
-        axes (tuple[int, ...]): The axes being normalized.
-    """
     actual = tuple(x.shape[axis] for axis in axes)
     if actual != shape:
         raise ValueError(
-            f'expected normalized dimensions {shape} on axes {axes}, '
+            f'expected feature dimensions {shape} on axes {axes}, '
             f'got {actual} from shape {x.shape}'
         )
 
@@ -100,23 +104,8 @@ def _broadcast_parameter(
     ndim: int,
     axes: tuple[int, ...],
 ) -> jax.Array:
-    """Broadcasts a normalization parameter to the input shape.
-
-    Args:
-        parameter (jax.Array): The parameter tensor to broadcast.
-        ndim (int): The number of dimensions of the input.
-        axes (tuple[int, ...]): The axes the parameter normalizes over.
-
-    Returns:
-        jax.Array: The broadcasted parameter tensor.
-    """
-    trailing_axes = tuple(range(ndim - parameter.ndim, ndim))
-    if axes == trailing_axes:
-        return parameter
-
-    dimension_order = tuple(
-        sorted(range(len(axes)), key=axes.__getitem__)
-    )
+    """Broadcast a parameter whose dimensions follow declared axis order."""
+    dimension_order = tuple(sorted(range(len(axes)), key=axes.__getitem__))
     if dimension_order != tuple(range(len(axes))):
         parameter = jnp.transpose(parameter, dimension_order)
     ordered_axes = tuple(axes[index] for index in dimension_order)
@@ -127,492 +116,612 @@ def _broadcast_parameter(
 
 
 def _statistics_value(x: jax.Array) -> jax.Array:
-    """Converts the input to float32 if it is a half-precision float for computing statistics.
-
-    Args:
-        x (jax.Array): The input tensor.
-
-    Returns:
-        jax.Array: The converted input tensor.
-    """
     if x.dtype in (jnp.float16, jnp.bfloat16):
         return x.astype(jnp.float32)
     return x
 
 
 def _validate_floating(x: jax.Array) -> None:
-    """Validates that the input tensor has a floating-point data type.
-
-    Args:
-        x (jax.Array): The input tensor to validate.
-    """
     if not jnp.issubdtype(x.dtype, jnp.floating):
         raise TypeError('normalization requires a floating-point input')
 
 
+def _validate_quant(quant: QuantConfig) -> None:
+    if quant is not None and resolve_quantization_rule(
+        quant,
+        '',
+        op_name='normalization',
+    ) is not None:
+        raise NotImplementedError(
+            'quantized normalization parameters are not supported'
+        )
+
+
+def _new_parameter(
+    initializer: Initializer,
+    rngs: Rngs,
+    shape: tuple[int, ...],
+    dtype: DType | None,
+    axis_names: AxisNames | None,
+    partition_spec: PartitionSpec | None,
+    metadata: MetaData | None = None,
+    *,
+    trainable: bool = True,
+) -> Parameter:
+    if axis_names is not None or partition_spec is not None:
+        initializer = with_logical_partitioning(
+            initializer,
+            axis_names,
+            partition_spec,
+        )
+    return Parameter(
+        initializer(rngs(), shape, dtype),
+        trainable=trainable,
+        axis_names=axis_names,
+        partition_spec=partition_spec,
+        metadata=metadata,
+    )
+
+
+def _feature_statistics(
+    value: jax.Array,
+    feature_axes: tuple[int, ...],
+) -> tuple[jax.Array, jax.Array]:
+    """Return statistics with dimensions in declared feature-axis order."""
+    reduction_axes = tuple(
+        axis for axis in range(value.ndim) if axis not in feature_axes
+    )
+    if not reduction_axes:
+        raise ValueError('BatchNorm requires at least one reduction axis')
+    permutation = reduction_axes + feature_axes
+    transposed = jnp.transpose(value, permutation)
+    leading_axes = tuple(range(len(reduction_axes)))
+    return (
+        jnp.mean(transposed, axis=leading_axes),
+        jnp.var(transposed, axis=leading_axes),
+    )
+
+
+def _shape_repr(shape: tuple[int, ...]) -> str:
+    return '×'.join(map(str, shape))
+
+
 class LayerNorm(Module):
-    """
-    Applies Layer Normalization over a mini-batch of inputs.
+    """Apply layer normalization over selected feature dimensions.
+
+    For every independent slice of the input, LayerNorm computes the mean and
+    variance over ``axes`` and applies
+
+    ``output = (x - mean) / sqrt(variance + epsilon) * scale + bias``.
+
+    Unlike BatchNorm, its statistics do not depend on other samples and it
+    performs the same calculation in training and evaluation modes.
+    ``num_features`` declares the sizes of the normalized dimensions in the
+    same order as ``axes``. If ``axes`` is omitted, the final
+    ``len(num_features)`` dimensions are normalized. For example,
+    ``num_features=(3, 4)`` expects trailing dimensions of shape ``(3, 4)``.
+
+    Statistics for float16 and bfloat16 inputs are computed in float32 for
+    numerical stability. The result is converted back to the input dtype.
+
+    Args:
+        num_features: Size of every normalized input dimension. An integer is
+            treated as a one-dimensional feature shape.
+        epsilon: Positive value added to the variance before the reciprocal
+            square root. Defaults to ``1e-6``.
+        bias: Whether to create an additive bias when affine parameters are
+            enabled. Defaults to ``True``.
+        dtype: Dtype passed to the parameter initializers. Defaults to each
+            initializer's default dtype.
+        rngs: Random stream used by parameter initializers. A deterministic
+            stream seeded with zero is used when omitted.
+        elementwise_affine: Whether to create a learnable scale and optional
+            bias with shape ``num_features``. Defaults to ``True``.
+        axes: Input dimensions corresponding to ``num_features``, in the same
+            order. Negative dimensions are supported. Defaults to the trailing
+            feature dimensions.
+        scale_initializer: Initializer for the multiplicative scale.
+            Defaults to ones.
+        bias_initializer: Initializer for the additive bias.
+            Defaults to zeros.
+        quant: Optional Qwix configuration. Rules for unrelated operation
+            types are ignored; quantized normalization parameters are not yet
+            supported.
+        axis_names: Logical names for all ``num_features`` dimensions.
+        partition_spec: Explicit partition specification for affine
+            parameters. A mapping obtained from ``axis_names`` overrides this
+            specification.
+        scale_metadata: Metadata attached to the scale parameter.
+        bias_metadata: Metadata attached to the bias parameter.
+
+    Attributes:
+        num_features: Normalized feature shape as a tuple.
+        axes: Input dimensions normalized by this module.
+        scale: Learnable multiplicative parameter, or ``None`` when
+            ``elementwise_affine=False``.
+        bias: Learnable additive parameter, or ``None`` when disabled.
+
+    Example:
+        Normalize the final two dimensions independently for each item in the
+        leading batch dimension:
+
+        >>> import jax.numpy as jnp
+        >>> from taktiny import nn
+        >>> layer = nn.LayerNorm((3, 4))
+        >>> x = jnp.arange(24, dtype=jnp.float32).reshape(2, 3, 4)
+        >>> layer(x).shape
+        (2, 3, 4)
+
+    References:
+        Jimmy Lei Ba, Jamie Ryan Kiros, and Geoffrey E. Hinton,
+        "Layer Normalization" (2016).
+        https://arxiv.org/abs/1607.06450
     """
 
     def __init__(
         self,
-        normalized_shape: int | Sequence[int] | None,
-        eps: float = 1e-5,
+        num_features: GenericShape,
+        epsilon: float = 1e-6,
         *,
-        elementwise_affine: bool = True,
-        dtype: DType = jnp.float32,
         bias: bool = True,
-        axes: Axes | None = None,
-        initializer: Initializer = jnp.ones,
-        bias_initializer: Initializer = jnp.zeros,
+        dtype: DType | None = None,
+        rngs: Rngs | None = None,
+        elementwise_affine: bool = True,
+        axes: GenericShape | None = None,
+        scale_initializer: Initializer = initializers.ones,
+        bias_initializer: Initializer = initializers.zeros,
+        quant: QuantConfig = None,
         axis_names: AxisNames | None = None,
+        partition_spec: PartitionSpec | None = None,
+        scale_metadata: MetaData | None = None,
+        bias_metadata: MetaData | None = None,
     ) -> None:
-        """Initializes the LayerNorm module.
-
-        Args:
-            normalized_shape (int | Sequence[int] | None): Input shape from an expected input of size.
-            eps (float, optional): A value added to the denominator for numerical stability. Defaults to 1e-5.
-            elementwise_affine (bool, optional): A boolean value that when set to True, this module has learnable per-element affine parameters initialized to ones (for weights) and zeros (for biases). Defaults to True.
-            dtype (DType, optional): Data type of the module parameters. Defaults to jnp.float32.
-            bias (bool, optional): If set to False, the layer will not learn an additive bias (only relevant if elementwise_affine is True). Defaults to True.
-            axes (Axes | None, optional): The axes to normalize over. Defaults to None.
-            initializer (Initializer, optional): Initializer for the weight parameter. Defaults to jnp.ones.
-            bias_initializer (Initializer, optional): Initializer for the bias parameter. Defaults to jnp.zeros.
-            axis_names (AxisNames | None, optional): Logical names for the parameter axes. Defaults to None.
-            shard_mode (optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
-        """
-        self.normalized_shape = (
-            None
-            if normalized_shape is None
-            else _normalize_shape(normalized_shape, 'normalized_shape')
-        )
-        self.hidden_size = (
-            None
-            if self.normalized_shape is None
-            else (
-                self.normalized_shape[0]
-                if len(self.normalized_shape) == 1
-                else self.normalized_shape
-            )
-        )
-        self.eps = _validate_positive_float(eps, 'eps')
+        _validate_quant(quant)
+        self.num_features = _normalize_shape(num_features, 'num_features')
+        self.epsilon = _validate_positive_float(epsilon, 'epsilon')
         self.elementwise_affine = bool(elementwise_affine)
-        if self.normalized_shape is None and self.elementwise_affine:
-            raise ValueError(
-                'normalized_shape is required when elementwise_affine=True'
-            )
-        self.has_bias = self.elementwise_affine and bool(bias)
-        requested_axes = (
-            (
-                -1
-                if self.normalized_shape is None
-                else _default_axes(len(self.normalized_shape))
-            )
-            if axes is None
-            else axes
-        )
-        self.axes = (
-            (requested_axes,)
-            if isinstance(requested_axes, int)
-            else tuple(requested_axes)
-        )
-        if (
-            self.normalized_shape is not None
-            and len(self.axes) != len(self.normalized_shape)
-        ):
-            raise ValueError(
-                'axes and normalized_shape must have the same number '
-                'of dimensions'
-            )
+        self.axes = _feature_axes(axes, len(self.num_features), 'axes')
+        names = _parameter_axis_names(axis_names, len(self.num_features))
+        rngs = Rngs(0) if rngs is None else rngs
 
-        if self.normalized_shape is None and axis_names is not None:
-            raise ValueError(
-                'axis_names requires a fixed normalized_shape'
-            )
-        names = (
-            None
-            if self.normalized_shape is None
-            else _parameter_axis_names(
-                axis_names,
-                len(self.normalized_shape),
-            )
-        )
+        self.scale = None
+        self.bias = None
         if self.elementwise_affine:
-            self.weight = Parameter(
-                initializer(self.normalized_shape, dtype=dtype)
+            self.scale = _new_parameter(
+                scale_initializer,
+                rngs,
+                self.num_features,
+                dtype,
+                names,
+                partition_spec,
+                scale_metadata,
             )
-            if names is not None:
-                self.weight.axis_names = names
-            if self.has_bias:
-                self.bias = Parameter(
-                    bias_initializer(self.normalized_shape, dtype=dtype)
+            if bias:
+                self.bias = _new_parameter(
+                    bias_initializer,
+                    rngs,
+                    self.num_features,
+                    dtype,
+                    names,
+                    partition_spec,
+                    bias_metadata,
                 )
-                if names is not None:
-                    self.bias.axis_names = names
 
     def __call__(
         self,
         x: jax.Array,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
-        """Applies layer normalization to the input.
-
-        Args:
-            x (jax.Array): The input tensor.
-            out_sharding (jax.sharding.Sharding | None, optional): Sharding constraint for the output. Defaults to None.
-
-        Returns:
-            jax.Array: The normalized input.
-        """
+        """Apply layer normalization."""
         x = jnp.asarray(x)
         _validate_floating(x)
         axes = _canonical_axes(self.axes, x.ndim)
-        if self.normalized_shape is not None:
-            _validate_input_shape(x, self.normalized_shape, axes)
-        input_dtype = x.dtype
+        _validate_input_shape(x, self.num_features, axes)
         value = _statistics_value(x)
         mean = jnp.mean(value, axis=axes, keepdims=True)
         variance = jnp.var(value, axis=axes, keepdims=True)
-        output = (value - mean) * jax.lax.rsqrt(variance + self.eps)
-        if self.elementwise_affine:
-            weight = _broadcast_parameter(
-                self.weight.value.astype(value.dtype),
-                x.ndim,
-                axes,
+        output = (value - mean) * jax.lax.rsqrt(variance + self.epsilon)
+        if self.scale is not None:
+            output *= _broadcast_parameter(
+                self.scale.value.astype(value.dtype), x.ndim, axes
             )
-            output = output * weight
-            if self.has_bias:
-                bias = _broadcast_parameter(
-                    self.bias.value.astype(value.dtype),
-                    x.ndim,
-                    axes,
-                )
-                output = output + bias
-        output = output.astype(input_dtype)
-        return _constrain(output, out_sharding)
+        if self.bias is not None:
+            output += _broadcast_parameter(
+                self.bias.value.astype(value.dtype), x.ndim, axes
+            )
+        return _constrain(output.astype(x.dtype), out_sharding)
 
     def extra_repr(self) -> str:
-        shape = (
-            'dynamic'
-            if self.normalized_shape is None
-            else 'x'.join(map(str, self.normalized_shape))
+        return (
+            f'{_shape_repr(self.num_features)}, epsilon={self.epsilon:g}, '
+            f'affine={self.elementwise_affine}'
         )
-        return f'{shape}, eps={self.eps:g}, affine={self.elementwise_affine}'
 
 
 class RMSNorm(Module):
-    """
-    Applies Root Mean Square Normalization over a mini-batch of inputs.
+    """Apply root mean square normalization over selected dimensions.
+
+    RMSNorm scales each independent input slice using its root mean square:
+
+    ``output = x / sqrt(mean(x ** 2) + epsilon) * scale + bias``.
+
+    It does not subtract the mean. Consequently, RMSNorm provides re-scaling
+    invariance without the re-centering step performed by LayerNorm. The
+    statistics are local to each input slice, so training and evaluation modes
+    behave identically.
+
+    ``num_features`` gives the sizes of the normalized dimensions in the same
+    order as ``axes``. When ``axes`` is omitted, the final
+    ``len(num_features)`` dimensions are used. Statistics for float16 and
+    bfloat16 inputs are computed in float32, after which the result is cast
+    back to the input dtype.
+
+    Args:
+        num_features: Size of every normalized input dimension. An integer is
+            treated as a one-dimensional feature shape.
+        epsilon: Positive value added to the mean square before the reciprocal
+            square root. Defaults to ``1e-6``.
+        bias: Whether to create an additive bias when affine parameters are
+            enabled. Defaults to ``False``.
+        dtype: Dtype passed to the parameter initializers. Defaults to each
+            initializer's default dtype.
+        rngs: Random stream used by parameter initializers. A deterministic
+            stream seeded with zero is used when omitted.
+        elementwise_affine: Whether to create a learnable scale and optional
+            bias with shape ``num_features``. Defaults to ``True``.
+        axes: Input dimensions corresponding to ``num_features``, in the same
+            order. Negative dimensions are supported. Defaults to the trailing
+            feature dimensions.
+        scale_initializer: Initializer for the multiplicative scale.
+            Defaults to ones.
+        bias_initializer: Initializer for the additive bias.
+            Defaults to zeros.
+        quant: Optional Qwix configuration. Rules for unrelated operation
+            types are ignored; quantized normalization parameters are not yet
+            supported.
+        axis_names: Logical names for all ``num_features`` dimensions.
+        partition_spec: Explicit partition specification for affine
+            parameters. A mapping obtained from ``axis_names`` overrides this
+            specification.
+        scale_metadata: Metadata attached to the scale parameter.
+        bias_metadata: Metadata attached to the bias parameter.
+
+    Attributes:
+        num_features: Normalized feature shape as a tuple.
+        axes: Input dimensions normalized by this module.
+        scale: Learnable multiplicative parameter, or ``None`` when
+            ``elementwise_affine=False``.
+        bias: Learnable additive parameter, or ``None`` when disabled.
+
+    Example:
+        Normalize the last feature dimension without adding a bias:
+
+        >>> import jax.numpy as jnp
+        >>> from taktiny import nn
+        >>> layer = nn.RMSNorm(4)
+        >>> x = jnp.arange(8, dtype=jnp.float32).reshape(2, 4)
+        >>> layer(x).shape
+        (2, 4)
+
+    References:
+        Biao Zhang and Rico Sennrich,
+        "Root Mean Square Layer Normalization" (2019).
+        https://arxiv.org/abs/1910.07467
     """
 
     def __init__(
         self,
-        shape: int | Sequence[int] | None,
-        epsilon: float = 1e-5,
+        num_features: GenericShape,
+        epsilon: float = 1e-6,
         *,
-        dtype: DType | None = None,
-        with_scale: bool = True,
         bias: bool = False,
+        dtype: DType | None = None,
+        rngs: Rngs | None = None,
+        elementwise_affine: bool = True,
+        axes: GenericShape | None = None,
+        scale_initializer: Initializer = initializers.ones,
+        bias_initializer: Initializer = initializers.zeros,
+        quant: QuantConfig = None,
         axis_names: AxisNames | None = None,
-        initializer: Initializer = jnp.ones,
-        bias_initializer: Initializer = jnp.zeros,
-        axes: Axes | None = None,
+        partition_spec: PartitionSpec | None = None,
+        scale_metadata: MetaData | None = None,
+        bias_metadata: MetaData | None = None,
     ) -> None:
-        """Initializes the RMSNorm module.
+        _validate_quant(quant)
+        self.num_features = _normalize_shape(num_features, 'num_features')
+        self.epsilon = _validate_positive_float(epsilon, 'epsilon')
+        self.elementwise_affine = bool(elementwise_affine)
+        self.axes = _feature_axes(axes, len(self.num_features), 'axes')
+        names = _parameter_axis_names(axis_names, len(self.num_features))
+        rngs = Rngs(0) if rngs is None else rngs
 
-        Args:
-            shape (int | Sequence[int] | None): Input shape from an expected input of size.
-            epsilon (float, optional): A value added to the denominator for numerical stability. Defaults to 1e-5.
-            dtype (DType | None, optional): Data type of the module parameters. Defaults to None.
-            with_scale (bool, optional): If set to True, the layer will learn a multiplicative scale parameter. Defaults to True.
-            bias (bool, optional): If set to True, the layer will learn an additive bias parameter. Defaults to False.
-            axis_names (AxisNames | None, optional): Logical names for the parameter axes. Defaults to None.
-            shard_mode (optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
-            initializer (Initializer, optional): Initializer for the scale parameter. Defaults to jnp.ones.
-            bias_initializer (Initializer, optional): Initializer for the bias parameter. Defaults to jnp.zeros.
-            axes (Axes | None, optional): The axes to normalize over. Defaults to None.
-        """
-        self.normalized_shape = (
-            None
-            if shape is None
-            else _normalize_shape(shape, 'normalized_shape')
-        )
-        self.eps = _validate_positive_float(epsilon, 'eps')
-        self.with_scale = bool(with_scale)
-        self.has_bias = bool(bias)
-        if self.normalized_shape is None and (self.with_scale or self.has_bias):
-            raise ValueError(
-                'normalized_shape is required for RMSNorm parameters'
+        self.scale = None
+        self.bias = None
+        if self.elementwise_affine:
+            self.scale = _new_parameter(
+                scale_initializer,
+                rngs,
+                self.num_features,
+                dtype,
+                names,
+                partition_spec,
+                scale_metadata,
             )
-        requested_axes = (
-            (
-                -1
-                if self.normalized_shape is None
-                else _default_axes(len(self.normalized_shape))
-            )
-            if axes is None
-            else axes
-        )
-        self.axes = (
-            (requested_axes,)
-            if isinstance(requested_axes, int)
-            else tuple(requested_axes)
-        )
-        if (
-            self.normalized_shape is not None
-            and len(self.axes) != len(self.normalized_shape)
-        ):
-            raise ValueError(
-                'axes and normalized_shape must have the same number '
-                'of dimensions'
-            )
-
-        if self.normalized_shape is None and axis_names is not None:
-            raise ValueError(
-                'axis_names requires a fixed normalized_shape'
-            )
-        names = (
-            None
-            if self.normalized_shape is None
-            else _parameter_axis_names(
-                axis_names,
-                len(self.normalized_shape),
-            )
-        )
-        dtype = dtype or jnp.float32
-        if self.with_scale:
-            self.weight = Parameter(
-                initializer(self.normalized_shape, dtype=dtype), 
-                axis_names=names
-            )
-        if self.has_bias:
-            self.bias = Parameter(
-                bias_initializer(self.normalized_shape, dtype=dtype), 
-                axis_names=names
-            )
+            if bias:
+                self.bias = _new_parameter(
+                    bias_initializer,
+                    rngs,
+                    self.num_features,
+                    dtype,
+                    names,
+                    partition_spec,
+                    bias_metadata,
+                )
 
     def __call__(
         self,
         x: jax.Array,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
-        """Applies root mean square normalization to the input.
-
-        Args:
-            x (jax.Array): The input tensor.
-            out_sharding (jax.sharding.Sharding | None, optional): Sharding constraint for the output. Defaults to None.
-
-        Returns:
-            jax.Array: The normalized input.
-        """
+        """Apply root mean square normalization."""
         x = jnp.asarray(x)
         _validate_floating(x)
         axes = _canonical_axes(self.axes, x.ndim)
-        if self.normalized_shape is not None:
-            _validate_input_shape(x, self.normalized_shape, axes)
-        input_dtype = x.dtype
+        _validate_input_shape(x, self.num_features, axes)
         value = _statistics_value(x)
-        variance = jnp.mean(jnp.square(value), axis=axes, keepdims=True)
-        output = value * jax.lax.rsqrt(variance + self.eps)
-        if self.with_scale:
-            weight = _broadcast_parameter(
-                self.weight.value.astype(value.dtype),
-                x.ndim,
-                axes,
+        mean_square = jnp.mean(jnp.square(value), axis=axes, keepdims=True)
+        output = value * jax.lax.rsqrt(mean_square + self.epsilon)
+        if self.scale is not None:
+            output *= _broadcast_parameter(
+                self.scale.value.astype(value.dtype), x.ndim, axes
             )
-            output = output * weight
-        if self.has_bias:
-            bias = _broadcast_parameter(
-                self.bias.value.astype(value.dtype),
-                x.ndim,
-                axes,
+        if self.bias is not None:
+            output += _broadcast_parameter(
+                self.bias.value.astype(value.dtype), x.ndim, axes
             )
-            output = output + bias
-        output = output.astype(input_dtype)
-        return _constrain(output, out_sharding)
+        return _constrain(output.astype(x.dtype), out_sharding)
 
     def extra_repr(self) -> str:
-        shape = (
-            'dynamic'
-            if self.normalized_shape is None
-            else 'x'.join(map(str, self.normalized_shape))
-        )
         return (
-            f'{shape}, eps={self.eps:g}, scale={self.with_scale}, '
-            f'bias={self.has_bias}'
+            f'{_shape_repr(self.num_features)}, epsilon={self.epsilon:g}, '
+            f'affine={self.elementwise_affine}'
         )
 
 
 class BatchNorm(Module):
-    """
-    Applies Batch Normalization over a mini-batch of inputs.
+    """Normalize feature dimensions using mini-batch statistics.
+
+    BatchNorm retains the dimensions selected by ``axes`` and computes a mean
+    and variance by reducing every other input dimension. Its transformation
+    is
+
+    ``output = (x - mean) / sqrt(variance + epsilon) * scale + bias``.
+
+    ``num_features`` may contain one or more dimensions. Their sizes and order
+    must match ``axes`` and determine the shapes of the affine parameters and
+    running statistics. If ``axes`` is omitted, the final
+    ``len(num_features)`` input dimensions are treated as features.
+
+    Mode is controlled by :attr:`Module.is_training`, which is changed through
+    :meth:`Module.train` and :meth:`Module.eval`. During training, current
+    batch statistics normalize the input. If ``track_running_stats=True``, the
+    same call also updates ``running_mean``, ``running_var``, and
+    ``num_batches_tracked``. During evaluation, the stored statistics are used.
+    When tracking is disabled, current input statistics are used in both modes.
+
+    Running-state mutation is an eager side effect and is therefore rejected
+    while tracing with ``jax.jit``. Use evaluation mode or set
+    ``track_running_stats=False`` for a directly jitted call. Float16 and
+    bfloat16 statistics are accumulated in float32 before the output is cast
+    back to its input dtype.
+
+    Args:
+        num_features: Size of every retained feature dimension. An integer is
+            treated as a one-dimensional feature shape.
+        epsilon: Positive value added to the variance before the reciprocal
+            square root. Defaults to ``1e-6``.
+        bias: Whether to create an additive bias when affine parameters are
+            enabled. Defaults to ``False``.
+        dtype: Dtype used for affine parameters and running statistics.
+            Defaults to float32 through the default initializers.
+        rngs: Random stream used by parameter initializers. A deterministic
+            stream seeded with zero is used when omitted.
+        elementwise_affine: Whether to create a learnable scale and optional
+            bias with shape ``num_features``. Defaults to ``True``.
+        momentum: Weight assigned to the newest batch statistics when updating
+            running state. ``None`` selects a cumulative moving average.
+            Defaults to ``0.1``.
+        track_running_stats: Whether to maintain statistics for evaluation.
+            Defaults to ``True``.
+        axes: Input feature dimensions retained by the statistics, in the same
+            order as ``num_features``. Every remaining dimension is reduced.
+            Defaults to the trailing feature dimensions.
+        scale_initializer: Initializer for the multiplicative scale.
+            Defaults to ones.
+        bias_initializer: Initializer for the additive bias.
+            Defaults to zeros.
+        quant: Optional Qwix configuration. Rules for unrelated operation
+            types are ignored; quantized normalization parameters are not yet
+            supported.
+        axis_names: Logical names for all feature and running-state dimensions.
+        partition_spec: Explicit partition specification for affine parameters
+            and running statistics. A mapping obtained from ``axis_names``
+            overrides this specification.
+        scale_metadata: Metadata attached to the scale parameter.
+        bias_metadata: Metadata attached to the bias parameter.
+
+    Attributes:
+        num_features: Retained feature shape as a tuple.
+        axes: Input dimensions treated as features.
+        scale: Learnable multiplicative parameter, or ``None`` when affine
+            parameters are disabled.
+        bias: Learnable additive parameter, or ``None`` when disabled.
+        running_mean: Non-trainable running mean, or ``None`` when tracking is
+            disabled.
+        running_var: Non-trainable running variance, or ``None`` when tracking
+            is disabled.
+        num_batches_tracked: Number of eager training batches incorporated into
+            the running statistics, or ``None`` when tracking is disabled.
+
+    Example:
+        Train once to record statistics, then switch to evaluation mode:
+
+        >>> import jax.numpy as jnp
+        >>> from taktiny import nn
+        >>> layer = nn.BatchNorm(4, momentum=1.0)
+        >>> x = jnp.arange(24, dtype=jnp.float32).reshape(2, 3, 4)
+        >>> training_output = layer(x)
+        >>> _ = layer.eval()
+        >>> evaluation_output = layer(x)
+        >>> training_output.shape == evaluation_output.shape
+        True
+
+    References:
+        Sergey Ioffe and Christian Szegedy,
+        "Batch Normalization: Accelerating Deep Network Training by Reducing
+        Internal Covariate Shift" (2015).
+        https://arxiv.org/abs/1502.03167
     """
 
     def __init__(
         self,
-        num_features: int,
-        eps: float = 1e-5,
+        num_features: GenericShape,
+        epsilon: float = 1e-6,
         *,
-        momentum: float | None = 0.1,
-        affine: bool = True,
-        track_running_stats: bool = True,
+        bias: bool = False,
         dtype: DType | None = None,
-        bias: bool = True,
-        channel_axis: int = -1,
-        initializer: Initializer = jnp.ones,
-        bias_initializer: Initializer = jnp.zeros,
+        rngs: Rngs | None = None,
+        elementwise_affine: bool = True,
+        momentum: float | None = 0.1,
+        track_running_stats: bool = True,
+        axes: GenericShape | None = None,
+        scale_initializer: Initializer = initializers.ones,
+        bias_initializer: Initializer = initializers.zeros,
+        quant: QuantConfig = None,
         axis_names: AxisNames | None = None,
-        collective_axis_name: MeshAxisName = None,
+        partition_spec: PartitionSpec | None = None,
+        scale_metadata: MetaData | None = None,
+        bias_metadata: MetaData | None = None,
     ) -> None:
-        """Initializes the BatchNorm module.
-
-        Args:
-            num_features (int): Expected number of features.
-            eps (float, optional): A value added to the denominator for numerical stability. Defaults to 1e-5.
-            momentum (float | None, optional): The value used for the running_mean and running_var computation. Defaults to 0.1.
-            affine (bool, optional): A boolean value that when set to True, this module has learnable affine parameters. Defaults to True.
-            track_running_stats (bool, optional): A boolean value that when set to True, this module tracks the running mean and variance. Defaults to True.
-            dtype (DType | None, optional): Data type of the module parameters. Defaults to None.
-            bias (bool, optional): If set to False, the layer will not learn an additive bias. Defaults to True.
-            channel_axis (int, optional): The axis containing the channel information. Defaults to -1.
-            initializer (Initializer, optional): Initializer for the weight parameter. Defaults to jnp.ones.
-            bias_initializer (Initializer, optional): Initializer for the bias parameter. Defaults to jnp.zeros.
-            axis_names (AxisNames | None, optional): Logical names for the parameter axes. Defaults to None.
-            collective_axis_name (MeshAxisName, optional): The axis name to normalize over collectively in parallel. Defaults to None.
-            shard_mode (optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
-        """
-        self.num_features = _validate_integer(num_features, 'num_features')
-        self.eps = _validate_positive_float(eps, 'eps')
+        _validate_quant(quant)
+        self.num_features = _normalize_shape(num_features, 'num_features')
+        self.epsilon = _validate_positive_float(epsilon, 'epsilon')
         if momentum is not None:
-            if not math.isfinite(momentum) or not 0 <= momentum <= 1:
+            if (
+                isinstance(momentum, bool)
+                or not isinstance(momentum, (int, float))
+                or not math.isfinite(momentum)
+                or not 0 <= momentum <= 1
+            ):
                 raise ValueError('momentum must be None or between 0 and 1')
             momentum = float(momentum)
         self.momentum = momentum
-        self.affine = bool(affine)
-        self.has_bias = self.affine and bool(bias)
+        self.elementwise_affine = bool(elementwise_affine)
         self.track_running_stats = bool(track_running_stats)
-        self.channel_axis = channel_axis
-        self.collective_axis_name = collective_axis_name
-        dtype = jnp.float32 if dtype is None else dtype
+        self.axes = _feature_axes(axes, len(self.num_features), 'axes')
+        names = _parameter_axis_names(axis_names, len(self.num_features))
+        rngs = Rngs(0) if rngs is None else rngs
 
-        names = _parameter_axis_names(axis_names, 1)
-        if self.affine:
-            self.weight = Parameter(initializer((num_features,), dtype=dtype))
-            if names is not None:
-                self.weight.axis_names = names
-            if self.has_bias:
-                self.bias = Parameter(
-                    bias_initializer((num_features,), dtype=dtype)
+        self.scale = None
+        self.bias = None
+        if self.elementwise_affine:
+            self.scale = _new_parameter(
+                scale_initializer,
+                rngs,
+                self.num_features,
+                dtype,
+                names,
+                partition_spec,
+                scale_metadata,
+            )
+            if bias:
+                self.bias = _new_parameter(
+                    bias_initializer,
+                    rngs,
+                    self.num_features,
+                    dtype,
+                    names,
+                    partition_spec,
+                    bias_metadata,
                 )
-                if names is not None:
-                    self.bias.axis_names = names
 
+        self.running_mean = None
+        self.running_var = None
+        self.num_batches_tracked = None
         if self.track_running_stats:
-            self.running_mean = Parameter(
-                jnp.zeros((num_features,), dtype=dtype),
+            state_dtype = jnp.float32 if dtype is None else dtype
+            self.running_mean = _new_parameter(
+                initializers.zeros,
+                rngs,
+                self.num_features,
+                state_dtype,
+                names,
+                partition_spec,
                 trainable=False,
             )
-            self.running_var = Parameter(
-                jnp.ones((num_features,), dtype=dtype),
+            self.running_var = _new_parameter(
+                initializers.ones,
+                rngs,
+                self.num_features,
+                state_dtype,
+                names,
+                partition_spec,
                 trainable=False,
             )
             self.num_batches_tracked = Parameter(
                 jnp.asarray(0, dtype=jnp.int32),
                 trainable=False,
             )
-            if names is not None:
-                self.running_mean.axis_names = names
-                self.running_var.axis_names = names
 
     def statistics(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """Computes the mean and variance of the input tensor.
-
-        Args:
-            x (jax.Array): The input tensor.
-
-        Returns:
-            tuple[jax.Array, jax.Array]: A tuple containing the mean and variance.
-        """
-
+        """Compute batch mean and variance in feature-axis order."""
         x = jnp.asarray(x)
         _validate_floating(x)
-        channel_axis = _canonical_axis(
-            self.channel_axis,
-            x.ndim,
-            name='channel_axis',
-        )
-        if x.shape[channel_axis] != self.num_features:
-            raise ValueError(
-                f'expected {self.num_features} features on axis '
-                f'{channel_axis}, got shape {x.shape}'
-            )
-        reduction_axes = tuple(
-            axis for axis in range(x.ndim) if axis != channel_axis
-        )
-        if not reduction_axes:
-            raise ValueError('BatchNorm requires at least one reduction axis')
-
-        value = _statistics_value(x)
-        mean = jnp.mean(value, axis=reduction_axes)
-        if self.collective_axis_name is not None:
-            mean_square = jnp.mean(jnp.square(value), axis=reduction_axes)
-            mean = jax.lax.pmean(mean, self.collective_axis_name)
-            mean_square = jax.lax.pmean(
-                mean_square,
-                self.collective_axis_name,
-            )
-            variance = jnp.maximum(mean_square - jnp.square(mean), 0)
-        else:
-            variance = jnp.var(value, axis=reduction_axes)
-        return mean, variance
+        axes = _canonical_axes(self.axes, x.ndim)
+        _validate_input_shape(x, self.num_features, axes)
+        return _feature_statistics(_statistics_value(x), axes)
 
     def update_running_stats(
         self,
         mean: jax.Array,
         variance: jax.Array,
     ) -> None:
-        """Updates the running mean and variance statistics.
-
-        Args:
-            mean (jax.Array): The current batch mean.
-            variance (jax.Array): The current batch variance.
-        """
-
+        """Update tracked statistics from an eager training call."""
         if not self.track_running_stats:
-            raise ValueError('running statistics are disabled')
-
+            return
+        assert self.running_mean is not None
+        assert self.running_var is not None
+        assert self.num_batches_tracked is not None
         if isinstance(mean, Tracer) or isinstance(variance, Tracer):
             raise TypeError(
-                'BatchNorm running statistics cannot be mutated while tracing'
+                'BatchNorm running statistics cannot be mutated while tracing; '
+                'use eval mode or track_running_stats=False under jax.jit'
             )
-        if mean.shape != (self.num_features,) or variance.shape != (
-            self.num_features,
-        ):
+        if mean.shape != self.num_features or variance.shape != self.num_features:
             raise ValueError(
-                'mean and variance must both have shape '
-                f'({self.num_features},)'
+                f'expected statistics with shape {self.num_features}, got '
+                f'{mean.shape} and {variance.shape}'
             )
 
-        count = int(jax.device_get(self.num_batches_tracked.value)) + 1
-        factor = 1.0 / count if self.momentum is None else self.momentum
-        mean = mean.astype(self.running_mean.value.dtype)
-        variance = variance.astype(self.running_var.value.dtype)
+        count = int(self.num_batches_tracked.value) + 1
+        factor = (1.0 / count) if self.momentum is None else self.momentum
         self.running_mean._value = (
-            (1.0 - factor) * self.running_mean.value + factor * mean
+            (1.0 - factor) * self.running_mean.value
+            + factor * mean.astype(self.running_mean.value.dtype)
         )
         self.running_var._value = (
-            (1.0 - factor) * self.running_var.value + factor * variance
+            (1.0 - factor) * self.running_var.value
+            + factor * variance.astype(self.running_var.value.dtype)
         )
         self.num_batches_tracked._value = jnp.asarray(count, dtype=jnp.int32)
 
     def reset_running_stats(self) -> None:
-        """
-        Resets the running mean and variance to their initial values.
-        """
-
+        """Reset tracked statistics to mean zero and variance one."""
         if not self.track_running_stats:
-            raise ValueError('running statistics are disabled')
+            return
+        assert self.running_mean is not None
+        assert self.running_var is not None
+        assert self.num_batches_tracked is not None
         self.running_mean._value = jnp.zeros_like(self.running_mean.value)
         self.running_var._value = jnp.ones_like(self.running_var.value)
         self.num_batches_tracked._value = jnp.asarray(0, dtype=jnp.int32)
@@ -620,236 +729,270 @@ class BatchNorm(Module):
     def __call__(
         self,
         x: jax.Array,
-        *,
-        training: bool | None = None,
-        update_stats: bool = False,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
-        """Applies batch normalization to the input.
-
-        Args:
-            x (jax.Array): The input tensor.
-            training (bool | None, optional): Whether the module is in training mode. Defaults to None.
-            update_stats (bool, optional): Whether to update the running statistics. Defaults to False.
-            out_sharding (jax.sharding.Sharding | None, optional): Sharding constraint for the output. Defaults to None.
-
-        Returns:
-            jax.Array: The normalized input.
-        """
-
+        """Apply batch normalization using the module's current mode."""
         x = jnp.asarray(x)
         _validate_floating(x)
-        training = _resolve_training(self.training, training)
-        channel_axis = _canonical_axis(
-            self.channel_axis,
-            x.ndim,
-            name='channel_axis',
-        )
-        if x.shape[channel_axis] != self.num_features:
-            raise ValueError(
-                f'expected {self.num_features} features on axis '
-                f'{channel_axis}, got shape {x.shape}'
-            )
+        axes = _canonical_axes(self.axes, x.ndim)
+        _validate_input_shape(x, self.num_features, axes)
+        value = _statistics_value(x)
 
-        use_batch_stats = training or not self.track_running_stats
-        if use_batch_stats:
-            mean, variance = self.statistics(x)
-            if training and update_stats:
+        if self.is_training or not self.track_running_stats:
+            mean, variance = _feature_statistics(value, axes)
+            if self.is_training and self.track_running_stats:
                 self.update_running_stats(mean, variance)
         else:
-            mean = self.running_mean.value
-            variance = self.running_var.value
+            assert self.running_mean is not None
+            assert self.running_var is not None
+            mean = self.running_mean.value.astype(value.dtype)
+            variance = self.running_var.value.astype(value.dtype)
 
-        input_dtype = x.dtype
-        value = _statistics_value(x)
-        broadcast_shape = [1] * x.ndim
-        broadcast_shape[channel_axis] = self.num_features
-        mean = mean.astype(value.dtype).reshape(broadcast_shape)
-        variance = variance.astype(value.dtype).reshape(broadcast_shape)
-        output = (value - mean) * jax.lax.rsqrt(variance + self.eps)
-
-        if self.affine:
-            weight = self.weight.value.astype(value.dtype).reshape(
-                broadcast_shape
+        mean = _broadcast_parameter(mean, x.ndim, axes)
+        variance = _broadcast_parameter(variance, x.ndim, axes)
+        output = (value - mean) * jax.lax.rsqrt(variance + self.epsilon)
+        if self.scale is not None:
+            output *= _broadcast_parameter(
+                self.scale.value.astype(value.dtype), x.ndim, axes
             )
-            output = output * weight
-            if self.has_bias:
-                bias = self.bias.value.astype(value.dtype).reshape(
-                    broadcast_shape
-                )
-                output = output + bias
-
-        output = output.astype(input_dtype)
-        return _constrain(output, out_sharding)
+        if self.bias is not None:
+            output += _broadcast_parameter(
+                self.bias.value.astype(value.dtype), x.ndim, axes
+            )
+        return _constrain(output.astype(x.dtype), out_sharding)
 
     def extra_repr(self) -> str:
         return (
-            f'{self.num_features}, eps={self.eps:g}, '
-            f'momentum={self.momentum}, axis={self.channel_axis}'
+            f'{_shape_repr(self.num_features)}, epsilon={self.epsilon:g}, '
+            f'momentum={self.momentum}, affine={self.elementwise_affine}'
         )
 
 
 class GroupNorm(Module):
-    """
-    Applies Group Normalization over a mini-batch of inputs.
+    """Normalize grouped channels independently of the batch size.
+
+    GroupNorm divides each channel dimension into a corresponding number of
+    groups. For every sample and Cartesian combination of channel groups, it
+    computes mean and variance across the within-group channel dimensions and
+    every spatial dimension:
+
+    ``output = (x - mean) / sqrt(variance + epsilon) * scale + bias``.
+
+    ``num_channels`` and ``num_groups`` may both be N-D shapes. They must have
+    equal rank, and every ``num_channels[i]`` must be divisible by
+    ``num_groups[i]``. Their dimensions correspond in order to
+    ``channel_axes``. With N-D channels and the default ``channel_axes=-1``,
+    the final ``len(num_channels)`` dimensions are selected automatically.
+
+    Dimensions in ``batch_axes`` are kept independent and never contribute to
+    the statistics. The default is the leading dimension ``0``. Pass an empty
+    tuple for unbatched input. Because GroupNorm never aggregates across batch
+    dimensions and stores no running statistics, training and evaluation modes
+    behave identically. Float16 and bfloat16 statistics are computed in
+    float32, and the result is cast back to the input dtype.
+
+    Args:
+        num_groups: Number of groups used to split each channel dimension. An
+            integer is treated as a one-dimensional group shape.
+        num_channels: Size of every channel dimension. It must have the same
+            rank as ``num_groups``.
+        epsilon: Positive value added to the variance before the reciprocal
+            square root. Defaults to ``1e-6``.
+        bias: Whether to create an additive bias when affine parameters are
+            enabled. Defaults to ``False``.
+        dtype: Dtype passed to the parameter initializers. Defaults to each
+            initializer's default dtype.
+        rngs: Random stream used by parameter initializers. A deterministic
+            stream seeded with zero is used when omitted.
+        elementwise_affine: Whether to create a learnable scale and optional
+            bias with shape ``num_channels``. Defaults to ``True``.
+        channel_axes: Input dimensions corresponding to ``num_channels``, in
+            the same order. Defaults to the trailing channel dimensions.
+        batch_axes: Input dimensions kept independent during normalization.
+            Defaults to the leading dimension ``0``. Use ``()`` for unbatched
+            input.
+        scale_initializer: Initializer for the multiplicative scale.
+            Defaults to ones.
+        bias_initializer: Initializer for the additive bias.
+            Defaults to zeros.
+        quant: Optional Qwix configuration. Rules for unrelated operation
+            types are ignored; quantized normalization parameters are not yet
+            supported.
+        axis_names: Logical names for all ``num_channels`` dimensions.
+        partition_spec: Explicit partition specification for affine
+            parameters. A mapping obtained from ``axis_names`` overrides this
+            specification.
+        scale_metadata: Metadata attached to the scale parameter.
+        bias_metadata: Metadata attached to the bias parameter.
+
+    Attributes:
+        num_groups: Group shape as a tuple.
+        num_channels: Channel shape as a tuple.
+        channel_axes: Input dimensions containing channels.
+        batch_axes: Input dimensions kept independent.
+        scale: Learnable multiplicative parameter, or ``None`` when affine
+            parameters are disabled.
+        bias: Learnable additive parameter, or ``None`` when disabled.
+
+    Example:
+        Normalize a tensor with two structured channel dimensions. The final
+        dimensions ``(4, 6)`` are divided into ``(2, 2)`` groups:
+
+        >>> import jax.numpy as jnp
+        >>> from taktiny import nn
+        >>> layer = nn.GroupNorm((2, 2), (4, 6))
+        >>> x = jnp.ones((2, 5, 4, 6), dtype=jnp.float32)
+        >>> layer(x).shape
+        (2, 5, 4, 6)
+
+    References:
+        Yuxin Wu and Kaiming He, "Group Normalization" (2018).
+        https://arxiv.org/abs/1803.08494
     """
 
     def __init__(
         self,
-        num_groups: int,
-        num_channels: int,
-        eps: float = 1e-5,
+        num_groups: GenericShape,
+        num_channels: GenericShape,
+        epsilon: float = 1e-6,
         *,
-        affine: bool = True,
+        bias: bool = False,
         dtype: DType | None = None,
-        bias: bool = True,
-        channel_axis: int = -1,
-        batch_axis: int | None = 0,
-        initializer: Initializer = jnp.ones,
-        bias_initializer: Initializer = jnp.zeros,
+        rngs: Rngs | None = None,
+        elementwise_affine: bool = True,
+        channel_axes: Axes = -1,
+        batch_axes: Axes = 0,
+        scale_initializer: Initializer = initializers.ones,
+        bias_initializer: Initializer = initializers.zeros,
+        quant: QuantConfig = None,
         axis_names: AxisNames | None = None,
+        partition_spec: PartitionSpec | None = None,
+        scale_metadata: MetaData | None = None,
+        bias_metadata: MetaData | None = None,
     ) -> None:
-        """Initializes the GroupNorm module.
-
-        Args:
-            num_groups (int): Expected number of groups.
-            num_channels (int): Expected number of channels.
-            eps (float, optional): A value added to the denominator for numerical stability. Defaults to 1e-5.
-            affine (bool, optional): A boolean value that when set to True, this module has learnable affine parameters. Defaults to True.
-            dtype (DType | None, optional): Data type of the module parameters. Defaults to None.
-            bias (bool, optional): If set to False, the layer will not learn an additive bias. Defaults to True.
-            channel_axis (int, optional): The axis containing the channel information. Defaults to -1.
-            batch_axis (int | None, optional): The batch axis. Defaults to 0.
-            initializer (Initializer, optional): Initializer for the weight parameter. Defaults to jnp.ones.
-            bias_initializer (Initializer, optional): Initializer for the bias parameter. Defaults to jnp.zeros.
-            axis_names (AxisNames | None, optional): Logical names for the parameter axes. Defaults to None.
-            shard_mode (optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
-        """
-
-        self.num_groups = _validate_integer(num_groups, 'num_groups')
-        self.num_channels = _validate_integer(num_channels, 'num_channels')
-        if self.num_channels % self.num_groups != 0:
+        _validate_quant(quant)
+        self.num_groups = _normalize_shape(num_groups, 'num_groups')
+        self.num_channels = _normalize_shape(num_channels, 'num_channels')
+        if len(self.num_groups) != len(self.num_channels):
             raise ValueError(
-                f'num_channels ({num_channels}) must be divisible by '
-                f'num_groups ({num_groups})'
+                'num_groups and num_channels must have the same number of dimensions'
             )
-        self.eps = _validate_positive_float(eps, 'eps')
-        self.affine = bool(affine)
-        self.has_bias = self.affine and bool(bias)
-        self.channel_axis = channel_axis
-        self.batch_axis = batch_axis
-        dtype = jnp.float32 if dtype is None else dtype
-
-        names = _parameter_axis_names(axis_names, 1)
-        if self.affine:
-            self.weight = Parameter(initializer((num_channels,), dtype=dtype))
-            if names is not None:
-                self.weight.axis_names = names
-            if self.has_bias:
-                self.bias = Parameter(
-                    bias_initializer((num_channels,), dtype=dtype)
+        for index, (groups, channels) in enumerate(
+            zip(self.num_groups, self.num_channels)
+        ):
+            if channels % groups:
+                raise ValueError(
+                    f'num_channels[{index}] must be divisible by num_groups[{index}]'
                 )
-                if names is not None:
-                    self.bias.axis_names = names
+
+        self.epsilon = _validate_positive_float(epsilon, 'epsilon')
+        self.elementwise_affine = bool(elementwise_affine)
+        if (
+            isinstance(channel_axes, int)
+            and channel_axes == -1
+            and len(self.num_channels) > 1
+        ):
+            self.channel_axes = _default_axes(len(self.num_channels))
+        else:
+            self.channel_axes = _as_axes(channel_axes, 'channel_axes')
+        if len(self.channel_axes) != len(self.num_channels):
+            raise ValueError(
+                'channel_axes and num_channels must have the same number of dimensions'
+            )
+        self.batch_axes = _as_axes(batch_axes, 'batch_axes')
+
+        names = _parameter_axis_names(axis_names, len(self.num_channels))
+        rngs = Rngs(0) if rngs is None else rngs
+        self.scale = None
+        self.bias = None
+        if self.elementwise_affine:
+            self.scale = _new_parameter(
+                scale_initializer,
+                rngs,
+                self.num_channels,
+                dtype,
+                names,
+                partition_spec,
+                scale_metadata,
+            )
+            if bias:
+                self.bias = _new_parameter(
+                    bias_initializer,
+                    rngs,
+                    self.num_channels,
+                    dtype,
+                    names,
+                    partition_spec,
+                    bias_metadata,
+                )
 
     def __call__(
         self,
         x: jax.Array,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
-        """Applies group normalization to the input.
-
-        Args:
-            x (jax.Array): The input tensor.
-            out_sharding (jax.sharding.Sharding | None, optional): Sharding constraint for the output. Defaults to None.
-
-        Returns:
-            jax.Array: The normalized input.
-        """
-        
+        """Apply group normalization."""
         x = jnp.asarray(x)
         _validate_floating(x)
-        channel_axis = _canonical_axis(
-            self.channel_axis,
+        channel_axes = _canonical_axes(self.channel_axes, x.ndim)
+        batch_axes = _canonical_axes(
+            self.batch_axes,
             x.ndim,
-            name='channel_axis',
+            name='batch_axes',
+            allow_empty=True,
         )
-        if x.shape[channel_axis] != self.num_channels:
-            raise ValueError(
-                f'expected {self.num_channels} channels on axis '
-                f'{channel_axis}, got shape {x.shape}'
-            )
+        if set(channel_axes) & set(batch_axes):
+            raise ValueError('channel_axes and batch_axes must not overlap')
+        _validate_input_shape(x, self.num_channels, channel_axes)
 
-        if self.batch_axis is None:
-            batch_axis = None
-            permutation = tuple(
-                axis for axis in range(x.ndim) if axis != channel_axis
-            ) + (channel_axis,)
-        else:
-            batch_axis = _canonical_axis(
-                self.batch_axis,
-                x.ndim,
-                name='batch_axis',
-            )
-            if batch_axis == channel_axis:
-                raise ValueError('batch_axis and channel_axis must be different')
-            permutation = (
-                batch_axis,
-                *(
-                    axis
-                    for axis in range(x.ndim)
-                    if axis not in (batch_axis, channel_axis)
-                ),
-                channel_axis,
-            )
-
-        value = _statistics_value(x)
-        transposed = jnp.transpose(value, permutation)
-        if batch_axis is None:
-            transposed = transposed[None, ...]
-        grouped = transposed.reshape(
-            *transposed.shape[:-1],
-            self.num_groups,
-            self.num_channels // self.num_groups,
-        )
-        group_axis = grouped.ndim - 2
-        reduction_axes = tuple(
+        spatial_axes = tuple(
             axis
-            for axis in range(1, grouped.ndim)
-            if axis != group_axis
+            for axis in range(x.ndim)
+            if axis not in batch_axes and axis not in channel_axes
         )
+        permutation = batch_axes + spatial_axes + channel_axes
+        transposed = jnp.transpose(_statistics_value(x), permutation)
+        prefix_shape = transposed.shape[:-len(self.num_channels)]
+        split_channels = tuple(
+            chain.from_iterable(
+                (groups, channels // groups)
+                for groups, channels in zip(self.num_groups, self.num_channels)
+            )
+        )
+        grouped = transposed.reshape(prefix_shape + split_channels)
+
+        prefix_rank = len(prefix_shape)
+        spatial_positions = tuple(range(len(batch_axes), prefix_rank))
+        within_group_positions = tuple(
+            prefix_rank + 2 * index + 1
+            for index in range(len(self.num_channels))
+        )
+        reduction_axes = spatial_positions + within_group_positions
         mean = jnp.mean(grouped, axis=reduction_axes, keepdims=True)
         variance = jnp.var(grouped, axis=reduction_axes, keepdims=True)
-        output = (
-            (grouped - mean) * jax.lax.rsqrt(variance + self.eps)
+        normalized = (
+            (grouped - mean) * jax.lax.rsqrt(variance + self.epsilon)
         ).reshape(transposed.shape)
-        if batch_axis is None:
-            output = output[0]
         inverse_permutation = tuple(
             sorted(range(x.ndim), key=permutation.__getitem__)
         )
-        output = jnp.transpose(output, inverse_permutation)
+        output = jnp.transpose(normalized, inverse_permutation)
 
-        if self.affine:
-            broadcast_shape = [1] * x.ndim
-            broadcast_shape[channel_axis] = self.num_channels
-            weight = self.weight.value.astype(output.dtype).reshape(
-                broadcast_shape
+        if self.scale is not None:
+            output *= _broadcast_parameter(
+                self.scale.value.astype(output.dtype), x.ndim, channel_axes
             )
-            output = output * weight
-            if self.has_bias:
-                bias = self.bias.value.astype(output.dtype).reshape(
-                    broadcast_shape
-                )
-                output = output + bias
-
-        output = output.astype(x.dtype)
-        return _constrain(output, out_sharding)
+        if self.bias is not None:
+            output += _broadcast_parameter(
+                self.bias.value.astype(output.dtype), x.ndim, channel_axes
+            )
+        return _constrain(output.astype(x.dtype), out_sharding)
 
     def extra_repr(self) -> str:
         return (
-            f'{self.num_groups} groups, {self.num_channels} channels, '
-            f'eps={self.eps:g}, axis={self.channel_axis}'
+            f'{_shape_repr(self.num_groups)} groups, '
+            f'{_shape_repr(self.num_channels)} channels, '
+            f'epsilon={self.epsilon:g}'
         )
 
 

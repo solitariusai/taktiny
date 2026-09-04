@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""LoRA modules"""
+"""PEFT modules"""
 from __future__ import annotations
 
 import math
@@ -99,7 +99,6 @@ class LoRALinear(Module):
 
     def extra_repr(self) -> str:
         return f"rank={self.rank}, alpha={self.scaling * self.rank}"
-
 
 class DoRALinear(Module):
     """
@@ -288,7 +287,6 @@ class DoRALinear(Module):
 
     def extra_repr(self) -> str:
         return f"rank={self.rank}, alpha={self.alpha}"
-        
 
 class AdaLoRALinear(Module):
     """
@@ -465,7 +463,6 @@ class AdaLoRALinear(Module):
             f"init_rank={self.rank}, "
             f"alpha={self.alpha}"
         )
-
 
 class LoHaLinear(Module):
     """
@@ -646,7 +643,6 @@ class LoHaLinear(Module):
     def extra_repr(self) -> str:
         return f"rank={self.rank}, alpha={self.alpha}"
 
-
 def _factorization(
     dimension: int,
     factor: int = -1,
@@ -677,7 +673,6 @@ def _factorization(
         m, n = n, m
 
     return m, n
-
 
 class LoKrLinear(Module):
     """
@@ -922,7 +917,6 @@ class LoKrLinear(Module):
 
     def extra_repr(self) -> str:
         return f"rank={self.rank}, alpha={self.alpha}"
-
 
 class VeRALinear(Module):
     """
