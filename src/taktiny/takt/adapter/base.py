@@ -22,7 +22,7 @@ from typing import Any
 from taktiny.nn.base import Module
 
 
-class BaseAdapter:
+class AdapterBase:
     """Describe how to replace matching modules with adapter modules.
 
     Subclasses set ``_adapter`` to a ``Module`` type whose first positional
@@ -108,4 +108,4 @@ class BaseAdapter:
         return None
 
 
-__all__ = ['BaseAdapter']
+__all__ = ['AdapterBase']

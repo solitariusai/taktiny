@@ -19,11 +19,11 @@ from typing import Any
 
 from taktiny.nn.modules.peft import AdaLoRALinear
 from taktiny.nn.rng import Rngs
-from taktiny.takt.adapter.base import BaseAdapter
+from taktiny.takt.adapter.base import AdapterBase
 from taktiny.utils.typing import DType
 
 
-class AdaLoRAAdapter(BaseAdapter):
+class AdaLoRAAdapter(AdapterBase):
     """Apply :class:`AdaLoRALinear` to matching modules."""
 
     _adapter = AdaLoRALinear

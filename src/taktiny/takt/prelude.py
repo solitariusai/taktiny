@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any, TypeVar
 
 from taktiny.nn.base import Module, iter_children
-from taktiny.takt.adapter.base import BaseAdapter
+from taktiny.takt.adapter.base import AdapterBase
 
 M = TypeVar('M', bound=Module)
 
@@ -54,7 +54,7 @@ class Takt:
     """Apply adapter objects to existing Taktiny models."""
 
     @classmethod
-    def apply_adapter(cls, model: M, adapter: BaseAdapter) -> M:
+    def apply_adapter(cls, model: M, adapter: AdapterBase) -> M:
         """Inject ``adapter`` into all of its matching modules in ``model``.
 
         Existing model parameters are frozen. Parameters created by adapter
@@ -64,7 +64,7 @@ class Takt:
         """
         if not isinstance(model, Module):
             raise TypeError('Adapters require a Taktiny nn.Module model')
-        if not isinstance(adapter, BaseAdapter):
+        if not isinstance(adapter, AdapterBase):
             raise TypeError('adapter must be a BaseAdapter instance')
 
         targets: list[tuple[Module, str, Module, str]] = []

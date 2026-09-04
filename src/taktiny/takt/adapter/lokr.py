@@ -19,11 +19,11 @@ from typing import Any
 
 from taktiny.nn.modules.peft import LoKrLinear
 from taktiny.nn.rng import Rngs
-from taktiny.takt.adapter.base import BaseAdapter
+from taktiny.takt.adapter.base import AdapterBase
 from taktiny.utils.typing import DType
 
 
-class LoKrAdapter(BaseAdapter):
+class LoKrAdapter(AdapterBase):
     """Apply :class:`LoKrLinear` to matching modules."""
 
     _adapter = LoKrLinear

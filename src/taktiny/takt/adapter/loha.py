@@ -19,11 +19,11 @@ from typing import Any
 
 from taktiny.nn.modules.peft import LoHaLinear
 from taktiny.nn.rng import Rngs
-from taktiny.takt.adapter.base import BaseAdapter
+from taktiny.takt.adapter.base import AdapterBase
 from taktiny.utils.typing import DType
 
 
-class LoHaAdapter(BaseAdapter):
+class LoHaAdapter(AdapterBase):
     """Apply :class:`LoHaLinear` to matching modules."""
 
     _adapter = LoHaLinear

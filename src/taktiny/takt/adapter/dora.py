@@ -19,11 +19,11 @@ from typing import Any
 
 from taktiny.nn.modules.peft import DoRALinear
 from taktiny.nn.rng import Rngs
-from taktiny.takt.adapter.base import BaseAdapter
+from taktiny.takt.adapter.base import AdapterBase
 from taktiny.utils.typing import DType
 
 
-class DoRAAdapter(BaseAdapter):
+class DoRAAdapter(AdapterBase):
     """Apply :class:`DoRALinear` to matching modules."""
 
     _adapter = DoRALinear

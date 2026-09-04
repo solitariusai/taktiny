@@ -17,11 +17,11 @@ from __future__ import annotations
 
 from taktiny.nn.modules.peft import LoRALinear
 from taktiny.nn.rng import Rngs
-from taktiny.takt.adapter.base import BaseAdapter
+from taktiny.takt.adapter.base import AdapterBase
 from taktiny.utils.typing import DType
 
 
-class LoRAAdapter(BaseAdapter):
+class LoRAAdapter(AdapterBase):
     """Apply :class:`LoRALinear` to modules selected by regex patterns."""
 
     _adapter = LoRALinear
