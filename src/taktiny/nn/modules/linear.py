@@ -61,24 +61,24 @@ class Linear(Module):
 
     .. math::
         y = x W + b
-
+    
     Args:
         in_features (int | tuple[int, ...]): Size of each input sample. Can be a tuple for higher dimensional contraction.
         out_features (int | tuple[int, ...]): Size of each output sample.
+        rngs (Rngs | None): Random number generator for weight initialization. Required if weights are initialized.
         bias (bool, optional): If set to False, the layer will not learn an additive bias. Defaults to True.
         dtype (DType | None, optional): The data type of the computation. Defaults to 'float32'.
-        rngs (Rngs | None): Random number generator for weight initialization. Required if weights are initialized.
         kernel_initializer (Initializer, optional): Initializer function for the weight matrix. Defaults to lecun_uniform.
         bias_initializer (Initializer, optional): Initializer function for the bias vector. Defaults to zeros.
-        quant (tp.Any, optional): Optional quantization configuration for the weight. Defaults to None.
-        dot_general (tp.Any, optional): Optional custom dot_general implementation. Defaults to None.
+        quant (QuantConfig, optional): Optional quantization configuration for the weight. Defaults to None.
+        dot_general (DotGeneral | None, optional): Optional custom dot_general implementation. Defaults to None.
         axis_names (AxisNames | None, optional): Logical axis names for parameter sharding metadata. Defaults to None.
         partition_spec (PartitionSpec | None, optional): Explicit hardware sharding specification. Defaults to None.
-        kernel_meta_data (dict[str, Any] | Sequence[tuple[str, Any]] | None, optional): Additional metadata for the kernel parameter. Defaults to None.
-        bias_meta_data (dict[str, Any] | Sequence[tuple[str, Any]] | None, optional): Additional metadata for the bias parameter. Defaults to None.
+        kernel_metadata (dict[str, Any] | Sequence[tuple[str, Any]] | None, optional): Additional metadata for the kernel parameter. Defaults to None.
+        bias_metadata (dict[str, Any] | Sequence[tuple[str, Any]] | None, optional): Additional metadata for the bias parameter. Defaults to None.
         precision (PrecisionLike, optional): Numerical precision for the dot product (e.g. jax.lax.Precision). Defaults to None.
         preferred_element_type (DTypeLike | None, optional): Preferred accumulation type for the dot product. Defaults to None.
-
+        
     Example:
         ```python
         import jax
@@ -242,7 +242,26 @@ class Linear(Module):
 
 
 class Bilinear(Module):
-    """Applies a bilinear transformation to the incoming data."""
+    """_summary_
+
+    Args:
+        in1_features (int | tuple[int, ...]): _description_
+        in2_features (int | tuple[int, ...]): _description_
+        out_features (int | tuple[int, ...]): _description_
+        rngs (Rngs): _description_
+        bias (bool, optional): _description_. Defaults to True.
+        dtype (DType | None, optional): _description_. Defaults to None.
+        kernel_initializer (Initializer, optional): _description_. Defaults to default_kernel_initializer.
+        bias_initializer (Initializer, optional): _description_. Defaults to default_bias_initializer.
+        quant (QuantConfig, optional): _description_. Defaults to None.
+        dot_general (DotGeneral | None, optional): _description_. Defaults to None.
+        axis_names (AxisNames | None, optional): _description_. Defaults to None.
+        partition_spec (PartitionSpec | None, optional): _description_. Defaults to None.
+        kernel_metadata (dict[str, Any] | Sequence[tuple[str, Any]] | None, optional): _description_. Defaults to None.
+        bias_metadata (dict[str, Any] | Sequence[tuple[str, Any]] | None, optional): _description_. Defaults to None.
+        precision (PrecisionLike, optional): _description_. Defaults to None.
+        preferred_element_type (DTypeLike | None, optional): _description_. Defaults to None.
+    """
 
     def __init__(
         self,
@@ -251,30 +270,19 @@ class Bilinear(Module):
         out_features: int | tuple[int, ...],
         *,
         bias: bool = True,
-        dtype: DType | None = jnp.float32,
-        rngs: Rngs | None = None,
-        initializer: Initializer = default_kernel_initializer,
+        dtype: DType | None = None,
+        rngs: Rngs,
+        kernel_initializer: Initializer = default_kernel_initializer,
+        bias_initializer: Initializer = default_bias_initializer,
         quant: QuantConfig = None,
-        dot_general: tp.Any = None,
+        dot_general: DotGeneral | None = None,
         axis_names: AxisNames | None = None,
-        partition_spec: tp.Any | None = None,
+        partition_spec: PartitionSpec | None = None,
+        kernel_metadata: dict[str, Any] | Sequence[tuple[str, Any]] | None = None,
+        bias_metadata: dict[str, Any] | Sequence[tuple[str, Any]] | None = None,
+        precision: PrecisionLike = None,
+        preferred_element_type: DTypeLike | None = None,
     ) -> None:
-        """Initializes the bilinear module.
-
-        Args:
-            in1_features (int | tuple[int, ...]): Size of each first input sample.
-            in2_features (int | tuple[int, ...]): Size of each second input sample.
-            out_features (int | tuple[int, ...]): Size of each output sample.
-            bias (bool, optional): If set to False, the layer will not learn an additive bias. Defaults to True.
-            dtype (DType | None, optional): The dtype of the computation. Defaults to jnp.float32.
-            rngs (Rngs | None, optional): Random number generators for initialization. Defaults to None.
-            initializer (Initializer, optional): Initializer for the weight matrix. Defaults to default_linear_initializer.
-            quant (tp.Any, optional): Quantization configuration. Defaults to None.
-            dot_general (tp.Any, optional): Custom dot_general implementation. Defaults to None.
-            axis_names (AxisNames | None, optional): Names for the axes of the weight and bias parameters. Defaults to None.
-            partition_spec (PartitionSpec | None, optional): Explicit hardware sharding specification. Defaults to None.
-            shard_mode (optional): Sharding mode for the output. Defaults to ShardMode.AUTO.
-        """
         self.in1_features = _normalize_shape(in1_features, 'in1_features')
         self.in2_features = _normalize_shape(in2_features, 'in2_features')
         self.out_features = _normalize_shape(out_features, 'out_features')
@@ -289,7 +297,10 @@ class Bilinear(Module):
             + self.in2_features
             + self.out_features
         )
-        weight_array = initializer(rngs(), weight_shape, dtype)
+        if axis_names is not None or partition_spec is not None:
+            kernel_initializer = with_logical_partitioning(kernel_initializer, axis_names, partition_spec)
+        
+        weight_array = kernel_initializer(rngs(), weight_shape, dtype)
         
         if quant is not None:
             from taktiny.utils.quantization import resolve_quantization_rule, quantize_linear_weight
@@ -302,25 +313,31 @@ class Bilinear(Module):
                     batch_axis_count=0,
                 )
 
-        self.weight = Parameter(weight_array)
+        self.weight = Parameter(
+            weight_array,
+            axis_names=axis_names,
+            partition_spec=partition_spec,
+            metadata=kernel_metadata
+        )
 
-        # Note: Bilinear hasn't been updated to use with_logical_partitioning yet. Let's just pass partition_spec to Parameter.
-        if axis_names is not None:
-            if len(axis_names) != len(weight_shape):
-                raise ValueError(
-                    f'axis_names length {len(axis_names)} must match '
-                    f'weight dimensions {len(weight_shape)}'
-                )
-            self.weight.axis_names = axis_names
-        if partition_spec is not None:
-            self.weight.partition_spec = partition_spec
-
+        self.bias = None
         if bias:
-            self.bias = Parameter(jnp.zeros(self.out_features, dtype=dtype))
+            bias_axis_names = None
+            bias_partition_spec = None
             if axis_names is not None:
-                self.bias.axis_names = axis_names[-len(self.out_features):]
+                bias_axis_names = axis_names[-len(self.out_features):]
             if partition_spec is not None:
-                self.bias.partition_spec = partition_spec[-len(self.out_features):]
+                bias_partition_spec = partition_spec[-len(self.out_features):]
+                
+            if bias_axis_names is not None or bias_partition_spec is not None:
+                bias_initializer = with_logical_partitioning(bias_initializer, bias_axis_names, bias_partition_spec)
+
+            self.bias = Parameter(
+                bias_initializer(rngs(), self.out_features, dtype),
+                axis_names=bias_axis_names,
+                partition_spec=bias_partition_spec,
+                metadata=bias_metadata
+            )
 
     def __call__(
         self,
