@@ -142,18 +142,42 @@ def quantize_linear_weight(array: Any, rule: Any, input_axis_count: int, batch_a
     )
 
 
-def quantize_embedding_weight(array: Any, rule: Any, scale_dtype: Any = None) -> Any:
+def quantize_embedding_weight(
+    array: Any,
+    rule: Any,
+    scale_dtype: Any = None,
+    vocabulary_axis_count: int = 1,
+) -> Any:
     tiled_axes = None
     if rule.tile_size is not None:
-        tiled_axes = {1: rule.tile_size}
+        tiled_axes = {array.ndim - 1: rule.tile_size}
 
     return qwix.quantize(
         jnp.asarray(array),
         rule.weight_qtype,
-        channelwise_axes=(0,),
+        channelwise_axes=tuple(range(vocabulary_axis_count)),
         tiled_axes=tiled_axes,
         calibration_method=rule.weight_calibration_method,
         scale_dtype=scale_dtype or getattr(array, "dtype", None),
+    )
+
+
+def quantize_conv_weight(
+    array: Any,
+    rule: Any,
+    output_axis_count: int = 1,
+    scale_dtype: Any = None,
+) -> Any:
+    """Quantizes a convolution kernel per structured output channel."""
+    channelwise_axes = tuple(
+        range(array.ndim - output_axis_count, array.ndim)
+    )
+    return qwix.quantize(
+        jnp.asarray(array),
+        rule.weight_qtype,
+        channelwise_axes=channelwise_axes,
+        calibration_method=rule.weight_calibration_method,
+        scale_dtype=scale_dtype or getattr(array, 'dtype', None),
     )
 
 
@@ -164,4 +188,5 @@ __all__ = [
     'resolve_quantization_rule',
     'quantize_linear_weight',
     'quantize_embedding_weight',
+    'quantize_conv_weight',
 ]

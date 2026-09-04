@@ -158,6 +158,11 @@ class Module:
 
     training: bool = True
 
+    @property
+    def is_training(self) -> bool:
+        """Whether this module is currently in training mode."""
+        return self.training
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """
         Initializes subclasses and registers them as PyTree nodes.
@@ -323,10 +328,14 @@ class Parameter(Module):
         metadata (dict[str, Any] | Sequence[tuple[str, Any]] | None, optional): Optional metadata dictionary for custom layer logic. Defaults to None.
 
     Example:
+        >>> import jax, jax.numpy as jnp
         >>> from taktiny.nn import Parameter
-        >>> 
-        >>> z = Parameter(jnp.ones((4, 4)))
-        >>> output = jnp.dot(x, z)  # Parameter behaves like a normal array
+        >>>
+        >>> k = jax.random.key(0)
+        >>> k1, k2 = jax.random.split(k, 2)
+        >>> x = jax.random.normal(k1, (5, 10))
+        >>> z = Parameter(jax.random.normal(k2, (10, 5)))
+        >>> output = jnp.dot(x, z)
     """
 
     def __init__(
@@ -539,7 +548,6 @@ class Parameter(Module):
             metadata=self.metadata
         )
         return p
-
 
 def module(cls):
     """Class decorator to transform a generic class into a Module subclass.

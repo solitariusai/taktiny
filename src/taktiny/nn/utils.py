@@ -337,8 +337,12 @@ def _canonical_padding(
         effective_kernel = spacing * (kernel - 1) + 1
         output = math.ceil(size / step)
         total = max((output - 1) * step + effective_kernel - size, 0)
-        low = total // 2
-        pairs.append((low, total - low))
+        if padding == 'SAME_LOWER':
+            high = total // 2
+            pairs.append((total - high, high))
+        else:
+            low = total // 2
+            pairs.append((low, total - low))
     return tuple(pairs)
 
 
