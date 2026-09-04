@@ -23,7 +23,7 @@ def test_conv_transpose_1d():
         kernel_size=3,
         stride=2,
         bias=False,
-        initializer=ones,
+        kernel_initializer=ones,
         rngs=nn.Rngs(0),
     )
 
@@ -41,7 +41,8 @@ def test_conv_transpose_uses_cross_correlation_adjoint_orientation():
         1,
         kernel_size=3,
         bias=False,
-        initializer=ascending,
+        dtype=jnp.float32,
+        kernel_initializer=ascending,
         rngs=nn.Rngs(0),
     )
 
@@ -60,7 +61,7 @@ def test_conv_transpose_groups_and_output_padding():
         output_padding=1,
         groups=2,
         bias=False,
-        initializer=ones,
+        kernel_initializer=ones,
         rngs=nn.Rngs(0),
     )
 
@@ -68,6 +69,35 @@ def test_conv_transpose_groups_and_output_padding():
 
     assert output.shape == (1, 4, 2)
     assert jnp.array_equal(output[..., 0], output[..., 1])
+
+
+def test_conv_transpose_same_lower_matches_forward_adjoint():
+    kernel = jnp.asarray([1.0, 2.0]).reshape(2, 1, 1)
+    cotangent = jnp.asarray([1.0, 2.0, 3.0, 4.0]).reshape(4, 1)
+    layer = nn.ConvTranspose(
+        1,
+        1,
+        kernel_size=2,
+        padding='SAME_LOWER',
+        bias=False,
+        rngs=nn.Rngs(0),
+    )
+    layer.load_state_dict({'kernel': kernel})
+
+    expected = jax.grad(
+        lambda value: jnp.sum(
+            jax.lax.conv_general_dilated(
+                value[None, ...],
+                kernel,
+                window_strides=(1,),
+                padding='SAME_LOWER',
+                dimension_numbers=('NWC', 'WIO', 'NWC'),
+            )[0]
+            * cotangent
+        )
+    )(jnp.zeros((4, 1)))
+
+    assert jnp.array_equal(layer(cotangent), expected)
 
 
 def test_unfold_and_fold_are_overlap_add_pair():
