@@ -15,9 +15,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextvars import ContextVar, Token
+from types import TracebackType
 
 import jax
 from jax._src.random.core import KeyDTypeLike, PRNGSpecDesc
+from jax.extend.core import get_opaque_trace_state
 from jax.tree_util import register_pytree_node_class
 from jax.typing import ArrayLike
 
@@ -26,8 +29,12 @@ from taktiny.utils.typing import PRNGKey
 
 @register_pytree_node_class
 class Rngs:
-    """
-    A sequential random number generator class for maintaining PRNG state in JAX.
+    """A sequential random number generator class for maintaining PRNG state in JAX.
+
+    Args:
+        key (ArrayLike): Seed or PRNGKey to initialize the state.
+        impl (PRNGSpecDesc | None, optional): PRNG implementation specification. Defaults to None.
+        dtype (KeyDTypeLike | None, optional): The dtype of the key array. Defaults to None.
     """
 
     def __init__(
@@ -37,17 +44,11 @@ class Rngs:
         impl: PRNGSpecDesc | None = None,
         dtype: KeyDTypeLike | None = None
     ) -> None:
-        """Initialize the random number generator.
-
-        Args:
-            key (ArrayLike): Seed or PRNGKey to initialize the state.
-            impl (PRNGSpecDesc | None, optional): PRNG implementation specification. Defaults to None.
-            dtype (KeyDTypeLike | None, optional): The dtype of the key array. Defaults to None.
-        """
         try:
             self._key = jax.random.key(key, impl=impl, dtype=dtype)
         except TypeError:
             self._key = jax.numpy.asarray(key)
+        self._trace_state = get_opaque_trace_state()
 
     def __call__(self) -> PRNGKey:
         """Generate a new PRNGKey by splitting the internal key state.
@@ -78,6 +79,99 @@ class Rngs:
     ) -> Rngs:
         obj = object.__new__(cls)
         obj._key = children[0]
+        obj._trace_state = get_opaque_trace_state()
         return obj
 
-__all__ = ['Rngs']
+
+_context_rng: ContextVar[Rngs | None] = ContextVar('taktiny_context_rng', default=None)
+
+
+def _check_context_rng(rngs: Rngs) -> None:
+    if rngs._trace_state != get_opaque_trace_state():
+        raise RuntimeError(
+            'A context RNG cannot be captured across JAX transformations. '
+            'Pass Rngs into the transformed function, use '
+            'with set_context_rng(rngs) inside it, and return the updated Rngs.'
+        )
+
+
+class _ContextRngScope:
+    """Single-use restoration handle for an immediately installed default."""
+
+    def __init__(self, token: Token[Rngs | None], rngs: Rngs | None) -> None:
+        self._token = token
+        self._rngs = rngs
+        self._entered = False
+
+    def __enter__(self) -> Rngs | None:
+        if self._entered:
+            raise RuntimeError('set_context_rng scopes cannot be reused')
+        self._entered = True
+        return self._rngs
+
+    def __exit__(
+        self, exc_type: type[BaseException] | None,
+        exc: BaseException | None, traceback: TracebackType | None,
+    ) -> None:
+        _context_rng.reset(self._token)
+
+
+def set_context_rng(rngs: Rngs | None) -> _ContextRngScope:
+    """Set the default runtime RNG, optionally restoring it with ``with``.
+
+    The stream is installed immediately. Used as a context manager, the
+    previous stream is restored on exit, including exceptional exits. Nested
+    scopes do not reset the keys of previous streams. Pass None to clear or
+    temporarily disable the default. Explicit module RNGs take precedence.
+    Parameter initializers and raw jax.random functions are unaffected.
+
+    Defaults are local to the current Python context, not process-wide.
+    Async tasks inherit their parent's binding, including the mutable Rngs
+    object; install separate streams in tasks that need independent state.
+
+    Do not capture this mutable default in jit/grad/vmap. Pass RNG state into
+    the transformed function, establish a scope inside that function, and
+    return its updated state. Each mapped sample or scan iteration needs its
+    own split key or explicitly threaded RNG state.
+
+    Examples:
+        >>> from taktiny import nn
+        >>> _ = nn.set_context_rng(nn.Rngs(42))
+        >>> with nn.set_context_rng(rngs=nn.Rngs(123)):
+        ...     key = nn.get_context_rng()()
+        >>> _ = nn.set_context_rng(None)
+
+        >>> @jax.jit
+        ... def step(x, rngs):
+        ...     with nn.set_context_rng(rngs):
+        ...         y = nn.Dropout(0.5)(x)
+        ...     return y, rngs
+        >>> y, rngs = step(jax.numpy.ones((8,)), nn.Rngs(0))
+        >>> y, rngs = step(jax.numpy.ones((8,)), rngs)
+    """
+    if rngs is not None:
+        if not isinstance(rngs, Rngs):
+            raise TypeError('rngs must be an Rngs or None')
+            
+        _check_context_rng(rngs)
+    return _ContextRngScope(_context_rng.set(rngs), rngs)
+
+
+def get_context_rng() -> Rngs:
+    """Return the runtime stream without consuming a key.
+
+    Call the returned stream to obtain a fresh key for custom sampling.
+    Raises ValueError if no default is installed, or RuntimeError when an
+    outer mutable stream is accessed across a JAX transformation boundary.
+    """
+    rngs = _context_rng.get()
+    if rngs is None:
+        raise ValueError(
+            'rngs is required for stochastic operations: pass an explicit '
+            'Rngs or install one with set_context_rng(rngs).'
+        )
+    _check_context_rng(rngs)
+    return rngs
+
+
+__all__ = ['Rngs', 'get_context_rng', 'set_context_rng']

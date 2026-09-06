@@ -22,12 +22,12 @@ import jax
 import jax.numpy as jnp
 import qwix
 from jax.lax import PrecisionLike
-from jax.nn.initializers import lecun_uniform, zeros
-from jax.sharding import PartitionSpec
+from jax.nn.initializers import lecun_uniform
+from jax.sharding import NamedSharding, PartitionSpec
 from jax.typing import DTypeLike
 
 from taktiny.nn.base import Module, Parameter
-from taktiny.nn.rng import Rngs
+from taktiny.nn.rng import Rngs, get_context_rng
 from taktiny.nn.utils import (
     _adaptive_pool,
     _as_batched,
@@ -42,6 +42,8 @@ from taktiny.nn.utils import (
     _reduce_window_config,
     _restore_batch,
     _scatter_indices,
+    _validate_integer,
+    _validate_positive_float,
     _window_output_shape,
 )
 from taktiny.utils.quantization import (
@@ -1000,43 +1002,134 @@ class ConvTranspose(Module):
             f'{quant}{custom_conv}'
         )
 
-class Unfold(Module):
-    """
-    Extracts sliding local blocks from a batched input tensor.
+def _positive_spatial(
+    value: GenericShape, *, name: str, rank: int | None = None,
+) -> tuple[int, ...]:
+    values = _normalize_shape(value, name)
+    if rank is not None and isinstance(value, int):
+        values = values * rank
+    if rank is not None and len(values) != rank:
+        raise ValueError(f'{name} must contain {rank} values, got {len(values)}')
+    return values
+
+
+def _spatial_padding(
+    padding: str | int | Sequence[int | tuple[int, int]], rank: int,
+) -> str | tuple[tuple[int, int], ...]:
+    result = Conv._normalize_padding(padding, rank)
+    if not isinstance(result, str):
+        for low, high in result:
+            if isinstance(low, bool) or isinstance(high, bool):
+                raise TypeError('padding values must be integers, not booleans')
+    return result
+
+
+def _boolean(value: bool, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f'{name} must be a boolean')
+    return value
+
+
+def _adaptive_size(value: int | Sequence[int | None]) -> tuple[int | None, ...]:
+    sizes = _normalize_adaptive_size(value)
+    for size in sizes:
+        if size is not None:
+            _validate_integer(size, 'output_size')
+    return sizes
+
+
+class _SpatialOp(Module):
+    """Common channels-last input validation, output placement and repr."""
+
+    spatial_rank: int
+
+    def _input(self, x: jax.Array) -> tuple[jax.Array, bool]:
+        x, unbatched = _as_batched(jnp.asarray(x), self.spatial_rank)
+        if any(size <= 0 for size in x.shape[1:]):
+            raise ValueError('spatial and channel dimensions must be nonempty')
+        return x, unbatched
+
+    def _finish(
+        self, output: jax.Array, unbatched: bool,
+        out_sharding: jax.sharding.Sharding | None,
+    ) -> jax.Array:
+        output = _restore_batch(output, unbatched)
+        if (isinstance(out_sharding, NamedSharding)
+                and out_sharding.mesh.are_all_axes_explicit):
+            return jax.sharding.reshard(output, out_sharding)
+        return _constrain(output, out_sharding)
+
+    def extra_repr(self) -> str:
+        fields = []
+        for name in ('output_size', 'kernel_size', 'stride', 'padding', 'dilation',
+                     'norm_type', 'output_ratio', 'return_indices', 'ceil_mode',
+                     'count_include_pad', 'divisor_override', 'mode', 'value'):
+            value = getattr(self, name, None)
+            if value is None:
+                continue
+            label = {'kernel_size': 'k', 'stride': 's', 'dilation': 'd'}.get(name, name)
+            if name in {'kernel_size', 'stride', 'dilation', 'output_size'}:
+                value = '×'.join('*' if v is None else str(v) for v in value)
+            fields.append(f'{label}={value}')
+        return ', '.join(fields)
+
+
+class Unfold(_SpatialOp):
+    """Extract channels-last sliding windows into flattened patches.
+
+    Inputs are (*spatial, channels) or (batch, *spatial, channels), with one
+    trailing channel axis. Scalars specify 1-D spatial shapes; sequences specify
+    the spatial rank. Spatial and channel dimensions must be nonempty.
+    __call__ accepts out_sharding for the final output.
+
+    Args:
+        kernel_size: Positive spatial window sizes (GenericShape).
+        dilation: Positive spacing within each window, scalar or per-axis.
+        padding: VALID, SAME, SAME_LOWER, a nonnegative symmetric integer,
+            per-axis integers, or per-axis (before, after) pairs. For 1-D,
+            a flat pair denotes asymmetric padding. Padding contributes zeros.
+        stride: Positive window strides; defaults to 1.
+
+    Returns (windows, patch_width) or (batch, windows, patch_width). Windows
+    are flattened in spatial row-major order. Within each patch, channel comes
+    before the kernel axes: patch_width = channels * prod(kernel_size).
+    Raises ValueError when effective kernel and padding produce no windows.
+    Fold sums overlapping patches; it is not automatically an inverse.
+
+    Example:
+        >>> from taktiny import nn
+        >>> import jax.numpy as jnp
+        >>> nn.Unfold(2)(jnp.ones((4, 1))).shape
+        (3, 2)
     """
 
     def __init__(
         self,
-        kernel_size: int | Sequence[int],
-        dilation: int | Sequence[int] = 1,
+        kernel_size: GenericShape,
+        dilation: GenericShape = 1,
         padding: str | int | Sequence[int | tuple[int, int]] = 0,
-        stride: int | Sequence[int] = 1,
+        stride: GenericShape = 1,
     ) -> None:
-        """Initializes the Unfold module.
-
-        Args:
-            kernel_size (int | Sequence[int]): The size of the sliding blocks.
-            dilation (int | Sequence[int], optional): A parameter that controls the stride of elements within the neighborhood. Defaults to 1.
-            padding (str | int | Sequence[int | tuple[int, int]], optional): Implicit zero padding to be added on both sides of input. Defaults to 0.
-            stride (int | Sequence[int], optional): The stride of the sliding blocks in the input spatial dimensions. Defaults to 1.
-        """
-        kernel_size = Conv._normalize_spatial(kernel_size, name='kernel_size')
+        kernel_size = _positive_spatial(kernel_size, name='kernel_size')
         rank = len(kernel_size)
         self.kernel_size = kernel_size
-        self.dilation = Conv._normalize_spatial(
+        self.dilation = _positive_spatial(
             dilation,
             rank=rank,
             name='dilation',
         )
-        self.padding = Conv._normalize_padding(padding, rank)
-        self.stride = Conv._normalize_spatial(
+        self.padding = _spatial_padding(padding, rank)
+        self.stride = _positive_spatial(
             stride,
             rank=rank,
             name='stride',
         )
         self.spatial_rank = rank
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: jax.Array,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array:
         """Extracts patches from the input tensor.
 
         Args:
@@ -1045,12 +1138,16 @@ class Unfold(Module):
         Returns:
             jax.Array: A tensor containing the extracted patches.
         """
-        x, unbatched = _as_batched(x, self.spatial_rank)
+        x, unbatched = self._input(x)
+        padding = _canonical_padding(self.padding, x.shape[1:-1], self.kernel_size,
+                                     self.stride, self.dilation)
+        _window_output_shape(x.shape[1:-1], self.kernel_size, self.stride,
+                             self.dilation, padding)
         patches = jax.lax.conv_general_dilated_patches(
             x,
             filter_shape=self.kernel_size,
             window_strides=self.stride,
-            padding=self.padding,
+            padding=padding,
             rhs_dilation=self.dilation,
             dimension_numbers=_conv_dimension_numbers(self.spatial_rank),
         )
@@ -1059,52 +1156,66 @@ class Unfold(Module):
             math.prod(patches.shape[1:-1]),
             patches.shape[-1],
         )
-        return _restore_batch(patches, unbatched)
+        return self._finish(patches, unbatched, out_sharding)
 
-class Fold(Module):
-    """
-    Combines an array of sliding local blocks into a large containing tensor.
+class Fold(_SpatialOp):
+    """Overlap-add flattened sliding patches into a channels-last array.
+
+    Args:
+        output_size: Positive target spatial dimensions; determines spatial rank.
+        kernel_size: Positive window sizes, scalar or per-axis.
+        dilation: Positive spacing within windows; defaults to 1.
+        padding: The same VALID/SAME/SAME_LOWER or numeric padding used by Unfold.
+        stride: Positive window strides; defaults to 1.
+
+    Input is (windows, patch_width) or (batch, windows, patch_width). Patch
+    layout must match Unfold: channel followed by flattened kernel dimensions.
+    Output is (*output_size, channels), optionally with a batch axis.
+    Overlaps are summed and padded positions are discarded, including negative
+    coordinates; they never wrap around the output. To invert Unfold, divide
+    by the overlap counts where those counts are nonzero. __call__ accepts
+    out_sharding. Patch width must be a positive multiple of kernel volume.
+
+    Example:
+        >>> from taktiny import nn
+        >>> import jax.numpy as jnp
+        >>> nn.Fold(4, 2)(jnp.ones((3, 2)))[:, 0].tolist()
+        [1.0, 2.0, 2.0, 1.0]
     """
 
     def __init__(
         self,
-        output_size: int | Sequence[int],
-        kernel_size: int | Sequence[int],
-        dilation: int | Sequence[int] = 1,
+        output_size: GenericShape,
+        kernel_size: GenericShape,
+        dilation: GenericShape = 1,
         padding: str | int | Sequence[int | tuple[int, int]] = 0,
-        stride: int | Sequence[int] = 1,
+        stride: GenericShape = 1,
     ) -> None:
-        """Initializes the Fold module.
-
-        Args:
-            output_size (int | Sequence[int]): The shape of the spatial dimensions of the output.
-            kernel_size (int | Sequence[int]): The size of the sliding blocks.
-            dilation (int | Sequence[int], optional): A parameter that controls the stride of elements within the neighborhood. Defaults to 1.
-            padding (str | int | Sequence[int | tuple[int, int]], optional): Implicit zero padding to be added on both sides of input. Defaults to 0.
-            stride (int | Sequence[int], optional): The stride of the sliding blocks in the input spatial dimensions. Defaults to 1.
-        """
-        output_size = Conv._normalize_spatial(output_size, name='output_size')
+        output_size = _positive_spatial(output_size, name='output_size')
         rank = len(output_size)
         self.output_size = output_size
-        self.kernel_size = Conv._normalize_spatial(
+        self.kernel_size = _positive_spatial(
             kernel_size,
             rank=rank,
             name='kernel_size',
         )
-        self.dilation = Conv._normalize_spatial(
+        self.dilation = _positive_spatial(
             dilation,
             rank=rank,
             name='dilation',
         )
-        self.padding = Conv._normalize_padding(padding, rank)
-        self.stride = Conv._normalize_spatial(
+        self.padding = _spatial_padding(padding, rank)
+        self.stride = _positive_spatial(
             stride,
             rank=rank,
             name='stride',
         )
         self.spatial_rank = rank
 
-    def __call__(self, patches: jax.Array) -> jax.Array:
+    def __call__(
+        self, patches: jax.Array,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array:
         """Folds the extracted patches back into an output tensor.
 
         Args:
@@ -1113,6 +1224,7 @@ class Fold(Module):
         Returns:
             jax.Array: The folded output tensor.
         """
+        patches = jnp.asarray(patches)
         if patches.ndim not in {2, 3}:
             raise ValueError(
                 'Fold expects [windows, patch] or [batch, windows, patch]'
@@ -1142,7 +1254,7 @@ class Fold(Module):
                 f'got {patches.shape[1]}'
             )
         kernel_volume = math.prod(self.kernel_size)
-        if patches.shape[-1] % kernel_volume:
+        if patches.shape[-1] == 0 or patches.shape[-1] % kernel_volume:
             raise ValueError(
                 'patch width must be divisible by the kernel volume '
                 f'({kernel_volume})'
@@ -1182,54 +1294,72 @@ class Fold(Module):
             ]
             output = output.at[
                 (indices[0], *spatial_indices, indices[-1])
-            ].add(values, mode='drop')
-        return _restore_batch(output, unbatched)
+            ].add(values, mode='drop', wrap_negative_indices=False)
+        return self._finish(output, unbatched, out_sharding)
 
-class MaxPool(Module):
-    """
-    Applies a max pooling over an input signal.
+class MaxPool(_SpatialOp):
+    """Take maxima over channels-last spatial windows.
+
+    Inputs are (*spatial, channels) or (batch, *spatial, channels), with one
+    trailing channel axis. Scalars specify 1-D spatial shapes; sequences specify
+    the spatial rank. Spatial and channel dimensions must be nonempty.
+    __call__ accepts out_sharding for the final output.
+
+    Args:
+        kernel_size: Positive spatial window sizes.
+        stride: Positive strides; None uses kernel_size.
+        padding: VALID, SAME, SAME_LOWER or nonnegative symmetric/asymmetric
+            numeric padding, as in Conv. Padding uses the dtype's minimum
+            identity (negative infinity for floating-point inputs), not zero.
+        dilation: Positive spacing within each pooling window; defaults to 1.
+        return_indices: Return (values, indices) when True.
+        ceil_mode: Include a final partial window by extending right padding.
+
+    Indices are int32 row-major spatial offsets, excluding batch and channel.
+    Ties choose the smallest spatial offset. NaNs propagate; tied NaNs choose
+    the first offset. Fully padded windows use the maximum int32 index sentinel.
+    Complex inputs are unsupported. With indices enabled, out_sharding is
+    applied to both result arrays.
+
+    Example:
+        >>> from taktiny import nn
+        >>> import jax.numpy as jnp
+        >>> values, indices = nn.MaxPool(2, return_indices=True)(jnp.arange(4.)[:, None])
+        >>> values[:, 0].tolist(), indices[:, 0].tolist()
+        ([1.0, 3.0], [1, 3])
     """
 
     def __init__(
         self,
-        kernel_size: int | Sequence[int],
-        stride: int | Sequence[int] | None = None,
+        kernel_size: GenericShape,
+        stride: GenericShape | None = None,
         padding: str | int | Sequence[int | tuple[int, int]] = 0,
-        dilation: int | Sequence[int] = 1,
+        dilation: GenericShape = 1,
         return_indices: bool = False,
         ceil_mode: bool = False,
     ) -> None:
-        """Initializes the MaxPool module.
-
-        Args:
-            kernel_size (int | Sequence[int]): The size of the window to take a max over.
-            stride (int | Sequence[int] | None, optional): The stride of the window. Default value is kernel_size. Defaults to None.
-            padding (str | int | Sequence[int | tuple[int, int]], optional): Implicit zero padding to be added on both sides. Defaults to 0.
-            dilation (int | Sequence[int], optional): A parameter that controls the stride of elements in the window. Defaults to 1.
-            return_indices (bool, optional): If True, will return the max indices along with the outputs. Defaults to False.
-            ceil_mode (bool, optional): When True, will use ceil instead of floor to compute the output shape. Defaults to False.
-        """
-        kernel_size = Conv._normalize_spatial(kernel_size, name='kernel_size')
+        kernel_size = _positive_spatial(kernel_size, name='kernel_size')
         rank = len(kernel_size)
         self.kernel_size = kernel_size
-        self.stride = Conv._normalize_spatial(
+        self.stride = _positive_spatial(
             kernel_size if stride is None else stride,
             rank=rank,
             name='stride',
         )
-        self.padding = Conv._normalize_padding(padding, rank)
-        self.dilation = Conv._normalize_spatial(
+        self.padding = _spatial_padding(padding, rank)
+        self.dilation = _positive_spatial(
             dilation,
             rank=rank,
             name='dilation',
         )
-        self.return_indices = return_indices
-        self.ceil_mode = ceil_mode
+        self.return_indices = _boolean(return_indices, 'return_indices')
+        self.ceil_mode = _boolean(ceil_mode, 'ceil_mode')
         self.spatial_rank = rank
 
     def __call__(
         self,
         x: jax.Array,
+        out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array | tuple[jax.Array, jax.Array]:
         """Applies the max pooling operation.
 
@@ -1239,7 +1369,9 @@ class MaxPool(Module):
         Returns:
             jax.Array | tuple[jax.Array, jax.Array]: The pooled result, and optionally the indices of the maximum values.
         """
-        x, unbatched = _as_batched(x, self.spatial_rank)
+        x, unbatched = self._input(x)
+        if jnp.issubdtype(x.dtype, jnp.complexfloating):
+            raise TypeError('MaxPool does not support complex inputs')
         spatial_shape = x.shape[1:-1]
         padding = _pool_padding(
             self.padding,
@@ -1249,6 +1381,8 @@ class MaxPool(Module):
             self.dilation,
             self.ceil_mode,
         )
+        _window_output_shape(spatial_shape, self.kernel_size, self.stride,
+                             self.dilation, padding)
         window, strides, reduce_padding, window_dilation = (
             _reduce_window_config(
                 self.spatial_rank,
@@ -1269,7 +1403,7 @@ class MaxPool(Module):
                 reduce_padding,
                 window_dilation=window_dilation,
             )
-            return _restore_batch(output, unbatched)
+            return self._finish(output, unbatched, out_sharding)
 
         flat_indices = jnp.arange(
             math.prod(spatial_shape),
@@ -1287,6 +1421,11 @@ class MaxPool(Module):
             choose_right = (right_value > left_value) | (
                 (right_value == left_value) & (right_index < left_index)
             )
+            if jnp.issubdtype(x.dtype, jnp.floating):
+                right_nan, left_nan = jnp.isnan(right_value), jnp.isnan(left_value)
+                choose_right = choose_right | (right_nan & ~left_nan) | (
+                    right_nan & left_nan & (right_index < left_index)
+                )
             return (
                 jnp.where(choose_right, right_value, left_value),
                 jnp.where(choose_right, right_index, left_index),
@@ -1302,43 +1441,61 @@ class MaxPool(Module):
             window_dilation=window_dilation,
         )
         return (
-            _restore_batch(output, unbatched),
-            _restore_batch(indices, unbatched),
+            self._finish(output, unbatched, out_sharding),
+            self._finish(indices, unbatched, out_sharding),
         )
 
-class MaxUnpool(Module):
-    """
-    Computes a partial inverse of MaxPool.
+class MaxUnpool(_SpatialOp):
+    """Scatter pooled values back to their flattened spatial indices.
+
+    Inputs are (*spatial, channels) or (batch, *spatial, channels), with one
+    trailing channel axis. Scalars specify 1-D spatial shapes; sequences specify
+    the spatial rank. Spatial and channel dimensions must be nonempty.
+    __call__ accepts out_sharding for the final output.
+
+    Args:
+        kernel_size: Original positive pooling window sizes.
+        stride: Original strides; None uses kernel_size.
+        padding: Original explicit numeric padding; strings are unsupported.
+        dilation: Original positive window dilation; defaults to 1.
+
+    __call__(x, indices, output_size=None, out_sharding=None) requires integer
+    indices with the same shape as x. output_size contains spatial dimensions
+    only and overrides the shape inferred from kernel, stride, dilation and
+    padding. Supply it when ceil-mode or strided pooling made the original
+    size ambiguous. Out-of-range indices are discarded, not wrapped. Unfilled
+    positions are zero. Repeated indices have unspecified write order, so this
+    is only a partial inverse of MaxPool, not a reconstruction of lost values.
+
+    Example:
+        >>> from taktiny import nn
+        >>> import jax.numpy as jnp
+        >>> x = jnp.arange(4.)[:, None]
+        >>> values, indices = nn.MaxPool(2, return_indices=True)(x)
+        >>> nn.MaxUnpool(2)(values, indices)[:, 0].tolist()
+        [0.0, 1.0, 0.0, 3.0]
     """
 
     def __init__(
         self,
-        kernel_size: int | Sequence[int],
-        stride: int | Sequence[int] | None = None,
+        kernel_size: GenericShape,
+        stride: GenericShape | None = None,
         padding: int | Sequence[int | tuple[int, int]] = 0,
-        dilation: int | Sequence[int] = 1,
+        dilation: GenericShape = 1,
     ) -> None:
-        """Initializes the MaxUnpool module.
-
-        Args:
-            kernel_size (int | Sequence[int]): Size of the max pooling window.
-            stride (int | Sequence[int] | None, optional): Stride of the max pooling window. Defaults to None.
-            padding (int | Sequence[int | tuple[int, int]], optional): Padding that was added to the input. Defaults to 0.
-            dilation (int | Sequence[int], optional): Spacing between window elements. Defaults to 1.
-        """
-        kernel_size = Conv._normalize_spatial(kernel_size, name='kernel_size')
+        kernel_size = _positive_spatial(kernel_size, name='kernel_size')
         rank = len(kernel_size)
         self.kernel_size = kernel_size
-        self.stride = Conv._normalize_spatial(
+        self.stride = _positive_spatial(
             kernel_size if stride is None else stride,
             rank=rank,
             name='stride',
         )
-        normalized_padding = Conv._normalize_padding(padding, rank)
+        normalized_padding = _spatial_padding(padding, rank)
         if isinstance(normalized_padding, str):
             raise TypeError('MaxUnpool requires explicit numeric padding')
         self.padding = normalized_padding
-        self.dilation = Conv._normalize_spatial(
+        self.dilation = _positive_spatial(
             dilation,
             rank=rank,
             name='dilation',
@@ -1349,22 +1506,25 @@ class MaxUnpool(Module):
         self,
         x: jax.Array,
         indices: jax.Array,
-        output_size: int | Sequence[int] | None = None,
+        output_size: GenericShape | None = None,
+        out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
         """Applies the unpooling operation.
 
         Args:
             x (jax.Array): The input array to unpool.
             indices (jax.Array): The indices returned by MaxPool.
-            output_size (int | Sequence[int] | None, optional): The targeted output size. Defaults to None.
+            output_size (GenericShape | None, optional): The targeted output size. Defaults to None.
 
         Returns:
             jax.Array: The unpooled result.
         """
-        x, unbatched = _as_batched(x, self.spatial_rank)
-        indices, indices_unbatched = _as_batched(indices, self.spatial_rank)
+        x, unbatched = self._input(x)
+        indices, indices_unbatched = _as_batched(jnp.asarray(indices), self.spatial_rank)
         if indices_unbatched != unbatched or indices.shape != x.shape:
             raise ValueError('indices must have the same shape as the pooled input')
+        if not jnp.issubdtype(indices.dtype, jnp.integer):
+            raise TypeError('indices must have an integer dtype')
 
         if output_size is None:
             output_size = tuple(
@@ -1382,12 +1542,14 @@ class MaxUnpool(Module):
                 )
             )
         else:
-            output_size = Conv._normalize_spatial(
+            output_size = _positive_spatial(
                 output_size,
                 rank=self.spatial_rank,
                 name='output_size',
             )
 
+        if any(size <= 0 for size in output_size):
+            raise ValueError('output_size must contain positive spatial dimensions')
         batch_size, channels = x.shape[0], x.shape[-1]
         values = x.reshape(batch_size, -1, channels)
         flat_indices = indices.reshape(batch_size, -1, channels)
@@ -1400,51 +1562,69 @@ class MaxUnpool(Module):
         output = output.at[batch, flat_indices, channel].set(
             values,
             mode='drop',
+            wrap_negative_indices=False,
         )
         output = output.reshape(batch_size, *output_size, channels)
-        return _restore_batch(output, unbatched)
+        return self._finish(output, unbatched, out_sharding)
 
-class AvgPool(Module):
-    """
-    Applies an average pooling over an input signal.
+class AvgPool(_SpatialOp):
+    """Average channels-last spatial windows.
+
+    Inputs are (*spatial, channels) or (batch, *spatial, channels), with one
+    trailing channel axis. Scalars specify 1-D spatial shapes; sequences specify
+    the spatial rank. Spatial and channel dimensions must be nonempty.
+    __call__ accepts out_sharding for the final output.
+
+    Args:
+        kernel_size: Positive window sizes.
+        stride: Positive window strides; None uses kernel_size.
+        padding: VALID, SAME, SAME_LOWER or explicit nonnegative padding.
+            Outside-input values contribute zero to each window sum.
+        ceil_mode: Permit a final partial window with extra right padding.
+        count_include_pad: Include configured zero padding in the divisor.
+            Extra padding introduced solely by ceil_mode is never counted.
+        divisor_override: Optional positive integer divisor for every window.
+
+    Integer and boolean inputs are promoted to float32. No RNGs or parameters
+    are used. With count_include_pad=False, the divisor counts actual input
+    elements; configurations containing wholly padded windows have zero count.
+
+    Example:
+        >>> from taktiny import nn
+        >>> import jax.numpy as jnp
+        >>> nn.AvgPool(2)(jnp.arange(4.)[:, None])[:, 0].tolist()
+        [0.5, 2.5]
     """
 
     def __init__(
         self,
-        kernel_size: int | Sequence[int],
-        stride: int | Sequence[int] | None = None,
+        kernel_size: GenericShape,
+        stride: GenericShape | None = None,
         padding: str | int | Sequence[int | tuple[int, int]] = 0,
         ceil_mode: bool = False,
         count_include_pad: bool = True,
         divisor_override: int | None = None,
     ) -> None:
-        """Initializes the AvgPool module.
-
-        Args:
-            kernel_size (int | Sequence[int]): The size of the window.
-            stride (int | Sequence[int] | None, optional): The stride of the window. Defaults to None.
-            padding (str | int | Sequence[int | tuple[int, int]], optional): Implicit zero padding to be added on both sides. Defaults to 0.
-            ceil_mode (bool, optional): When True, will use ceil instead of floor to compute the output shape. Defaults to False.
-            count_include_pad (bool, optional): When True, will include the zero-padding in the averaging calculation. Defaults to True.
-            divisor_override (int | None, optional): If specified, it will be used as divisor, otherwise size of the pooling region will be used. Defaults to None.
-        """
-        kernel_size = Conv._normalize_spatial(kernel_size, name='kernel_size')
+        kernel_size = _positive_spatial(kernel_size, name='kernel_size')
         rank = len(kernel_size)
-        if divisor_override is not None and divisor_override <= 0:
-            raise ValueError('divisor_override must be positive')
+        if divisor_override is not None:
+            _validate_integer(divisor_override, 'divisor_override')
         self.kernel_size = kernel_size
-        self.stride = Conv._normalize_spatial(
+        self.stride = _positive_spatial(
             kernel_size if stride is None else stride,
             rank=rank,
             name='stride',
         )
-        self.padding = Conv._normalize_padding(padding, rank)
-        self.ceil_mode = ceil_mode
-        self.count_include_pad = count_include_pad
+        self.padding = _spatial_padding(padding, rank)
+        self.ceil_mode = _boolean(ceil_mode, 'ceil_mode')
+        self.count_include_pad = _boolean(count_include_pad, 'count_include_pad')
         self.divisor_override = divisor_override
         self.spatial_rank = rank
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: jax.Array,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array:
         """Applies the average pooling operation.
 
         Args:
@@ -1453,7 +1633,7 @@ class AvgPool(Module):
         Returns:
             jax.Array: The pooled result.
         """
-        x, unbatched = _as_batched(x, self.spatial_rank)
+        x, unbatched = self._input(x)
         if not jnp.issubdtype(x.dtype, jnp.inexact):
             x = x.astype(jnp.float32)
         configured_padding = _canonical_padding(
@@ -1471,6 +1651,8 @@ class AvgPool(Module):
             (1,) * self.spatial_rank,
             self.ceil_mode,
         )
+        _window_output_shape(x.shape[1:-1], self.kernel_size, self.stride,
+                             (1,) * self.spatial_rank, padding)
         window, strides, reduce_padding, _ = _reduce_window_config(
             self.spatial_rank,
             self.kernel_size,
@@ -1523,86 +1705,108 @@ class AvgPool(Module):
                 count_padding,
             )
             divisor = valid
-        return _restore_batch(total / divisor, unbatched)
+        return self._finish(total / divisor, unbatched, out_sharding)
 
-class FractionalMaxPool(Module):
-    """
-    Applies a fractional max pooling over an input signal.
+class FractionalMaxPool(_SpatialOp):
+    """Max-pool windows placed on a fractional, optionally random spatial grid.
+
+    Inputs are (*spatial, channels) or (batch, *spatial, channels), with one
+    trailing channel axis. Scalars specify 1-D spatial shapes; sequences specify
+    the spatial rank. Spatial and channel dimensions must be nonempty.
+    __call__ accepts out_sharding for the final output.
+
+    Args:
+        kernel_size: Positive window sizes.
+        output_size: Positive target spatial sizes; mutually exclusive with
+            output_ratio. Exactly one must be provided.
+        output_ratio: Finite ratios in (0, 1], scalar or per-axis. Target sizes
+            are max(1, floor(input_size * ratio)). Windows must fit the input.
+        return_indices: Also return int32 flattened spatial maximum indices.
+        random_samples: Optional fixed array/sequence of shape (spatial_rank,)
+            with values in [0, 1). Eager values are validated; traced values
+            must satisfy this domain. One grid is shared by batches/channels.
+        rngs: Explicit runtime stream. If fixed samples are absent, consumes
+            a fresh key on each call; None uses get_context_rng at call time.
+            A missing stream raises an error. Fixed samples consume no RNG.
+
+    Sampling also occurs in eval mode: this is grid sampling, not dropout.
+    To retain the former deterministic default grid, pass random_samples=(0.5,)
+    for 1-D, or one 0.5 per spatial axis. With owned RNGs under jit, pass the
+    module in and return its updated state. Values and optional indices both
+    receive out_sharding. Complex inputs are unsupported.
+
+    Example:
+        >>> from taktiny import nn
+        >>> import jax.numpy as jnp
+        >>> pool = nn.FractionalMaxPool(2, output_size=3, random_samples=(0.5,))
+        >>> pool(jnp.arange(6.)[:, None])[:, 0].tolist()
+        [1.0, 3.0, 5.0]
     """
 
     def __init__(
         self,
-        kernel_size: int | Sequence[int],
-        output_size: int | Sequence[int] | None = None,
+        kernel_size: GenericShape,
+        output_size: GenericShape | None = None,
         output_ratio: float | Sequence[float] | None = None,
         return_indices: bool = False,
         random_samples: jax.Array | Sequence[float] | None = None,
         *,
         rngs: Rngs | None = None,
     ) -> None:
-        """Initializes the FractionalMaxPool module.
-
-        Args:
-            kernel_size (int | Sequence[int]): The size of the window to take a max over.
-            output_size (int | Sequence[int] | None, optional): The target output size. Defaults to None.
-            output_ratio (float | Sequence[float] | None, optional): The ratio of output size to input size. Defaults to None.
-            return_indices (bool, optional): If True, will return the max indices along with the outputs. Defaults to False.
-            random_samples (jax.Array | Sequence[float] | None, optional): Optional random samples for pooling grid generation. Defaults to None.
-            rngs (Rngs | None, optional): PRNG key generator. Defaults to None.
-        """
-        kernel_size = Conv._normalize_spatial(kernel_size, name='kernel_size')
+        kernel_size = _positive_spatial(kernel_size, name='kernel_size')
         rank = len(kernel_size)
         if (output_size is None) == (output_ratio is None):
             raise ValueError(
                 'exactly one of output_size or output_ratio must be provided'
             )
         if output_size is not None:
-            output_size = Conv._normalize_spatial(
+            output_size = _positive_spatial(
                 output_size,
                 rank=rank,
                 name='output_size',
             )
         if output_ratio is not None:
             if isinstance(output_ratio, (int, float)):
-                output_ratio = (float(output_ratio),) * rank
+                ratios = (_validate_positive_float(output_ratio, 'output_ratio'),) * rank
             else:
-                output_ratio = tuple(float(value) for value in output_ratio)
-            if len(output_ratio) != rank:
+                ratios = tuple(_validate_positive_float(value, 'output_ratio')
+                               for value in output_ratio)
+            if len(ratios) != rank:
                 raise ValueError(
                     f'output_ratio must contain {rank} values, '
-                    f'got {len(output_ratio)}'
+                    f'got {len(ratios)}'
                 )
-            if any(value <= 0 or value > 1 for value in output_ratio):
+            if any(value > 1 for value in ratios):
                 raise ValueError('output_ratio values must be in (0, 1]')
+            output_ratio = ratios
 
-        if random_samples is None:
-            if rngs is None:
-                samples = jnp.full((rank,), 0.5, dtype=jnp.float32)
-            else:
-                samples = jax.random.uniform(rngs(), (rank,))
-        else:
-            if isinstance(random_samples, Sequence) and any(
-                float(value) < 0 or float(value) >= 1
-                for value in random_samples
-            ):
-                raise ValueError('random_samples values must be in [0, 1)')
+        if rngs is not None and not isinstance(rngs, Rngs):
+            raise TypeError('rngs must be an Rngs or None')
+        samples = None
+        if random_samples is not None:
             samples = jnp.asarray(random_samples, dtype=jnp.float32)
             if samples.shape != (rank,):
                 raise ValueError(
                     f'random_samples must have shape ({rank},), '
                     f'got {samples.shape}'
                 )
+            if not isinstance(samples, jax.core.Tracer) and not bool(jnp.all(
+                jnp.isfinite(samples) & (samples >= 0) & (samples < 1)
+            )):
+                raise ValueError('random_samples values must be finite and in [0, 1)')
 
         self.kernel_size = kernel_size
-        self.output_size = output_size
-        self.output_ratio = output_ratio
-        self.return_indices = return_indices
+        self.output_size: tuple[int, ...] | None = output_size
+        self.output_ratio: tuple[float, ...] | None = output_ratio
+        self.return_indices = _boolean(return_indices, 'return_indices')
         self.random_samples = samples
+        self.rngs = rngs
         self.spatial_rank = rank
 
     def __call__(
         self,
         x: jax.Array,
+        out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array | tuple[jax.Array, jax.Array]:
         """Applies the fractional max pooling operation.
 
@@ -1612,9 +1816,12 @@ class FractionalMaxPool(Module):
         Returns:
             jax.Array | tuple[jax.Array, jax.Array]: The pooled result, and optionally the indices of the maximum values.
         """
-        x, unbatched = _as_batched(x, self.spatial_rank)
+        x, unbatched = self._input(x)
+        if jnp.issubdtype(x.dtype, jnp.complexfloating):
+            raise TypeError('FractionalMaxPool does not support complex inputs')
         spatial_shape = x.shape[1:-1]
         if self.output_size is None:
+            assert self.output_ratio is not None
             output_size = tuple(
                 max(1, math.floor(size * ratio))
                 for size, ratio in zip(spatial_shape, self.output_ratio)
@@ -1633,12 +1840,16 @@ class FractionalMaxPool(Module):
                 'kernel_size and output size must fit within the input'
             )
 
+        samples = self.random_samples
+        if samples is None:
+            rngs = self.rngs if self.rngs is not None else get_context_rng()
+            samples = jax.random.uniform(rngs(), (self.spatial_rank,))
         starts = []
         for size, kernel, output, sample in zip(
             spatial_shape,
             self.kernel_size,
             output_size,
-            self.random_samples,
+            samples,
         ):
             maximum = size - kernel
             if output == 1:
@@ -1654,15 +1865,11 @@ class FractionalMaxPool(Module):
                 positions = positions.astype(jnp.int32).at[-1].set(maximum)
             starts.append(positions)
 
-        values = []
-        indices = []
         batch_size, channels = x.shape[0], x.shape[-1]
         kernel_volume = math.prod(self.kernel_size)
-        for output_index in product(*(range(size) for size in output_size)):
-            start = tuple(
-                starts[axis][position]
-                for axis, position in enumerate(output_index)
-            )
+        positions = tuple(grid.reshape(-1) for grid in jnp.meshgrid(*starts, indexing='ij'))
+
+        def pool_window(start: tuple[jax.Array, ...]) -> tuple[jax.Array, jax.Array | None]:
             patch = jax.lax.dynamic_slice(
                 x,
                 (0, *start, 0),
@@ -1670,11 +1877,11 @@ class FractionalMaxPool(Module):
             )
             patch = patch.reshape(batch_size, kernel_volume, channels)
             local_index = jnp.argmax(patch, axis=1).astype(jnp.int32)
-            values.append(jnp.take_along_axis(
+            value = jnp.take_along_axis(
                 patch,
                 local_index[:, None, :],
                 axis=1,
-            )[:, 0, :])
+            )[:, 0, :]
             if self.return_indices:
                 remainder = local_index
                 coordinates = []
@@ -1689,58 +1896,76 @@ class FractionalMaxPool(Module):
                     coordinates,
                 ):
                     global_index = global_index * size + offset + coordinate
-                indices.append(global_index)
+                return value, global_index
+            return value, None
 
-        output = jnp.stack(values, axis=1).reshape(
+        values, indices = jax.vmap(pool_window)(positions)
+        output = jnp.moveaxis(values, 0, 1).reshape(
             batch_size,
             *output_size,
             channels,
         )
-        output = _restore_batch(output, unbatched)
+        output = self._finish(output, unbatched, out_sharding)
         if not self.return_indices:
             return output
-        index_output = jnp.stack(indices, axis=1).reshape(
+        assert indices is not None
+        index_output = jnp.moveaxis(indices, 0, 1).reshape(
             batch_size,
             *output_size,
             channels,
         )
-        return output, _restore_batch(index_output, unbatched)
+        return output, self._finish(index_output, unbatched, out_sharding)
 
-class LPPool(Module):
-    """
-    Applies a power-average pooling over an input signal.
+class LPPool(_SpatialOp):
+    """Compute (sum(abs(x)**p))**(1/p) over spatial windows.
+
+    Inputs are (*spatial, channels) or (batch, *spatial, channels), with one
+    trailing channel axis. Scalars specify 1-D spatial shapes; sequences specify
+    the spatial rank. Spatial and channel dimensions must be nonempty.
+    __call__ accepts out_sharding for the final output.
+
+    Args:
+        norm_type: Finite positive exponent p. This is a true norm when p>=1;
+            values below one are allowed as a power aggregation.
+        kernel_size: Positive spatial window sizes.
+        stride: Positive strides; None uses kernel_size.
+        ceil_mode: Permit a final partial window, treating missing values as zero.
+
+    This is a sum-based Lp aggregation, not a power mean: there is no division
+    by window volume. Integer inputs promote to float32; complex inputs use
+    real magnitudes. The zero-total output uses a zero derivative convention.
+
+    Example:
+        >>> from taktiny import nn
+        >>> import jax.numpy as jnp
+        >>> nn.LPPool(2, 2)(jnp.array([[3.], [4.]]))[:, 0].tolist()
+        [5.0]
     """
 
     def __init__(
         self,
         norm_type: float,
-        kernel_size: int | Sequence[int],
-        stride: int | Sequence[int] | None = None,
+        kernel_size: GenericShape,
+        stride: GenericShape | None = None,
         ceil_mode: bool = False,
     ) -> None:
-        """Initializes the LPPool module.
-
-        Args:
-            norm_type (float): The power to use.
-            kernel_size (int | Sequence[int]): The size of the window.
-            stride (int | Sequence[int] | None, optional): The stride of the window. Defaults to None.
-            ceil_mode (bool, optional): When True, will use ceil instead of floor to compute the output shape. Defaults to False.
-        """
-        if norm_type <= 0:
-            raise ValueError('norm_type must be positive')
-        kernel_size = Conv._normalize_spatial(kernel_size, name='kernel_size')
+        norm_type = _validate_positive_float(norm_type, 'norm_type')
+        kernel_size = _positive_spatial(kernel_size, name='kernel_size')
         rank = len(kernel_size)
         self.norm_type = norm_type
         self.kernel_size = kernel_size
-        self.stride = Conv._normalize_spatial(
+        self.stride = _positive_spatial(
             kernel_size if stride is None else stride,
             rank=rank,
             name='stride',
         )
-        self.ceil_mode = ceil_mode
+        self.ceil_mode = _boolean(ceil_mode, 'ceil_mode')
         self.spatial_rank = rank
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: jax.Array,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array:
         """Applies the LPPool operation.
 
         Args:
@@ -1749,7 +1974,7 @@ class LPPool(Module):
         Returns:
             jax.Array: The pooled result.
         """
-        x, unbatched = _as_batched(x, self.spatial_rank)
+        x, unbatched = self._input(x)
         if not jnp.issubdtype(x.dtype, jnp.inexact):
             x = x.astype(jnp.float32)
         padding = _pool_padding(
@@ -1760,6 +1985,8 @@ class LPPool(Module):
             (1,) * self.spatial_rank,
             self.ceil_mode,
         )
+        _window_output_shape(x.shape[1:-1], self.kernel_size, self.stride,
+                             (1,) * self.spatial_rank, padding)
         window, strides, reduce_padding, _ = _reduce_window_config(
             self.spatial_rank,
             self.kernel_size,
@@ -1767,21 +1994,48 @@ class LPPool(Module):
             (1,) * self.spatial_rank,
             padding,
         )
-        powered = jnp.abs(x) ** self.norm_type
+        magnitude = jnp.abs(x)
+        powered = jnp.where(
+            magnitude > 0,
+            jnp.where(magnitude > 0, magnitude, 1) ** self.norm_type,
+            0,
+        )
         total = jax.lax.reduce_window(
             powered,
-            jnp.asarray(0, dtype=x.dtype),
+            jnp.asarray(0, dtype=powered.dtype),
             jax.lax.add,
             window,
             strides,
             reduce_padding,
         )
-        output = total ** (1.0 / self.norm_type)
-        return _restore_batch(output, unbatched)
+        output = jnp.where(total > 0, jnp.where(total > 0, total, 1) **
+                           (1.0 / self.norm_type), 0)
+        return self._finish(output, unbatched, out_sharding)
 
-class AdaptiveMaxPool(Module):
-    """
-    Applies an adaptive max pooling over an input signal.
+class AdaptiveMaxPool(_SpatialOp):
+    """Pool variable-size spatial bins to a requested output shape.
+
+    Inputs are (*spatial, channels) or (batch, *spatial, channels), with one
+    trailing channel axis. Scalars specify 1-D spatial shapes; sequences specify
+    the spatial rank. Spatial and channel dimensions must be nonempty.
+    __call__ accepts out_sharding for the final output.
+
+    Args:
+        output_size: Positive target sizes. A None entry preserves that input
+            spatial dimension. A scalar specifies one spatial dimension.
+        return_indices: Return values and int32 row-major spatial offsets.
+
+    Bin i spans floor(i * input / output) through ceil((i+1) * input / output),
+    excluding the end. Bins may overlap; output sizes may exceed input sizes.
+    Each channel is pooled separately. Ties choose the first element in the
+    bin. Complex inputs are unsupported. out_sharding applies to both arrays
+    when return_indices=True.
+
+    Example:
+        >>> from taktiny import nn
+        >>> import jax.numpy as jnp
+        >>> nn.AdaptiveMaxPool(3)(jnp.arange(6.)[:, None])[:, 0].tolist()
+        [1.0, 3.0, 5.0]
     """
 
     def __init__(
@@ -1789,12 +2043,14 @@ class AdaptiveMaxPool(Module):
         output_size: int | Sequence[int | None],
         return_indices: bool = False,
     ) -> None:
-        self.output_size = _normalize_adaptive_size(output_size)
-        self.return_indices = return_indices
+        self.output_size = _adaptive_size(output_size)
+        self.spatial_rank = len(self.output_size)
+        self.return_indices = _boolean(return_indices, 'return_indices')
 
     def __call__(
         self,
         x: jax.Array,
+        out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array | tuple[jax.Array, jax.Array]:
         """Applies the adaptive max pooling operation.
 
@@ -1805,7 +2061,9 @@ class AdaptiveMaxPool(Module):
             jax.Array | tuple[jax.Array, jax.Array]: The pooled result, and optionally the indices of the maximum values.
         """
         rank = len(self.output_size)
-        x, unbatched = _as_batched(x, rank)
+        x, unbatched = self._input(x)
+        if jnp.issubdtype(x.dtype, jnp.complexfloating):
+            raise TypeError('AdaptiveMaxPool does not support complex inputs')
         spatial_shape = x.shape[1:-1]
         output_size = tuple(
             size if requested is None else requested
@@ -1817,28 +2075,47 @@ class AdaptiveMaxPool(Module):
             reduction='max',
             return_indices=self.return_indices,
         )
-        values = _restore_batch(values, unbatched)
+        values = self._finish(values, unbatched, out_sharding)
         if not self.return_indices:
             return values
-        return values, _restore_batch(indices, unbatched)
+        assert indices is not None
+        return values, self._finish(indices, unbatched, out_sharding)
 
-class AdaptiveAvgPool(Module):
-    """
-    Applies an adaptive average pooling over an input signal.
+class AdaptiveAvgPool(_SpatialOp):
+    """Average variable-size spatial bins to a requested output shape.
+
+    Inputs are (*spatial, channels) or (batch, *spatial, channels), with one
+    trailing channel axis. Scalars specify 1-D spatial shapes; sequences specify
+    the spatial rank. Spatial and channel dimensions must be nonempty.
+    __call__ accepts out_sharding for the final output.
+
+    Args:
+        output_size: Positive target sizes; None entries preserve the matching
+            input dimensions. Scalars specify one spatial dimension.
+
+    Bin i spans floor(i * input / output) through ceil((i+1) * input / output),
+    excluding the end. Bins may overlap and each is divided by its own number
+    of elements. Output sizes may exceed input sizes. Integer and boolean
+    inputs promote to float32. This module has no parameters or randomness.
+
+    Example:
+        >>> from taktiny import nn
+        >>> import jax.numpy as jnp
+        >>> nn.AdaptiveAvgPool((2, None))(jnp.ones((4, 3, 1))).shape
+        (2, 3, 1)
     """
 
     def __init__(
         self,
         output_size: int | Sequence[int | None],
     ) -> None:
-        """Initializes the AdaptiveAvgPool module.
+        self.output_size = _adaptive_size(output_size)
+        self.spatial_rank = len(self.output_size)
 
-        Args:
-            output_size (int | Sequence[int | None]): The target output size.
-        """
-        self.output_size = _normalize_adaptive_size(output_size)
-
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: jax.Array,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array:
         """Applies the adaptive average pooling operation.
 
         Args:
@@ -1848,7 +2125,7 @@ class AdaptiveAvgPool(Module):
             jax.Array: The pooled result.
         """
         rank = len(self.output_size)
-        x, unbatched = _as_batched(x, rank)
+        x, unbatched = self._input(x)
         if not jnp.issubdtype(x.dtype, jnp.inexact):
             x = x.astype(jnp.float32)
         output_size = tuple(
@@ -1861,26 +2138,41 @@ class AdaptiveAvgPool(Module):
             reduction='mean',
             return_indices=False,
         )
-        return _restore_batch(values, unbatched)
+        return self._finish(values, unbatched, out_sharding)
 
-class Padding(Module):
-    """
-    Pads an input array.
+class Padding(_SpatialOp):
+    """Pad arbitrary array axes using jax.numpy.pad conventions.
+
+    Unlike the pooling modules, every axis is eligible, including batch and
+    channels. No channels-last interpretation or batch insertion is performed.
+
+    Args:
+        padding: Nonnegative integer applied to both ends of every axis; a
+            flat (before, after) pair broadcast to every axis; or one such
+            pair per array axis. A one-element sequence broadcasts symmetrically.
+        mode: constant, edge, reflect, symmetric or wrap. Aliases zeros,
+            replicate and circular map to constant, edge and wrap.
+        value: Fill value for constant mode only; defaults to 0.
+
+    reflect excludes the edge element when mirroring; symmetric repeats it.
+    Numeric padding is normalized to immutable tuples at construction.
+    __call__ accepts out_sharding for the final padded array.
+
+    Example:
+        >>> from taktiny import nn
+        >>> import jax.numpy as jnp
+        >>> nn.Padding((1, 2), value=9)(jnp.array([1, 2])).tolist()
+        [9, 1, 2, 9, 9]
     """
 
     def __init__(
         self,
-        padding: int | Sequence[int] | Sequence[tuple[int, int]],
+        padding: GenericShape | Sequence[tuple[int, int]],
         mode: str = 'constant',
         value: float = 0.0,
     ) -> None:
-        """Initializes the Padding module.
-
-        Args:
-            padding (int | Sequence[int] | Sequence[tuple[int, int]]): The size of the padding.
-            mode (str, optional): The padding mode. Defaults to 'constant'.
-            value (float, optional): The fill value for 'constant' padding. Defaults to 0.0.
-        """
+        if not isinstance(mode, str):
+            raise TypeError('mode must be a string')
         aliases = {
             'zeros': 'constant',
             'replicate': 'edge',
@@ -1897,11 +2189,41 @@ class Padding(Module):
         if mode not in supported:
             choices = ', '.join(sorted(supported | set(aliases)))
             raise ValueError(f'padding mode must be one of {choices}')
-        self.padding = padding
+        widths: tuple[int, ...]
+        normalized: int | tuple[int, ...] | tuple[tuple[int, int], ...]
+        if isinstance(padding, int):
+            widths = (padding,)
+            normalized = padding
+        elif isinstance(padding, Sequence) and not isinstance(padding, (str, bytes)):
+            entries = tuple(padding)
+            if not entries:
+                raise ValueError('padding must not be empty')
+            if all(isinstance(entry, int) for entry in entries):
+                if len(entries) not in {1, 2}:
+                    raise ValueError('flat padding must have one or two values')
+                widths = tuple(entry for entry in entries if isinstance(entry, int))
+                normalized = widths
+            else:
+                pairs: list[tuple[int, int]] = []
+                for entry in entries:
+                    if not isinstance(entry, Sequence) or len(entry) != 2:
+                        raise ValueError('padding entries must be (before, after) pairs')
+                    pairs.append((entry[0], entry[1]))
+                widths = tuple(value for pair in pairs for value in pair)
+                normalized = tuple(pairs)
+        else:
+            raise TypeError('padding must be an integer or sequence')
+        if any(isinstance(width, bool) or not isinstance(width, int) or width < 0
+               for width in widths):
+            raise ValueError('padding widths must be nonnegative integers')
+        self.padding = normalized
         self.mode = mode
         self.value = value
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: jax.Array,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array:
         """Applies the padding operation.
 
         Args:
@@ -1911,13 +2233,15 @@ class Padding(Module):
             jax.Array: The padded result.
         """
         if self.mode == 'constant':
-            return jnp.pad(
+            output = jnp.pad(
                 x,
                 self.padding,
                 mode=self.mode,
                 constant_values=self.value,
             )
-        return jnp.pad(x, self.padding, mode=self.mode)
+        else:
+            output = jnp.pad(x, self.padding, mode=self.mode)
+        return self._finish(output, False, out_sharding)
 
 
 __all__ = [

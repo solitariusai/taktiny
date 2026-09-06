@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Taktiny transformations built on JAX."""
+"""Generic JAX transforms. State and RNGs are explicit; metadata is untouched."""
 
 from __future__ import annotations
 
@@ -21,60 +21,40 @@ from functools import wraps
 from typing import Any
 
 import jax
-
-from taktiny.nn.base import Module
-
-
-def _add_mapped_axis(module: Module, axis: int) -> None:
-    seen = set()
-    for parameter in module.flat_parameter_dict().values():
-        if id(parameter) in seen:
-            continue
-        seen.add(id(parameter))
-
-        ndim = parameter.ndim
-        mapped_axis = axis if axis >= 0 else axis + ndim
-
-        axis_names = getattr(parameter, 'axis_names', None)
-        if axis_names is not None and len(axis_names) == ndim - 1:
-            parameter.axis_names = (
-                tuple(axis_names[:mapped_axis])
-                + (None,)
-                + tuple(axis_names[mapped_axis:])
-            )
+import jax.numpy as jnp
 
 
-
-
-def _update_output_axes(output: Any, out_axes: Any) -> None:
-    if out_axes is None:
-        return
-
+def _axis(value: Any, name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise TypeError(f'{name} leaves must be integers or None, not booleans')
     try:
-        axis = operator.index(out_axes)
-    except TypeError:
-        axis = None
+        return operator.index(value)
+    except TypeError as error:
+        raise TypeError(f'{name} leaves must be integers or None') from error
 
-    if axis is not None:
-        if isinstance(output, Module):
-            _add_mapped_axis(output, axis)
-        elif isinstance(output, dict):
-            for value in output.values():
-                _update_output_axes(value, axis)
-        elif isinstance(output, (list, tuple)):
-            for value in output:
-                _update_output_axes(value, axis)
-        return
 
-    if isinstance(output, dict) and isinstance(out_axes, dict):
-        for key, axes in out_axes.items():
-            _update_output_axes(output[key], axes)
-    elif (
-        isinstance(output, (list, tuple))
-        and isinstance(out_axes, (list, tuple))
-    ):
-        for value, axes in zip(output, out_axes):
-            _update_output_axes(value, axes)
+def _axes_for_tree(axes: Any, tree: Any, name: str) -> list[int | None]:
+    """Expand a PyTree-prefix specification to one axis per data leaf."""
+    result: list[int | None] = []
+    def expand(axis: Any, subtree: Any) -> None:
+        result.extend([_axis(axis, name)] * len(jax.tree.leaves(subtree)))
+    try:
+        jax.tree.map(expand, axes, tree, is_leaf=lambda value: value is None)
+    except ValueError as error:
+        raise ValueError(f'{name} must be a PyTree prefix of its data') from error
+    return result
+
+
+def _drop_scan_outputs(outputs: Any, axes: Any) -> Any:
+    """Drop requested subtrees before scan allocates their history."""
+    def keep(axis: Any, subtree: Any) -> Any:
+        return None if _axis(axis, 'out_axes') is None else subtree
+    try:
+        return jax.tree.map(keep, axes, outputs, is_leaf=lambda value: value is None)
+    except ValueError as error:
+        raise ValueError('out_axes must be a PyTree prefix of the body output') from error
 
 
 def vmap[F: Callable[..., Any]](
@@ -86,18 +66,26 @@ def vmap[F: Callable[..., Any]](
     spmd_axis_name: Any | tuple[Any, ...] | None = None,
     sum_match: bool = False,
 ) -> Any:
-    """Vectorize a function using :func:`jax.vmap`.
+    """Vectorize arbitrary PyTrees with JAX's vmap semantics.
 
-    The function can be supplied directly or through decorator syntax.
+    Supports vmap(function), @vmap and @vmap(...). Positional inputs follow
+    in_axes; keyword-argument array leaves map along axis zero, as in JAX.
+    out_axes=None retains JAX's unmapped-output meaning, not scan's discard
+    meaning. No module metadata is changed and RNGs are not split implicitly.
+    Return updated state explicitly; use Stack for module-state conveniences.
 
     Examples:
-        >>> mapped = vmap(function, in_axes=0)
-        >>> @vmap(in_axes=0)
-        ... def mapped_function(x):
-        ...     return x + 1
+        >>> import jax.numpy as jnp
+        >>> @vmap(in_axes=(0, None))
+        ... def scale(x, factor):
+        ...     return x * factor
+        >>> scale(jnp.arange(3), 2).tolist()
+        [0, 2, 4]
     """
 
     def transform(function: Any) -> Any:
+        if not callable(function):
+            raise TypeError(f'fun must be callable, got {type(function).__name__}')
         mapped = jax.vmap(
             function,
             in_axes=in_axes,
@@ -108,13 +96,7 @@ def vmap[F: Callable[..., Any]](
             sum_match=sum_match,
         )
 
-        @wraps(function)
-        def transformed(*args: Any, **kwargs: Any) -> Any:
-            output = mapped(*args, **kwargs)
-            _update_output_axes(output, out_axes)
-            return output
-
-        return transformed
+        return wraps(function)(mapped)
 
     if fun is None:
         return transform
@@ -126,23 +108,51 @@ def vmap[F: Callable[..., Any]](
 def scan[F: Callable[..., Any]](
     fun: F | None = None,
     *,
+    in_axes: Any = 0,
+    out_axes: Any = 0,
     length: int | None = None,
     reverse: bool = False,
     unroll: int | bool = 1,
     _split_transpose: bool = False,
 ) -> Any:
-    """Transform a scan body into a callable using :func:`jax.lax.scan`.
+    """Build a generic scan callable with configurable input and output axes.
 
     The transformed function accepts ``(init, xs, *args, **kwargs)``. Extra
     arguments are broadcast across iterations and passed to the scan body
     after ``carry`` and ``x``.
 
+    in_axes is an integer, None, or a PyTree prefix of xs. Integer axes select
+    the iteration dimension (negative axes are supported); None broadcasts a
+    subtree unchanged. All mapped dimensions must have equal length. Supply
+    length when there are no mapped leaves, including when xs is None.
+
+    out_axes is an integer or PyTree prefix of body outputs, selecting where
+    each stacked iteration axis appears. None discards a subtree before
+    stacking; it does not select an invariant or final output. Put a single
+    final result in carry. Final carry is never rearranged by out_axes.
+
+    Carry structure, shapes and dtypes remain fixed, as in lax.scan. reverse,
+    unroll and _split_transpose are forwarded to JAX. Reversing execution does
+    not reverse the returned output order. Module metadata is untouched, and
+    mutable state is not implicitly preserved. Thread RNGs/state through carry
+    or supply independent keys in xs. Use SeqStack for module conveniences.
+
     Examples:
-        >>> scanned = scan(body, reverse=True)
-        >>> final_carry, outputs = scanned(initial_carry, xs)
-        >>> @scan(unroll=2)
-        ... def scanned_body(carry, x):
-        ...     return carry + x, carry
+        >>> import jax.numpy as jnp
+        >>> @scan(in_axes=1, out_axes=-1)
+        ... def accumulate(carry, x, *, factor=1):
+        ...     carry = carry + x * factor
+        ...     return carry, carry
+        >>> final, history = accumulate(jnp.zeros(2), jnp.ones((2, 3)), factor=2)
+        >>> final.tolist(), history.shape
+        ([6.0, 6.0], (2, 3))
+
+        >>> @scan(in_axes=None, out_axes=None, length=3)
+        ... def repeat(carry, increment):
+        ...     return carry + increment, carry
+        >>> final, history = repeat(0, 2)
+        >>> int(final), history
+        (6, None)
     """
 
     def transform(function: Any) -> Any:
@@ -152,20 +162,41 @@ def scan[F: Callable[..., Any]](
             )
 
         @wraps(function)
-        def scanned(init: Any, xs: Any=None, *args: Any, **kwargs: Any) -> tuple[Any, ...]:
-            def body(carry: Any, x: Any) -> Any:
-                return function(carry, x, *args, **kwargs)
+        def scanned(init: Any, xs: Any = None, *args: Any, **kwargs: Any) -> tuple[Any, Any]:
+            leaves, structure = jax.tree.flatten(xs)
+            axes = _axes_for_tree(in_axes, xs, 'in_axes')
+            mapped = tuple(
+                jnp.moveaxis(jnp.asarray(leaf), axis, 0)
+                for leaf, axis in zip(leaves, axes) if axis is not None
+            )
+            if not mapped and length is None:
+                raise ValueError('length is required when xs has no scanned leaves')
+
+            def body(carry: Any, slices: Any) -> Any:
+                sliced = iter(()) if slices is None else iter(slices)
+                x = jax.tree.unflatten(structure, [
+                    leaf if axis is None else next(sliced)
+                    for leaf, axis in zip(leaves, axes)
+                ])
+                carry, output = function(carry, x, *args, **kwargs)
+                return carry, _drop_scan_outputs(output, out_axes)
 
             carry, outputs = jax.lax.scan(
                 body,
                 init,
-                xs,
+                mapped if mapped else None,
                 length=length,
                 reverse=reverse,
                 unroll=unroll,
                 _split_transpose=_split_transpose,
             )
-            _update_output_axes(outputs, 0)
+            output_leaves, output_structure = jax.tree.flatten(outputs)
+            output_axes = _axes_for_tree(out_axes, outputs, 'out_axes')
+            outputs = jax.tree.unflatten(output_structure, [
+                jnp.moveaxis(leaf, 0, axis)
+                for leaf, axis in zip(output_leaves, output_axes)
+                if axis is not None
+            ])
             return carry, outputs
 
         return scanned

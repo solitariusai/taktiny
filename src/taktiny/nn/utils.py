@@ -21,6 +21,8 @@ from numbers import Real
 import jax
 import jax.numpy as jnp
 
+from taktiny.utils.typing import Axes
+
 
 def _constrain(
     value: jax.Array,

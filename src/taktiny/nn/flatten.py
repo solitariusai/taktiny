@@ -19,13 +19,51 @@ from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding
 
 from taktiny.nn.base import Module
-from taktiny.nn.utils import _canonical_axis
+from taktiny.nn.utils import _canonical_axis, _constrain
+from taktiny.utils.typing import GenericShape
+
+
+def _reshape(
+    x: jax.Array,
+    shape: tuple[int, ...],
+    out_sharding: jax.sharding.Sharding | None,
+) -> jax.Array:
+    # Explicit layouts must reach reshape itself: splitting a sharded axis can
+    # be ambiguous before a constraint on the result can be applied.
+    if (isinstance(out_sharding, NamedSharding)
+            and out_sharding.mesh.are_all_axes_explicit):
+        return jnp.reshape(x, shape, out_sharding=out_sharding)
+    return _constrain(jnp.reshape(x, shape), out_sharding)
 
 
 class Flatten(Module):
-    """Flattens a contiguous range of axes of a tensor."""
+    """Merge an inclusive, contiguous range of axes in row-major order.
+
+    Args:
+        start_axis: First axis to merge; defaults to 1 to preserve a leading
+            batch axis. Negative axes count from the end of the input.
+        end_axis: Last axis to merge, inclusive; defaults to -1.
+
+    Axes outside the selected range, element order, and dtype are preserved.
+    No batch or channel axes are inferred. A scalar can be flattened to (1,)
+    using start_axis=0 (or -1); the default start_axis=1 requires rank >= 2.
+    Zero-sized dimensions are supported. Axis bounds and order are checked
+    against the input rank at call time. The module has no parameters or RNGs.
+
+    __call__ accepts out_sharding describing the output's axes, not the input's.
+    With None, layout follows JAX's reshape rules; it does not force replication.
+
+    Example:
+        >>> from taktiny import nn
+        >>> import jax.numpy as jnp
+        >>> nn.Flatten()(jnp.ones((2, 3, 4))).shape
+        (2, 12)
+        >>> nn.Flatten(1, -2)(jnp.ones((2, 3, 4, 5))).shape
+        (2, 12, 5)
+    """
 
     def __init__(
         self,
@@ -45,15 +83,20 @@ class Flatten(Module):
         self.start_axis = start_axis
         self.end_axis = end_axis
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: jax.Array,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array:
         """Flattens the specified axes of the input tensor.
 
         Args:
             x (jax.Array): The input tensor to be flattened.
+            out_sharding: Optional layout for the reshaped output.
 
         Returns:
             jax.Array: The flattened tensor.
         """
+        x = jnp.asarray(x)
         start_axis = _canonical_axis(
             self.start_axis,
             x.ndim,
@@ -77,25 +120,52 @@ class Flatten(Module):
             flattened_size,
             *x.shape[end_axis + 1:],
         )
-        return jnp.reshape(x, shape)
+        return _reshape(x, shape, out_sharding)
 
     def extra_repr(self) -> str:
         return f'start_axis={self.start_axis}, end_axis={self.end_axis}'
 
 
 class Unflatten(Module):
-    """Unflattens a specific axis of a tensor into multiple dimensions."""
+    """Replace one axis with a specified shape in row-major order.
+
+    Args:
+        axis: Axis to expand. Negative axes count from the end of the input.
+        unflattened_size: An integer or nonempty sequence of integer sizes.
+            Sizes may be nonnegative, with at most one -1 for inference. The
+            sequence is stored as an immutable tuple.
+
+    The new sizes must multiply to the selected axis size, independently of
+    other axes (even if those axes have size zero). A -1 size is inferred when
+    the product of known sizes divides the selected size. Combining -1 with
+    zero is ambiguous and raises ValueError; inferring zero from a zero-sized
+    axis and positive known sizes is supported. Scalar inputs are unsupported.
+    Element order, dtype, and all other axes are preserved; no parameters or
+    RNGs are used.
+
+    __call__ accepts out_sharding describing the expanded output axes. With
+    None, JAX infers the layout; explicitly sharded inputs may require a target
+    layout when splitting an axis has multiple possible sharding assignments.
+
+    Example:
+        >>> from taktiny import nn
+        >>> import jax.numpy as jnp
+        >>> nn.Unflatten(-1, [3, -1])(jnp.ones((2, 12))).shape
+        (2, 3, 4)
+        >>> nn.Unflatten(0, (2, 0))(jnp.empty((0,))).shape
+        (2, 0)
+    """
 
     def __init__(
         self,
         axis: int,
-        unflattened_size: int | Sequence[int],
+        unflattened_size: GenericShape,
     ) -> None:
         """Initializes an Unflatten module.
 
         Args:
             axis (int): The axis to unflatten.
-            unflattened_size (int | Sequence[int]): The sizes of the new dimensions. One of the sizes can be -1, in which case its value is inferred.
+            unflattened_size (GenericShape): New dimensions, with at most one -1 for inference.
         """
         if not isinstance(axis, int) or isinstance(axis, bool):
             raise TypeError('axis must be an integer')
@@ -128,15 +198,20 @@ class Unflatten(Module):
         self.axis = axis
         self.unflattened_size = unflattened_size
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: jax.Array,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array:
         """Unflattens the specified axis of the input tensor.
 
         Args:
             x (jax.Array): The input tensor to unflatten.
+            out_sharding: Optional layout for the reshaped output.
 
         Returns:
             jax.Array: The unflattened tensor.
         """
+        x = jnp.asarray(x)
         if x.ndim == 0:
             raise ValueError('cannot unflatten a scalar input')
         axis = _canonical_axis(self.axis, x.ndim, name='axis')
@@ -167,10 +242,11 @@ class Unflatten(Module):
             )
 
         shape = (*x.shape[:axis], *sizes, *x.shape[axis + 1:])
-        return jnp.reshape(x, shape)
+        return _reshape(x, shape, out_sharding)
 
     def extra_repr(self) -> str:
-        return f'axis={self.axis}, unflattened_size={self.unflattened_size}'
+        shape = '×'.join(map(str, self.unflattened_size))
+        return f'axis={self.axis}, unflattened_size={shape}'
 
 
 __all__ = ['Flatten', 'Unflatten']

@@ -25,6 +25,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
 from jax.typing import ArrayLike
 
+from taktiny.nn.rng import Rngs
 from taktiny.utils.format import format_bytes, format_dtype, format_params
 from taktiny.utils.spmd import logical_to_mesh_axes
 from taktiny.utils.typing import AxisNames, ParameterDict, PyTree, StateDict
@@ -143,7 +144,7 @@ def _is_dynamic(v: object) -> bool:
     Returns:
         bool: True if the object contains dynamic properties, False otherwise.
     """
-    if isinstance(v, (Module, Parameter, jax.Array, qwix.QArray)):
+    if isinstance(v, (Module, Parameter, Rngs, jax.Array, qwix.QArray)):
         return True
     if hasattr(jax.numpy, 'ndarray') and isinstance(v, jax.numpy.ndarray):
         return True
