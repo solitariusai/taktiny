@@ -2,8 +2,11 @@ import jax
 import jax.numpy as jnp
 import pytest
 import qwix
+import numpy as np
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 
 from taktiny import nn
+from taktiny.utils.spmd import map_logical_axis_names
 
 
 class Add(nn.Module):
@@ -177,8 +180,8 @@ def test_seq_stack_slices_quantized_parameters_loaded_after_stacking():
         nn.Linear(4, 4, bias=False, rngs=nn.Rngs(index))
         for index in range(2)
     ])
-    parameter = layers.stacked.weight
-    parameter.value = qwix.quantize(
+    parameter = layers.stacked.kernel
+    parameter._value = qwix.quantize(
         parameter.value,
         'int4',
         channelwise_axes=(0, 2),
@@ -255,3 +258,251 @@ def test_stacks_derive_size_for_parameter_free_modules():
     assert jnp.array_equal(parallel_output, jnp.asarray([4, 4, 4]))
     assert final == 8
     assert jnp.array_equal(sequential_outputs, jnp.asarray([2, 4, 8]))
+
+
+class Counter(nn.Module):
+    def __init__(self, mode='a'):
+        self.count = nn.Parameter(jnp.array(0.), trainable=False)
+        self.mode = mode
+
+    def __call__(self, x):
+        self.count._value = self.count.value + 1
+        return x + self.count.value
+
+
+def _scan_apply(layer, carry):
+    value = layer(carry)
+    return value, value
+
+
+@pytest.mark.parametrize('cls', [nn.Stack, nn.SeqStack])
+def test_stacks_preserve_dynamic_updates_and_leave_originals_unchanged(cls):
+    originals = [Counter(), Counter()]
+    stack = cls(originals)
+    if cls is nn.Stack:
+        first = stack(jnp.array(0.), in_axes=None)
+        second = stack(jnp.array(0.), in_axes=None)
+        assert jnp.array_equal(first, jnp.array([1., 1.]))
+        assert jnp.array_equal(second, jnp.array([2., 2.]))
+    else:
+        first, _ = stack(_scan_apply, jnp.array(0.))
+        second, _ = stack(_scan_apply, jnp.array(0.))
+        assert first == 2 and second == 4
+    assert jnp.array_equal(stack.stacked.count.value, jnp.array([2., 2.]))
+    assert all(layer.count.value == 0 for layer in originals)
+
+
+@pytest.mark.parametrize('reverse', [False, True])
+def test_grouped_seq_stack_preserves_state_and_original_output_order(reverse):
+    stack = nn.SeqStack([Counter('a'), Counter('a'), Counter('b')], reverse=reverse)
+    for call in (1, 2):
+        carry, outputs = stack(_scan_apply, jnp.array(0.))
+        expected = jnp.arange(1, 4, dtype=jnp.float32) * call
+        assert carry == 3 * call
+        assert jnp.array_equal(outputs, expected[::-1] if reverse else expected)
+        assert all(jnp.all(group.stacked.count.value == call) for group in stack.groups)
+
+
+@pytest.mark.parametrize('cls', [nn.Stack, nn.SeqStack])
+def test_stacks_thread_state_through_jit_without_leaking(cls):
+    @jax.jit
+    def step(model, x):
+        output = (model(x, in_axes=None) if cls is nn.Stack
+                  else model(_scan_apply, x)[0])
+        return output, model
+
+    model = cls([Counter(), Counter()])
+    with jax.checking_leaks():
+        _, model = step(model, jnp.array(0.))
+        _, model = step(model, jnp.array(0.))
+    assert jnp.all(model.stacked.count.value == 2)
+
+
+@pytest.mark.parametrize('cls', [nn.Stack, nn.SeqStack])
+def test_stateless_stacks_can_be_closed_over_by_jit(cls):
+    model = cls([Add(1.), Add(2.)])
+    stored = model.stacked
+    with jax.checking_leaks():
+        jax.jit(lambda x: model(x, in_axes=None) if cls is nn.Stack
+                else model(_scan_apply, x)[0])(jnp.array(0.))
+    assert model.stacked is stored
+
+
+@pytest.mark.parametrize('cls', [nn.Stack, nn.SeqStack])
+def test_stacks_advance_owned_dropout_rngs(cls):
+    @jax.jit
+    def step(model, x):
+        output = (model(x, in_axes=None) if cls is nn.Stack
+                  else model(_scan_apply, x)[0])
+        return output, model
+
+    model = cls([nn.Dropout(0.5, rngs=nn.Rngs(i)) for i in range(2)])
+    with jax.checking_leaks():
+        first, model = step(model, jnp.ones(128))
+        second, model = step(model, jnp.ones(128))
+    assert not jnp.array_equal(first, second)
+
+
+def test_seq_stack_threads_context_rng_in_carry():
+    def apply(layer, carry):
+        x, rngs = carry
+        with nn.set_context_rng(rngs):
+            output = layer(x)
+        return (output, rngs), None
+
+    model = nn.SeqStack([nn.Dropout(0.5), nn.Dropout(0.5)])
+    @jax.jit
+    def step(x, rngs):
+        return model(apply, (x, rngs))[0]
+    with jax.checking_leaks():
+        first, rngs = step(jnp.ones(128), nn.Rngs(0))
+        second, rngs = step(jnp.ones(128), rngs)
+    assert not jnp.array_equal(first, second)
+
+
+@pytest.mark.parametrize('cls', [nn.Stack, nn.SeqStack])
+@pytest.mark.parametrize('axis_type', [AxisType.Auto, AxisType.Explicit])
+def test_stack_sharding_metadata_tracks_layer_axis(cls, axis_type):
+    mesh = Mesh(np.asarray(jax.devices()), ('tp',), axis_types=(axis_type,))
+    with jax.set_mesh(mesh), map_logical_axis_names({'output': 'tp'}):
+        width = 2 * mesh.size
+        layers = [nn.Linear(width, width, rngs=nn.Rngs(i),
+                            axis_names=('input', 'output')) for i in range(2)]
+        model = cls(layers)
+        assert model.stacked.kernel.axis_names == (None, 'input', 'output')
+        assert model.stacked.kernel.partition_spec == P(None, None, 'tp')
+        assert model.stacked.kernel.value.sharding.is_equivalent_to(
+            NamedSharding(mesh, P(None, None, 'tp')), 3,
+        )
+        def apply(layer, x):
+            assert layer.kernel.axis_names == ('input', 'output')
+            assert layer.kernel.partition_spec == P(None, 'tp')
+            y = layer(x)
+            return y, None
+        x = jnp.ones((1, width))
+        if cls is nn.SeqStack:
+            # Keep scan carry replicated under explicit meshes.
+            def replicated_apply(layer, value):
+                output, _ = apply(layer, value)
+                if axis_type is AxisType.Explicit:
+                    output = jax.sharding.reshard(output, P())
+                return output, None
+            result, _ = model(replicated_apply, x)
+            expected = layers[1](layers[0](x))
+        else:
+            result = model(x, in_axes=None)
+            expected = jnp.stack([layer(x) for layer in layers])
+        assert jnp.allclose(result, expected, atol=1e-5)
+        assert model.stacked.kernel.partition_spec == P(None, None, 'tp')
+        assert layers[0].kernel.axis_names == ('input', 'output')
+
+
+@pytest.mark.parametrize('cls', [nn.Stack, nn.SeqStack])
+def test_stateful_captured_stacks_fail_without_mutating_stored_state(cls):
+    model = cls([Counter(), Counter()])
+    with pytest.raises(RuntimeError, match='Pass the container'):
+        jax.jit(lambda x: model(x, in_axes=None) if cls is nn.Stack
+                else model(_scan_apply, x)[0])(jnp.array(0.))
+    assert jnp.all(model.stacked.count.value == 0)
+
+
+@pytest.mark.parametrize('cls', [nn.Stack, nn.SeqStack])
+@pytest.mark.parametrize('tracking', [False, True])
+def test_stacks_support_batchnorm_nontracking_and_eval_modes(cls, tracking):
+    layers = [nn.BatchNorm(2, momentum=1.0, track_running_stats=tracking)
+              for _ in range(2)]
+    x = jnp.arange(8, dtype=jnp.float32).reshape(4, 2)
+    if tracking:
+        for layer in layers:
+            layer(x)  # BatchNorm currently updates statistics only eagerly.
+            layer.eval()
+    model = cls(layers)
+    if cls is nn.Stack:
+        result = model(x, in_axes=None)
+        expected = jnp.stack([layer(x) for layer in layers])
+    else:
+        result, _ = model(_scan_apply, x)
+        expected = layers[1](layers[0](x))
+    assert jnp.allclose(result, expected, atol=1e-6)
+    if tracking:
+        assert jnp.allclose(model.stacked.running_mean.value,
+                            jnp.stack([x.mean(0), x.mean(0)]))
+
+
+@pytest.mark.parametrize('cls', [nn.Stack, nn.SeqStack])
+def test_stacks_have_finite_parameter_gradients(cls):
+    model = cls([nn.Linear(2, 2, rngs=nn.Rngs(i)) for i in range(2)])
+    def objective(model):
+        x = jnp.ones((3, 2))
+        output = (model(x, in_axes=None) if cls is nn.Stack
+                  else model(_scan_apply, x)[0])
+        return output.sum()
+    gradient = jax.jit(jax.grad(objective))(model)
+    assert all(jnp.all(jnp.isfinite(leaf)) for leaf in jax.tree.leaves(gradient))
+    assert jnp.any(gradient.stacked.kernel.value != 0)
+
+
+def test_stack_result_axis_does_not_move_state_axis():
+    model = nn.Stack([Counter(), Counter(), Counter()])
+    output = model(jnp.zeros(2), in_axes=None, out_axes=1)
+    assert output.shape == (2, 3)
+    assert model.stacked.count.shape == (3,)
+    assert jnp.all(model.stacked.count.value == 1)
+
+
+def test_stacks_reject_static_mutation():
+    class ChangeConfig(nn.Module):
+        def __init__(self):
+            self.flag = False
+        def __call__(self, x):
+            self.flag = True
+            return x
+    model = nn.Stack([ChangeConfig(), ChangeConfig()])
+    with pytest.raises(ValueError, match='static configuration'):
+        model(jnp.ones(2))
+    assert not model.stacked.flag
+
+
+def test_grouped_scan_rejects_output_dtype_mismatch():
+    model = nn.SeqStack([ConfiguredAdd(1, 'a'), ConfiguredAdd(2, 'b')])
+    def apply(layer, carry):
+        output = jnp.array(1, dtype=jnp.float32 if layer.mode == 'a' else jnp.int32)
+        return carry, output
+    with pytest.raises(ValueError, match='output shapes and dtypes'):
+        model(apply, jnp.array(0))
+
+
+class ParameterOutput(nn.Module):
+    def __init__(self):
+        with map_logical_axis_names({'input': 'tp'}):
+            self.parameter = nn.Parameter(jnp.ones((2, 4)),
+                                          axis_names=('input', 'output'),
+                                          partition_spec=P('tp', None))
+    def __call__(self, x):
+        return {'parameter': self.parameter}
+
+
+@pytest.mark.parametrize('axis', [0, 1, -1])
+def test_stack_handles_parameter_output_metadata_locally(axis):
+    model = nn.Stack([ParameterOutput() for _ in range(3)])
+    result = model(jnp.array(0), in_axes=None, out_axes={'parameter': axis})
+    parameter = result['parameter']
+    index = axis if axis >= 0 else axis + 3
+    names = ['input', 'output']
+    names.insert(index, None)
+    spec = ['tp', None]
+    spec.insert(index, None)
+    assert parameter.axis_names == tuple(names)
+    assert parameter.partition_spec == P(*spec)
+    assert model.stacked.parameter.axis_names == (None, 'input', 'output')
+    assert model.stacked.parameter.partition_spec == P(None, 'tp', None)
+
+
+def test_seq_stack_handles_parameter_output_metadata_locally():
+    model = nn.SeqStack([ParameterOutput() for _ in range(3)])
+    def apply(layer, carry):
+        return carry, layer(carry)
+    _, result = model(apply, jnp.array(0))
+    assert result['parameter'].shape == (3, 2, 4)
+    assert result['parameter'].axis_names == (None, 'input', 'output')
+    assert result['parameter'].partition_spec == P(None, 'tp', None)
