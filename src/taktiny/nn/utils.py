@@ -484,20 +484,20 @@ def _conv_dimension_numbers(rank: int) -> jax.lax.ConvDimensionNumbers:
     return jax.lax.ConvDimensionNumbers(lhs_spec, rhs_spec, lhs_spec)
 
 
-def _max_identity(dtype: jnp.dtype) -> jax.Array:
+def _max_identity(dtype: jnp.dtype) -> Any:
     """Returns the identity value for the max reduction operation for a given dtype.
 
     Args:
         dtype (jnp.dtype): The JAX data type.
 
     Returns:
-        jax.Array: The identity value (e.g., -inf or min value) for max reduction.
+        Any: The identity value (e.g., -inf or min value) for max reduction.
     """
     if jnp.issubdtype(dtype, jnp.bool_):
-        return jnp.asarray(False, dtype=dtype)
+        return False
     if jnp.issubdtype(dtype, jnp.integer):
-        return jnp.asarray(jnp.iinfo(dtype).min, dtype=dtype)
-    return jnp.asarray(-jnp.inf, dtype=dtype)
+        return int(jnp.iinfo(dtype).min)
+    return -float("inf")
 
 
 def _normalize_adaptive_size(

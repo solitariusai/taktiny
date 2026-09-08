@@ -337,7 +337,6 @@ class LayerNorm(Module):
             f'affine={self.elementwise_affine}'
         )
 
-
 class RMSNorm(Module):
     """Apply root mean square normalization over selected dimensions.
 
@@ -486,7 +485,6 @@ class RMSNorm(Module):
             f'{_shape_repr(self.num_features)}, epsilon={self.epsilon:g}, '
             f'affine={self.elementwise_affine}'
         )
-
 
 class BatchNorm(Module):
     """Normalize feature dimensions using mini-batch statistics.
@@ -766,7 +764,6 @@ class BatchNorm(Module):
             f'{_shape_repr(self.num_features)}, epsilon={self.epsilon:g}, '
             f'momentum={self.momentum}, affine={self.elementwise_affine}'
         )
-
 
 class GroupNorm(Module):
     """Normalize grouped channels independently of the batch size.

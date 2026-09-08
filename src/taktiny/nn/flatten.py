@@ -125,7 +125,6 @@ class Flatten(Module):
     def extra_repr(self) -> str:
         return f'start_axis={self.start_axis}, end_axis={self.end_axis}'
 
-
 class Unflatten(Module):
     """Replace one axis with a specified shape in row-major order.
 
@@ -247,6 +246,5 @@ class Unflatten(Module):
     def extra_repr(self) -> str:
         shape = '×'.join(map(str, self.unflattened_size))
         return f'axis={self.axis}, unflattened_size={shape}'
-
 
 __all__ = ['Flatten', 'Unflatten']

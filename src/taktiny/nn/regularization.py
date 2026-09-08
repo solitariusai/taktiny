@@ -52,7 +52,6 @@ def _mask_shape(
         for axis, size in enumerate(shape)
     )
 
-
 def _feature_broadcast_axes(
     ndim: int,
     channel_axis: int,
@@ -84,7 +83,6 @@ def _feature_broadcast_axes(
         if axis not in (canonical_batch_axis, channel_axis)
     )
 
-
 def _next_key(rngs: Rngs | None) -> jax.Array:
     """Consume a key from an explicit stream or the current runtime context.
 
@@ -98,7 +96,6 @@ def _next_key(rngs: Rngs | None) -> jax.Array:
     if rngs is None:
         rngs = get_context_rng()
     return rngs()
-
 
 def _validate_rngs(rngs: Rngs | None) -> Rngs | None:
     """Validates that the provided rngs argument is of type Rngs or None.
@@ -117,7 +114,6 @@ def _validate_rngs(rngs: Rngs | None) -> Rngs | None:
         raise TypeError('rngs must be an Rngs or None')
 
     return rngs
-
 
 class Dropout(Module):
     """Applies Dropout to the input.
@@ -226,7 +222,6 @@ class Dropout(Module):
     def extra_repr(self) -> str:
         return f'p={self.p:g}, broadcast_axes={self.broadcast_axes}'
 
-
 class FeatureDropout(Dropout):
     """Applies Feature Dropout (Spatial Dropout) to the input.
 
@@ -282,7 +277,6 @@ class FeatureDropout(Dropout):
             f'p={self.p:g}, channel_axis={self.channel_axis}, '
             f'batch_axis={self.batch_axis}'
         )
-
 
 class AlphaDropout(Module):
     """Applies Alpha Dropout to the input, maintaining the self-normalizing property.
@@ -379,7 +373,6 @@ class AlphaDropout(Module):
     def extra_repr(self) -> str:
         return f'p={self.p:g}, broadcast_axes={self.broadcast_axes}'
 
-
 class FeatureAlphaDropout(AlphaDropout):
     """Applies Feature Alpha Dropout to the input.
 
@@ -433,7 +426,6 @@ class FeatureAlphaDropout(AlphaDropout):
             f'p={self.p:g}, channel_axis={self.channel_axis}, '
             f'batch_axis={self.batch_axis}'
         )
-
 
 class StochasticDepth(Dropout):
     """Applies Stochastic Depth to the input.

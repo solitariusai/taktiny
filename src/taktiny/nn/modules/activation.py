@@ -264,6 +264,7 @@ class HardSigmoid(ActivationBase):
 
 
 __all__ = [
+    'ActivationBase',
     'ELU',
     'GELU',
     'SELU',

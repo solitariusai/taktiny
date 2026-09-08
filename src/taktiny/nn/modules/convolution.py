@@ -1012,7 +1012,6 @@ def _positive_spatial(
         raise ValueError(f'{name} must contain {rank} values, got {len(values)}')
     return values
 
-
 def _spatial_padding(
     padding: str | int | Sequence[int | tuple[int, int]], rank: int,
 ) -> str | tuple[tuple[int, int], ...]:
@@ -1023,12 +1022,10 @@ def _spatial_padding(
                 raise TypeError('padding values must be integers, not booleans')
     return result
 
-
 def _boolean(value: bool, name: str) -> bool:
     if not isinstance(value, bool):
         raise TypeError(f'{name} must be a boolean')
     return value
-
 
 def _adaptive_size(value: int | Sequence[int | None]) -> tuple[int | None, ...]:
     sizes = _normalize_adaptive_size(value)
@@ -1036,7 +1033,6 @@ def _adaptive_size(value: int | Sequence[int | None]) -> tuple[int | None, ...]:
         if size is not None:
             _validate_integer(size, 'output_size')
     return sizes
-
 
 class _SpatialOp(Module):
     """Common channels-last input validation, output placement and repr."""
@@ -1073,11 +1069,10 @@ class _SpatialOp(Module):
             fields.append(f'{label}={value}')
         return ', '.join(fields)
 
-
 class Unfold(_SpatialOp):
     """Extract channels-last sliding windows into flattened patches.
 
-    Inputs are (*spatial, channels) or (batch, *spatial, channels), with one
+    Inputs are ``(*spatial, channels)`` or ``(batch, *spatial, channels)``, with one
     trailing channel axis. Scalars specify 1-D spatial shapes; sequences specify
     the spatial rank. Spatial and channel dimensions must be nonempty.
     __call__ accepts out_sharding for the final output.
@@ -1170,7 +1165,7 @@ class Fold(_SpatialOp):
 
     Input is (windows, patch_width) or (batch, windows, patch_width). Patch
     layout must match Unfold: channel followed by flattened kernel dimensions.
-    Output is (*output_size, channels), optionally with a batch axis.
+    Output is ``(*output_size, channels)``, optionally with a batch axis.
     Overlaps are summed and padded positions are discarded, including negative
     coordinates; they never wrap around the output. To invert Unfold, divide
     by the overlap counts where those counts are nonzero. __call__ accepts
@@ -1300,7 +1295,7 @@ class Fold(_SpatialOp):
 class MaxPool(_SpatialOp):
     """Take maxima over channels-last spatial windows.
 
-    Inputs are (*spatial, channels) or (batch, *spatial, channels), with one
+    Inputs are ``(*spatial, channels)`` or ``(batch, *spatial, channels)``, with one
     trailing channel axis. Scalars specify 1-D spatial shapes; sequences specify
     the spatial rank. Spatial and channel dimensions must be nonempty.
     __call__ accepts out_sharding for the final output.
@@ -1448,7 +1443,7 @@ class MaxPool(_SpatialOp):
 class MaxUnpool(_SpatialOp):
     """Scatter pooled values back to their flattened spatial indices.
 
-    Inputs are (*spatial, channels) or (batch, *spatial, channels), with one
+    Inputs are ``(*spatial, channels)`` or ``(batch, *spatial, channels)``, with one
     trailing channel axis. Scalars specify 1-D spatial shapes; sequences specify
     the spatial rank. Spatial and channel dimensions must be nonempty.
     __call__ accepts out_sharding for the final output.
@@ -1570,7 +1565,7 @@ class MaxUnpool(_SpatialOp):
 class AvgPool(_SpatialOp):
     """Average channels-last spatial windows.
 
-    Inputs are (*spatial, channels) or (batch, *spatial, channels), with one
+    Inputs are ``(*spatial, channels)`` or ``(batch, *spatial, channels)``, with one
     trailing channel axis. Scalars specify 1-D spatial shapes; sequences specify
     the spatial rank. Spatial and channel dimensions must be nonempty.
     __call__ accepts out_sharding for the final output.
@@ -1710,7 +1705,7 @@ class AvgPool(_SpatialOp):
 class FractionalMaxPool(_SpatialOp):
     """Max-pool windows placed on a fractional, optionally random spatial grid.
 
-    Inputs are (*spatial, channels) or (batch, *spatial, channels), with one
+    Inputs are ``(*spatial, channels)`` or ``(batch, *spatial, channels)``, with one
     trailing channel axis. Scalars specify 1-D spatial shapes; sequences specify
     the spatial rank. Spatial and channel dimensions must be nonempty.
     __call__ accepts out_sharding for the final output.
@@ -1919,7 +1914,7 @@ class FractionalMaxPool(_SpatialOp):
 class LPPool(_SpatialOp):
     """Compute (sum(abs(x)**p))**(1/p) over spatial windows.
 
-    Inputs are (*spatial, channels) or (batch, *spatial, channels), with one
+    Inputs are ``(*spatial, channels)`` or ``(batch, *spatial, channels)``, with one
     trailing channel axis. Scalars specify 1-D spatial shapes; sequences specify
     the spatial rank. Spatial and channel dimensions must be nonempty.
     __call__ accepts out_sharding for the final output.
@@ -2015,7 +2010,7 @@ class LPPool(_SpatialOp):
 class AdaptiveMaxPool(_SpatialOp):
     """Pool variable-size spatial bins to a requested output shape.
 
-    Inputs are (*spatial, channels) or (batch, *spatial, channels), with one
+    Inputs are ``(*spatial, channels)`` or ``(batch, *spatial, channels)``, with one
     trailing channel axis. Scalars specify 1-D spatial shapes; sequences specify
     the spatial rank. Spatial and channel dimensions must be nonempty.
     __call__ accepts out_sharding for the final output.
@@ -2084,7 +2079,7 @@ class AdaptiveMaxPool(_SpatialOp):
 class AdaptiveAvgPool(_SpatialOp):
     """Average variable-size spatial bins to a requested output shape.
 
-    Inputs are (*spatial, channels) or (batch, *spatial, channels), with one
+    Inputs are ``(*spatial, channels)`` or ``(batch, *spatial, channels)``, with one
     trailing channel axis. Scalars specify 1-D spatial shapes; sequences specify
     the spatial rank. Spatial and channel dimensions must be nonempty.
     __call__ accepts out_sharding for the final output.

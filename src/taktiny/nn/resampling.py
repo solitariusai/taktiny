@@ -195,8 +195,8 @@ class _Resize(Module):
 class Upsample(_Resize):
     """Resize channels-last spatial dimensions by a multiplicative factor.
 
-    For n spatial dimensions, accepts (*spatial, channels) or
-    (batch, *spatial, channels). Scalar size/scale_factor means n=1; a sequence
+    For n spatial dimensions, accepts ``(*spatial, channels)`` or
+    ``(batch, *spatial, channels)``. Scalar size/scale_factor means n=1; a sequence
     specifies n explicitly. For 2-D images, use e.g. scale_factor=(2, 2).
     Batch and channel dimensions are preserved. Only one channel axis is
     supported; trailing N-D feature blocks are not inferred.
@@ -260,8 +260,8 @@ class Upsample(_Resize):
 class Downsample(_Resize):
     """Reduce channels-last spatial dimensions by a divisive factor.
 
-    For n spatial dimensions, accepts (*spatial, channels) or
-    (batch, *spatial, channels). Scalar size/scale_factor describes 1-D input;
+    For n spatial dimensions, accepts ``(*spatial, channels)`` or
+    ``(batch, *spatial, channels)``. Scalar size/scale_factor describes 1-D input;
     use a sequence such as (2, 2) for 2-D resizing. Batch and the single trailing
     channel axis are preserved; N-D feature blocks are not inferred.
 
