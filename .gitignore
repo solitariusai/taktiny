@@ -11,5 +11,11 @@ wheels/
 
 
 # Added by cargo
-
 /target
+
+# tmp files
+tmp*
+zcratch*
+
+# Sphinx documentation build
+docs/_build/
