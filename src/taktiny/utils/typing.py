@@ -47,7 +47,7 @@ type MutableBatch = dict[str, PyTree]
 type StateDict = dict[str, PyTree]
 type ParameterDict = dict[str, Any]
 type ModuleFactory = Callable[..., Any]
-type LossFn = Callable[[Any, Batch], Array]
+type LossFn = Callable[[Any, Any], Array | tuple[Array, Any]]
 type QuantConfig = str | qwix.QuantizationRule | qwix.PtqProvider | Sequence[qwix.QuantizationRule] | None
 type MetaData = dict[str, Any] | Sequence[tuple[str, Any]]
 

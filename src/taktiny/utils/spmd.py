@@ -16,16 +16,17 @@
 """Utilities for working with jit and partitioned models."""
 from __future__ import annotations
 
-from typing import Any, Self, Sequence
-from collections.abc import Mapping
-import jax
 import collections
-import threading
-import dataclasses
 import contextlib
-import contextvars
+import dataclasses
+import threading
+from collections.abc import Mapping, Sequence
+from typing import Any, Self
+
+import jax
 
 from taktiny.utils.typing import LogicalRules, MeshAxisName
+
 
 class _UnassignedAxis:
     def __repr__(self) -> str: return 'UnassignedAxis'

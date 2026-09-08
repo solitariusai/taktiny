@@ -15,9 +15,9 @@
 # limitations under the License.
 """Format utilities."""
 from __future__ import annotations
+
 import re
 import typing as tp
-
 
 _SIZE_SUFFIXES = {
     'kb': 1024,
@@ -94,11 +94,16 @@ def format_bytes(size: int) -> str:
 
 def format_dtype(dtype: tp.Any) -> str:
     name = dtype.name
-    if name == 'float32': return 'f32'
-    if name == 'float16': return 'f16'
-    if name == 'bfloat16': return 'bf16'
-    if name == 'int32': return 'i32'
-    if name == 'int64': return 'i64'
+    if name == 'float32': 
+        return 'f32'
+    if name == 'float16': 
+        return 'f16'
+    if name == 'bfloat16': 
+        return 'bf16'
+    if name == 'int32': 
+        return 'i32'
+    if name == 'int64': 
+        return 'i64'
     return name
 
 __all__ = [

@@ -53,6 +53,9 @@ def _parameter_labels(params: PyTree) -> PyTree:
         )
 
     def label_parameter(parameter: Parameter) -> PyTree:
+        if not isinstance(parameter, Parameter):
+            # Module-owned buffers and RNG leaves are state, not parameters.
+            return 'frozen'
         trainable = (
             getattr(parameter, 'trainable', True)
             and _is_trainable_value(parameter.value)
@@ -193,6 +196,8 @@ def _ema_update(
     """
     def blend(ema_value: Any, param_value: Any) -> Any:
         if ema_value is None or param_value is None:
+            return param_value
+        if not _is_trainable_value(param_value):
             return param_value
         return ema_value * decay + param_value * (1.0 - decay)
 
@@ -345,5 +350,3 @@ def _format_iteration_time(seconds: float) -> str:
         return f'{seconds:.1f} s/it'
 
     return f'{seconds / 60:.1f} min/it'
-
-

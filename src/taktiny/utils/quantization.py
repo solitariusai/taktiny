@@ -14,16 +14,14 @@
 """Quantization helpers."""
 
 from __future__ import annotations
-from typing import Any
 
-
-from collections.abc import Sequence
 import dataclasses
 import re
+from collections.abc import Sequence
+from typing import Any
 
 import jax.numpy as jnp
 import qwix
-
 
 _QTYPE_ALIASES = {
     'fp8': jnp.float8_e4m3fn,

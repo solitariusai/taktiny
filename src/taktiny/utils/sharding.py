@@ -19,9 +19,10 @@ from __future__ import annotations
 
 from typing import Any
 
-
-from jax.sharding import NamedSharding, PartitionSpec as P
 import jax
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
+
 from taktiny.utils import spmd
 
 
@@ -35,14 +36,14 @@ def remove_size_one_mesh_axis(spec: Any, mesh: Any) -> Any:
   """
   if spec is None:
     return None
-  new_spec = []  # type: ignore
+  new_spec = []
   for s in spec:
     if s is None or s == P.UNCONSTRAINED:
-      new_spec.append(s)  # type: ignore
+      new_spec.append(s)
     elif isinstance(s, tuple):
       new_spec.append(tuple(i for i in s if mesh.shape.get(i, 1) != 1))
     else:
-      new_spec.append(None if mesh.shape.get(s, 1) == 1 else s)  # type: ignore
+      new_spec.append(None if mesh.shape.get(s, 1) == 1 else s)
   return P(*new_spec, unreduced=spec.unreduced, reduced=spec.reduced)
 
 def logical_to_mesh_axes(logical_names: Any, mesh: Any, rules: Any=None) -> Any:
