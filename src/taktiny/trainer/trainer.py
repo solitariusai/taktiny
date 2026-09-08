@@ -19,7 +19,7 @@ import math
 import os
 import re
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sized
 from itertools import islice
 from typing import Any
 
@@ -90,7 +90,9 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
         self.loss_has_aux = loss_has_aux
         self.training_config = training_config
         self.dataset_config = dataset_config
-        self._train_dataloader = dataset_config.train_dataloader
+        if dataset_config.train_dataloader is None:
+            raise TypeError('train_dataloader is required')
+        self._train_dataloader: Iterable[Batch] = dataset_config.train_dataloader
         self._validation_dataloader = dataset_config.validation_dataloader
 
         self.compute_metrics = compute_metrics
@@ -435,7 +437,7 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
             raise ValueError(
                 'validation_dataloader is required when evaluation is enabled'
             )
-        if saving_enabled:
+        if saving_enabled and self.training_config.output_dir is not None:
             os.makedirs(self.training_config.output_dir, exist_ok=True)
 
         self._call_event('on_train_begin')
@@ -613,7 +615,7 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
 
         # Try to guess total optimizer updates if dataloader has __len__.
         total_steps = None
-        if hasattr(self._train_dataloader, '__len__'):
+        if isinstance(self._train_dataloader, Sized):
             try:
                 dataloader_length = len(self._train_dataloader)
             except TypeError:
@@ -676,6 +678,9 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
                 nonlocal trainable_params
                 nonlocal update_skipped
 
+                if accumulated_loss is None or accumulated_microbatches == 0:
+                    return
+
                 divisor = jnp.asarray(
                     accumulated_microbatches,
                     dtype=jnp.float32,
@@ -719,6 +724,7 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
                     finite = jnp.isfinite(averaged_loss)
 
                 if self.training_config.max_grad_norm is not None:
+                    assert current_grad_norm is not None
                     clip_scale = jnp.minimum(
                         jnp.asarray(1.0, dtype=jnp.float32),
                         (
@@ -902,6 +908,7 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
 
                 should_evaluate = (
                     self.training_config.eval_strategy == 'steps'
+                    and self.training_config.eval_steps is not None
                     and step % self.training_config.eval_steps == 0
                 )
                 if should_evaluate:
@@ -971,6 +978,7 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
                 skip_batches = resume_step_in_epoch
                 step_in_epoch = skip_batches
                 dataloader = self._train_dataloader
+                assert dataloader is not None
                 data_iterator = iter(dataloader)
                 self._active_data_iterator = data_iterator
                 restored_iterator = (
