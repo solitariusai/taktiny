@@ -25,7 +25,6 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 from rich.console import Console
 from rich.progress import (
@@ -63,6 +62,14 @@ from taktiny.utils.typing import Batch, LossFn, PathLike, PyTree
 
 
 class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
+    """Train a model on caller-provided batch iterables with an explicit loss.
+
+    DatasetConfig owns only batch placement/prefetch settings: dataset loading,
+    preprocessing, batching, and sampling are external responsibilities.
+    Training checkpoints use native Orbax, including dynamic model leaves,
+    optional optimizer/EMA state, RNGs, and iterator progress. Static model
+    configuration must be supplied again when constructing a resumed Trainer.
+    """
     def __init__(
         self,
         model: Any,
@@ -74,6 +81,10 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
         callbacks: Iterable[Any] | Any | None = None,
         compute_metrics: Callable[..., Mapping[str, Any]] | None = None,
     ) -> None:
+        if not callable(loss_fn):
+            raise TypeError('loss_fn must be callable')
+        if not isinstance(loss_has_aux, bool):
+            raise TypeError('loss_has_aux must be a boolean')
         self.model = model
         self.loss_fn = loss_fn
         self.loss_has_aux = loss_has_aux
@@ -125,10 +136,10 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
         self._active_data_iterator = None
         self.rngs = Rngs(self.training_config.seed)
         self._loss_accepts_rng = self._callable_accepts_rng(loss_fn)
-        self._checkpoint_executor = None
         self._pending_checkpoint = None
 
 
+    @staticmethod
     def _callable_accepts_rng(function: Callable[..., Any]) -> bool:
         try:
             signature = inspect.signature(function)
@@ -172,6 +183,7 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
         """Run subclass finalization before train-end callbacks."""
 
 
+    @staticmethod
     def _set_dataloader_epoch(dataloader: Any, epoch: int) -> bool:
         candidates = (
             dataloader,
@@ -188,6 +200,7 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
         return False
 
 
+    @staticmethod
     def _validate_callback(callback: Any) -> None:
         events = (
             'on_train_begin',
@@ -262,6 +275,7 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
             raise ValueError("Unsupported model type")
 
 
+    @property
     def ema(self) -> Module:
         """A fresh model holding the EMA weights, without touching ``self.model``.
 
@@ -273,16 +287,6 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
                 'EMA is disabled; set TrainingConfig.ema_decay to enable it'
             )
         return _copy_tree(self._ema)
-
-
-    def _ema_snapshot(self) -> dict[str, Any] | None:
-        """A host copy of the EMA leaves, or ``None`` when EMA is disabled."""
-        if self._ema is None:
-            return None
-        return {
-            name: np.array(jax.device_get(value), copy=True)
-            for name, value in self._ema.flat_state_dict().items()
-        }
 
 
     def _setup_optimizer(self, params: PyTree) -> optax.GradientTransformation:
@@ -342,12 +346,27 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
 
 
     def train(self, resume_from_checkpoint: PathLike | None = None) -> None:
+        """Train on caller-provided batches; resume a native Orbax checkpoint.
+
+        Pass a checkpoint directory or 'latest'. Supply the same model structure,
+        optimizer, and data pipeline for exact resume. Async writes are drained
+        on both success and failure before returning to the caller.
+        """
+        try:
+            if isinstance(self.model, Module):
+                self.model.train()
+            self._train(resume_from_checkpoint)
+        finally:
+            self._drain_pending_checkpoint()
+            self._active_data_iterator = None
+
+    def _train(self, resume_from_checkpoint: PathLike | None = None) -> None:
         """Train the configured model, optionally resuming a checkpoint.
 
         Args:
             resume_from_checkpoint: A ``checkpoint-<step>`` directory or
                 ``"latest"`` to select the highest numbered checkpoint in
-                ``output_dir``. Resuming restores model or adapter weights,
+                ``output_dir``. Resuming restores all model leaves,
                 optimizer state, Trainer RNG, history, and the saved epoch and
                 batch position. The dataloader must reproduce the same
                 per-epoch ordering so consumed batches can be skipped
@@ -416,30 +435,8 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
             raise ValueError(
                 'validation_dataloader is required when evaluation is enabled'
             )
-        supports_checkpoint = (
-            callable(getattr(self.model, 'save_pretrained', None))
-            or (
-                jax.process_count() > 1
-                and isinstance(self.model, Module)
-            )
-        )
-        if saving_enabled and not supports_checkpoint:
-            raise TypeError(
-                f'{type(self.model).__name__} does not support '
-                'save_pretrained checkpoints'
-            )
         if saving_enabled:
             os.makedirs(self.training_config.output_dir, exist_ok=True)
-        if (
-            saving_enabled
-            and self.training_config.save_async
-            and jax.process_count() > 1
-            and jax.process_index() == 0
-        ):
-            console.print(
-                '[dim]save_async uses coordinated synchronous writes on '
-                'multi-host jobs[/dim]'
-            )
 
         self._call_event('on_train_begin')
 
@@ -480,24 +477,7 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
             self._mesh,
         )
         if resume_checkpoint is not None:
-            import orbax.checkpoint as ocp
-
-            optimizer_path = os.path.join(
-                resume_checkpoint,
-                'optimizer_state',
-            )
-            if not os.path.isdir(optimizer_path):
-                raise FileNotFoundError(
-                    f'Optimizer state was not found: {optimizer_path}'
-                )
-            checkpointer = ocp.StandardCheckpointer()
-            try:
-                opt_state = checkpointer.restore(
-                    optimizer_path,
-                    target=opt_state,
-                )
-            finally:
-                checkpointer.close()
+            opt_state = self._restore_optimizer_state(resume_checkpoint, opt_state)
 
         # 2. Define independently compilable gradient and optimizer phases.
         def calculate_loss(
@@ -621,7 +601,7 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
             if resume_state
             else 0
         )
-        epoch = 0
+        epoch = resume_state['epoch'] if resume_state else 0
         step_in_epoch = resume_step_in_epoch
         accumulation_steps = (
             self.training_config.gradient_accumulation_steps
@@ -989,6 +969,7 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
 
                 epoch_updates_run = 0
                 skip_batches = resume_step_in_epoch
+                step_in_epoch = skip_batches
                 dataloader = self._train_dataloader
                 data_iterator = iter(dataloader)
                 self._active_data_iterator = data_iterator
@@ -1317,19 +1298,21 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
                             step_in_epoch=step_in_epoch,
                         )
                 resume_step_in_epoch = 0
+                resume_checkpoint = None
 
                 # With no max_steps the dataloader is consumed once; otherwise
                 # cycle it (the dataloader owns its own shuffling) until
                 # max_steps is reached.
                 if self.training_config.max_steps is None:
                     break
-                if epoch_updates_run == 0:
+                if epoch_updates_run == 0 and skip_batches == 0:
                     # The dataloader yielded nothing this pass (e.g. a
                     # one-shot iterator that can no longer be re-iterated).
                     break
                 if should_stop:
                     # max_steps was reached on this pass; do not start another.
                     break
+                epoch += 1
 
             if microbatches_run_this_call == 0 and step == 0:
                 raise ValueError('dataloader produced no training batches')
@@ -1423,9 +1406,6 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
                 f'[dim]Saved final checkpoint to {checkpoint_path}[/dim]'
             )
         self._drain_pending_checkpoint()
-        if self._checkpoint_executor is not None:
-            self._checkpoint_executor.shutdown(wait=True)
-            self._checkpoint_executor = None
         if self.training_config.load_best_model_at_end:
             if self.best_model_checkpoint is None:
                 raise ValueError(
@@ -1444,7 +1424,7 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
     def _inject_params(self, params: PyTree) -> None:
         if self.model_type == "taktiny":
             # The returned PyTree is a new taktiny Module. We can update self.model in-place.
-            self.model.load_state_dict(params.state_dict())
+            self.model.__dict__.update(params.__dict__)
         elif self.model_type == "nnx":
             from flax import nnx
             # params is the state dict, we merge it back into the graph

@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 
 from taktiny.utils.trainer import (
+    _copy_tree,
     _parameter_mesh,
     _prefetch,
     _sharding_mesh,
@@ -32,6 +33,9 @@ from taktiny.utils.typing import PyTree
 
 class TrainerEvaluateMixin:
     def _evaluate_params(self, params: PyTree) -> dict[str, float]:
+        from taktiny.nn.base import Module
+        if isinstance(params, Module):
+            params = _copy_tree(params).eval()
         dataloader = self._validation_dataloader
         if dataloader is None:
             raise ValueError(
@@ -88,6 +92,8 @@ class TrainerEvaluateMixin:
             else:
                 value = self.loss_fn(params, batch)
 
+            if self.loss_has_aux:
+                value, _ = value
             if isinstance(value, jax.Array):
                 value = value.item()
 

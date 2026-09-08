@@ -15,6 +15,5 @@
 from taktiny.trainer.callbacks import *
 from taktiny.trainer.checkpoint import *
 from taktiny.trainer.config import *
-from taktiny.trainer.dataset import *
 from taktiny.trainer.evaluate import *
 from taktiny.trainer.trainer import *

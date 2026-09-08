@@ -13,11 +13,10 @@
 # limitations under the License.
 
 from __future__ import annotations
-from typing import Any
 
-
-from numbers import Number
 import os
+from numbers import Number
+from typing import Any
 
 
 def _numeric_logs(logs: Any) -> Any:
@@ -71,7 +70,7 @@ class TensorBoardCallback(TrainerCallback):
                 'runs',
             )
         try:
-            from tensorboardX import SummaryWriter
+            from tensorboardX import SummaryWriter  # ty: ignore[unresolved-import]
         except ImportError:
             try:
                 from torch.utils.tensorboard import SummaryWriter
@@ -134,7 +133,7 @@ class WandbCallback(TrainerCallback):
         if self.run is not None:
             return self.run
         try:
-            import wandb
+            import wandb  # ty: ignore[unresolved-import]
         except ImportError as error:
             raise ImportError(
                 'WandbCallback requires the wandb package'
