@@ -67,7 +67,7 @@ class map_logical_axis_names(contextlib.ContextDecorator):
         self._rules = tuple(rules)
         
         # Apply globally immediately upon instantiation
-        current_rules = get_logical_axis_rules()
+        current_rules = tuple(get_logical_axis_rules())
         self._prev_rules = current_rules
         new_rules = self._rules + current_rules
         set_logical_axis_rules(new_rules)

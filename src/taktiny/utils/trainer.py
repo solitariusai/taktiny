@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import copy
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from typing import Any
 
 import jax
@@ -319,7 +319,7 @@ def _prefetch[T](
     iterable: Iterable[T],
     place: Callable[[T], T],
     size: int,
-) -> Iterator[T]:
+) -> Generator[T, None, None]:
     """Place a bounded number of batches ahead of consumption."""
     iterator = iter(iterable)
     if size == 0:
