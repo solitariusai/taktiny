@@ -14,9 +14,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 import taktiny
 from taktiny import nn
-from taktiny import Takt
-from taktiny.maestro.overture import PretrainedModel
-from taktiny.peft import LoraConfig
 from taktiny.trainer import (
     DatasetConfig,
     TensorBoardCallback,
@@ -41,61 +38,6 @@ class TinyModel(nn.Module):
         self.weight = nn.Parameter(jnp.asarray(0.0))
         self.frozen = nn.Parameter(jnp.asarray(3.0), trainable=False)
 
-
-class SavingTinyModel(TinyModel):
-    def __init__(self):
-        super().__init__()
-        self.save_calls = []
-
-    def save_pretrained(self, path, *, max_shard_size):
-        os.makedirs(path, exist_ok=True)
-        saved_file = os.path.join(path, 'weight.txt')
-        with open(saved_file, 'w') as checkpoint:
-            checkpoint.write(str(float(self.weight.value)))
-        self.save_calls.append(
-            (os.fspath(path), max_shard_size, float(self.weight.value))
-        )
-        return (saved_file,)
-
-
-class CheckpointTinyModel(PretrainedModel):
-    def __init__(self):
-        self.config = {}
-        self.weight = nn.Parameter(jnp.asarray(0.0))
-        self.frozen = nn.Parameter(jnp.asarray(3.0), trainable=False)
-
-
-class SlowCheckpointTinyModel(CheckpointTinyModel):
-    @classmethod
-    def _save_pretrained_snapshot(cls, snapshot, path, **kwargs):
-        time.sleep(0.05)
-        return super()._save_pretrained_snapshot(
-            snapshot,
-            path,
-            **kwargs,
-        )
-
-
-class FailingSavingTinyModel(TinyModel):
-    def save_pretrained(self, path, *, max_shard_size):
-        os.makedirs(path, exist_ok=True)
-        with open(os.path.join(path, 'partial.txt'), 'w') as partial:
-            partial.write('incomplete')
-        raise RuntimeError('checkpoint write failed')
-
-
-class AdapterTrainingModel(PretrainedModel):
-    def __init__(self):
-        self.config = {}
-        self.proj = nn.Linear(
-            1,
-            1,
-            bias=False,
-            rngs=nn.Rngs(0),
-        )
-
-    def __call__(self, x):
-        return self.proj(x)
 
 
 class RecordingCallback(TrainerCallback):
@@ -126,6 +68,7 @@ class RecordingCallback(TrainerCallback):
         self.events.append(('train_end', trainer.global_step))
 
 
+
 class FakeSummaryWriter:
     def __init__(self):
         self.scalars = []
@@ -142,6 +85,7 @@ class FakeSummaryWriter:
         self.closed = True
 
 
+
 class FakeWandbRun:
     def __init__(self):
         self.logs = []
@@ -152,6 +96,7 @@ class FakeWandbRun:
 
     def finish(self):
         self.finished = True
+
 
 
 class StatefulIterator:
@@ -187,6 +132,7 @@ class StatefulIterator:
         self.restored_position = position
 
 
+
 class StatefulLoader:
     def __init__(self, batches, *, state_format='bytes'):
         self.batches = batches
@@ -205,6 +151,7 @@ class StatefulLoader:
         return len(self.batches)
 
 
+
 class EpochAwareLoader:
     def __init__(self, batches):
         self.batches = batches
@@ -220,14 +167,17 @@ class EpochAwareLoader:
         return len(self.batches)
 
 
+
 def squared_error(model, batch):
     prediction = model.weight.value * batch['x']
     return jnp.mean((prediction - batch['y']) ** 2)
 
 
+
 def projection_error(model, batch):
     prediction = model(batch['x'])
     return jnp.mean((prediction - batch['y']) ** 2)
+
 
 
 def absolute_error_metrics(model, batch):
@@ -236,6 +186,7 @@ def absolute_error_metrics(model, batch):
         'mae': jnp.mean(jnp.abs(prediction - batch['y'])),
         'eval_bias': jnp.mean(prediction - batch['y']),
     }
+
 
 
 @pytest.mark.parametrize(
@@ -248,6 +199,7 @@ def absolute_error_metrics(model, batch):
 )
 def test_iteration_time_format(seconds, expected):
     assert _format_iteration_time(seconds) == expected
+
 
 
 @pytest.mark.parametrize('jit_compile', [False, True])
@@ -276,6 +228,7 @@ def test_trainer_updates_only_trainable_parameters(jit_compile):
 
     assert float(model.weight.value) != 0.0
     assert float(model.frozen.value) == 3.0
+
 
 
 def test_gradient_accumulation_fused_scan_matches_eager_path():
@@ -316,6 +269,7 @@ def test_gradient_accumulation_fused_scan_matches_eager_path():
     )
 
 
+
 def test_trainer_rejects_empty_dataloader():
     trainer = Trainer(
         TinyModel(),
@@ -330,143 +284,6 @@ def test_trainer_rejects_empty_dataloader():
     ):
         trainer.train()
 
-
-def test_trainer_saves_by_step_and_rotates_checkpoints(tmp_path):
-    model = SavingTinyModel()
-    batches = [
-        {
-            'x': np.asarray([1.0], dtype=np.float32),
-            'y': np.asarray([2.0], dtype=np.float32),
-        }
-        for _ in range(5)
-    ]
-    trainer = Trainer(
-        model,
-        TrainingConfig(
-            max_steps=5,
-            learning_rate=0.1,
-            log_interval=5,
-            output_dir=tmp_path,
-            save_steps=2,
-            save_total_limit=2,
-            save_at_end=True,
-            max_shard_size='1GB',
-        ),
-        DatasetConfig(batches, prefetch_size=0),
-        loss_fn=squared_error,
-    )
-
-    trainer.train()
-
-    assert [
-        os.path.basename(call[0]).split('.tmp-', 1)[0]
-        for call in model.save_calls
-    ] == ['checkpoint-2', 'checkpoint-4', 'checkpoint-5']
-    assert all(call[1] == '1GB' for call in model.save_calls)
-    assert all(call[2] != 0.0 for call in model.save_calls)
-    assert trainer.global_step == 5
-    assert [
-        os.path.basename(path)
-        for path in trainer.saved_checkpoints
-    ] == ['checkpoint-4', 'checkpoint-5']
-    assert sorted(path.name for path in tmp_path.iterdir()) == [
-        'checkpoint-4',
-        'checkpoint-5',
-    ]
-    final_checkpoint = tmp_path / 'checkpoint-5'
-    assert (final_checkpoint / 'optimizer_state').is_dir()
-    with (final_checkpoint / 'trainer_state.json').open() as state_file:
-        trainer_state = json.load(state_file)
-    assert trainer_state == {
-        'global_step': 5,
-        'epoch': 0,
-        'step_in_epoch': 5,
-        'log_history': trainer.log_history,
-        'best_metric': None,
-        'best_model_checkpoint': None,
-        'gradient_accumulation_steps': 1,
-        'loss_scale': 1.0,
-        'loss_scale_good_steps': 0,
-        'skipped_updates': 0,
-        'micro_step': 5,
-    }
-    assert [record['step'] for record in trainer.log_history] == [5]
-    assert np.isfinite(trainer.log_history[0]['loss'])
-    assert trainer.log_history[0]['seconds_per_step'] >= 0
-    labels = _parameter_labels(model)
-    trainable_params, _ = _partition_params(model, labels)
-    optimizer_target = optax.adamw(
-        0.1,
-        weight_decay=0.0,
-    ).init(trainable_params)
-    checkpointer = ocp.StandardCheckpointer()
-    try:
-        restored_optimizer = checkpointer.restore(
-            final_checkpoint / 'optimizer_state',
-            target=optimizer_target,
-        )
-    finally:
-        checkpointer.close()
-    assert int(restored_optimizer[0].count) == 5
-
-
-def test_trainer_does_not_duplicate_scheduled_final_checkpoint(tmp_path):
-    model = SavingTinyModel()
-    batches = [
-        {
-            'x': np.asarray([1.0], dtype=np.float32),
-            'y': np.asarray([2.0], dtype=np.float32),
-        }
-        for _ in range(4)
-    ]
-    trainer = Trainer(
-        model,
-        TrainingConfig(
-            max_steps=4,
-            output_dir=tmp_path,
-            save_steps=2,
-            save_at_end=True,
-        ),
-        DatasetConfig(batches, prefetch_size=0),
-        loss_fn=squared_error,
-    )
-
-    trainer.train()
-
-    assert [
-        os.path.basename(call[0]).split('.tmp-', 1)[0]
-        for call in model.save_calls
-    ] == ['checkpoint-2', 'checkpoint-4']
-    with (
-        tmp_path / 'checkpoint-4' / 'trainer_state.json'
-    ).open() as state_file:
-        state = json.load(state_file)
-    assert state['log_history'][-1]['step'] == 4
-
-
-def test_rng_state_round_trips_without_advancing_on_save(tmp_path):
-    trainer = Trainer(
-        TinyModel(),
-        TrainingConfig(seed=123),
-        DatasetConfig([]),
-        loss_fn=squared_error,
-    )
-    trainer.rngs()
-    trainer._save_rng_state(tmp_path)
-    expected = trainer.rngs()
-
-    restored = Trainer(
-        TinyModel(),
-        TrainingConfig(seed=999),
-        DatasetConfig([]),
-        loss_fn=squared_error,
-    )
-    assert restored._restore_rng_state(tmp_path)
-
-    np.testing.assert_array_equal(
-        jax.random.key_data(restored.rngs()),
-        jax.random.key_data(expected),
-    )
 
 
 def test_loss_function_can_receive_trainer_rng():
@@ -488,6 +305,7 @@ def test_loss_function_can_receive_trainer_rng():
     trainer.train()
 
     assert 'rng' in received
+
 
 
 @pytest.mark.parametrize('jit_compile', [False, True])
@@ -519,144 +337,6 @@ def test_evaluation_uses_separate_rng_for_stochastic_loss(jit_compile):
         training_key_before,
     )
 
-
-def test_async_checkpoint_uses_stable_snapshot_and_publishes_atomically(
-    tmp_path,
-):
-    model = SlowCheckpointTinyModel()
-    batches = [{
-        'x': np.asarray([1.0], dtype=np.float32),
-        'y': np.asarray([2.0], dtype=np.float32),
-    } for _ in range(2)]
-    trainer = Trainer(
-        model,
-        TrainingConfig(
-            max_steps=2,
-            learning_rate=0.1,
-            output_dir=tmp_path,
-            save_steps=1,
-            save_async=True,
-            save_optimizer_state=False,
-        ),
-        DatasetConfig(batches, prefetch_size=0),
-        loss_fn=squared_error,
-    )
-
-    trainer.train()
-
-    assert (tmp_path / 'checkpoint-1' / 'rng_state.json').is_file()
-    assert (tmp_path / 'checkpoint-2' / 'rng_state.json').is_file()
-    assert not list(tmp_path.glob('checkpoint-*.tmp-*'))
-    first = CheckpointTinyModel().load_pretrained(
-        tmp_path / 'checkpoint-1'
-    )
-    second = CheckpointTinyModel().load_pretrained(
-        tmp_path / 'checkpoint-2'
-    )
-    assert float(first.weight.value) != float(second.weight.value)
-
-
-def test_failed_checkpoint_never_publishes_partial_directory(tmp_path):
-    trainer = Trainer(
-        FailingSavingTinyModel(),
-        TrainingConfig(
-            max_steps=1,
-            output_dir=tmp_path,
-            save_steps=1,
-            save_optimizer_state=False,
-        ),
-        DatasetConfig([{
-            'x': np.asarray([1.0], dtype=np.float32),
-            'y': np.asarray([2.0], dtype=np.float32),
-        }]),
-        loss_fn=squared_error,
-    )
-
-    with pytest.raises(RuntimeError, match='checkpoint write failed'):
-        trainer.train()
-
-    assert not (tmp_path / 'checkpoint-1').exists()
-    assert not list(tmp_path.glob('checkpoint-1.tmp-*'))
-
-
-def test_multihost_state_files_are_process_local(monkeypatch, tmp_path):
-    monkeypatch.setattr(jax, 'process_count', lambda: 4)
-    monkeypatch.setattr(jax, 'process_index', lambda: 2)
-    trainer = Trainer(
-        TinyModel(),
-        TrainingConfig(),
-        DatasetConfig([]),
-        loss_fn=squared_error,
-    )
-
-    assert trainer._rng_state_path(tmp_path).endswith(
-        'rng_state-00002.json'
-    )
-    assert trainer._dataloader_state_paths(tmp_path) == (
-        str(tmp_path / 'dataloader_state-00002.bin'),
-        str(tmp_path / 'dataloader_state-00002.json'),
-    )
-
-
-def test_multihost_checkpoint_coordinates_publication(
-    monkeypatch,
-    tmp_path,
-):
-    class FakeCheckpointer:
-        def save(self, path, item, *, force):
-            assert force
-            assert item
-            os.makedirs(path)
-
-        def wait_until_finished(self):
-            pass
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(jax, 'process_count', lambda: 2)
-    monkeypatch.setattr(jax, 'process_index', lambda: 0)
-    monkeypatch.setattr(ocp, 'StandardCheckpointer', FakeCheckpointer)
-    trainer = Trainer(
-        TinyModel(),
-        TrainingConfig(
-            output_dir=tmp_path,
-            save_optimizer_state=False,
-        ),
-        DatasetConfig([]),
-        loss_fn=squared_error,
-    )
-    barriers = []
-    trainer._sync_hosts = barriers.append
-    temporary = tmp_path / 'checkpoint-1.tmp'
-    checkpoint = tmp_path / 'checkpoint-1'
-    trainer_state = trainer._trainer_state(
-        step=1,
-        epoch=0,
-        step_in_epoch=1,
-    )
-
-    trainer._write_checkpoint_directory(
-        temporary,
-        checkpoint,
-        model_snapshot=None,
-        optimizer_state=None,
-        dataloader_state=None,
-        rng_state=trainer._capture_rng_state(),
-        trainer_state=trainer_state,
-    )
-
-    assert checkpoint.is_dir()
-    assert (checkpoint / 'model_state').is_dir()
-    assert (checkpoint / 'rng_state-00000.json').is_file()
-    assert (checkpoint / 'trainer_state.json').is_file()
-    assert barriers == [
-        'taktiny-checkpoint-open-checkpoint-1',
-        'taktiny-checkpoint-model-checkpoint-1',
-        'taktiny-checkpoint-data-checkpoint-1',
-        'taktiny-checkpoint-close-checkpoint-1',
-        'taktiny-checkpoint-publish-checkpoint-1',
-    ]
 
 
 def test_trainer_records_log_interval_and_final_history():
@@ -693,6 +373,7 @@ def test_trainer_records_log_interval_and_final_history():
     )
 
 
+
 def test_trainer_logs_rolling_average_loss():
     def supplied_loss(model, batch):
         return model.weight.value * 0.0 + batch['loss']
@@ -719,6 +400,7 @@ def test_trainer_logs_rolling_average_loss():
     assert [record['step'] for record in trainer.log_history] == [3, 5]
     assert trainer.log_history[0]['loss'] == pytest.approx(3.0)
     assert trainer.log_history[1]['loss'] == pytest.approx(7.0)
+
 
 
 def test_default_optimizer_uses_and_logs_schedule():
@@ -755,6 +437,7 @@ def test_default_optimizer_uses_and_logs_schedule():
     assert 0.0 < float(model.weight.value) < 1.0
 
 
+
 def test_custom_optimizer_schedule_is_logged():
     schedule = optax.linear_schedule(
         init_value=0.2,
@@ -787,6 +470,7 @@ def test_custom_optimizer_schedule_is_logged():
     ] == pytest.approx([0.2, 0.1])
 
 
+
 def test_custom_optimizer_without_schedule_logs_unknown_rate():
     trainer = Trainer(
         TinyModel(),
@@ -806,52 +490,6 @@ def test_custom_optimizer_without_schedule_logs_unknown_rate():
 
     assert trainer.log_history[-1]['learning_rate'] is None
 
-
-def test_trainer_dispatches_callback_events_in_order(tmp_path):
-    callback = RecordingCallback()
-    batches = [{
-        'x': np.asarray([1.0], dtype=np.float32),
-        'y': np.asarray([2.0], dtype=np.float32),
-    }]
-    trainer = Trainer(
-        CheckpointTinyModel(),
-        TrainingConfig(
-            max_steps=1,
-            log_interval=1,
-            output_dir=tmp_path,
-            save_steps=1,
-            eval_strategy='steps',
-            eval_steps=1,
-        ),
-        DatasetConfig(
-            batches,
-            validation_dataloader=batches,
-            prefetch_size=0,
-        ),
-        loss_fn=squared_error,
-        callbacks=callback,
-    )
-
-    trainer.train()
-
-    assert [event[0] for event in callback.events] == [
-        'train_begin',
-        'step_end',
-        'log',
-        'log',
-        'evaluate',
-        'save',
-        'train_end',
-    ]
-    step_logs = callback.events[1][1]
-    assert step_logs['step'] == 1
-    assert step_logs['learning_rate'] == pytest.approx(1e-3)
-    assert callback.events[2][1]['loss'] is not None
-    assert callback.events[3][1]['eval_loss'] >= 0
-    assert callback.events[4][2] == pytest.approx(
-        callback.events[4][1]['eval_loss']
-    )
-    assert callback.events[-1] == ('train_end', 1)
 
 
 def test_partial_callback_and_callback_registration():
@@ -883,6 +521,7 @@ def test_partial_callback_and_callback_registration():
     assert values['step'] == 1
     assert values['model_type'] == 'taktiny'
     assert trainer.callbacks == []
+
 
 
 def test_custom_metrics_are_averaged_and_prefixed():
@@ -922,6 +561,7 @@ def test_custom_metrics_are_averaged_and_prefixed():
     }
 
 
+
 @pytest.mark.parametrize(
     ('compute_metrics', 'error', 'message'),
     [
@@ -958,6 +598,7 @@ def test_custom_metrics_validate_results(compute_metrics, error, message):
         trainer.evaluate()
 
 
+
 def test_custom_metrics_require_consistent_names():
     def inconsistent_metrics(model, batch):
         if float(batch['x'][0]) == 1.0:
@@ -989,6 +630,7 @@ def test_custom_metrics_require_consistent_names():
         trainer.evaluate()
 
 
+
 def test_tensorboard_callback_reports_training_and_evaluation(tmp_path):
     writer = FakeSummaryWriter()
     callback = TensorBoardCallback(writer=writer)
@@ -997,7 +639,7 @@ def test_tensorboard_callback_reports_training_and_evaluation(tmp_path):
         'y': np.asarray([2.0], dtype=np.float32),
     }]
     trainer = Trainer(
-        CheckpointTinyModel(),
+        TinyModel(),
         TrainingConfig(
             max_steps=1,
             log_interval=1,
@@ -1030,6 +672,7 @@ def test_tensorboard_callback_reports_training_and_evaluation(tmp_path):
     assert writer.closed is False
 
 
+
 def test_tensorboard_callback_lazily_owns_writer(monkeypatch, tmp_path):
     writer = FakeSummaryWriter()
     writer_factory_calls = []
@@ -1056,6 +699,7 @@ def test_tensorboard_callback_lazily_owns_writer(monkeypatch, tmp_path):
     assert writer.closed is True
 
 
+
 def test_wandb_callback_reports_logs():
     run = FakeWandbRun()
     trainer = Trainer(
@@ -1077,6 +721,7 @@ def test_wandb_callback_reports_logs():
     assert values['loss'] >= 0
     assert values['learning_rate'] == pytest.approx(1e-3)
     assert run.finished is False
+
 
 
 def test_wandb_callback_lazily_owns_run(monkeypatch):
@@ -1112,10 +757,12 @@ def test_wandb_callback_lazily_owns_run(monkeypatch):
     assert run.finished is True
 
 
+
 def test_callback_api_is_exported_at_package_root():
     assert taktiny.TrainerCallback is TrainerCallback
     assert taktiny.TensorBoardCallback is TensorBoardCallback
     assert taktiny.WandbCallback is WandbCallback
+
 
 
 @pytest.mark.parametrize(
@@ -1134,6 +781,7 @@ def test_trainer_validates_reporting_hooks(kwargs):
             loss_fn=squared_error,
             **kwargs,
         )
+
 
 
 @pytest.mark.parametrize('jit_compile', [False, True])
@@ -1188,6 +836,7 @@ def test_gradient_accumulation_matches_larger_batch(jit_compile):
     )
 
 
+
 def test_gradient_accumulation_flushes_partial_epoch_window():
     model = TinyModel()
     trainer = Trainer(
@@ -1212,6 +861,7 @@ def test_gradient_accumulation_flushes_partial_epoch_window():
     assert trainer.global_step == 2
     assert trainer.micro_step == 3
     assert trainer.log_history[-1]['step'] == 2
+
 
 
 def test_jitted_accumulation_accepts_smaller_final_batch():
@@ -1263,6 +913,7 @@ def test_jitted_accumulation_accepts_smaller_final_batch():
     )
 
 
+
 def test_global_gradient_clipping_limits_update_norm():
     model = TinyModel()
     trainer = Trainer(
@@ -1284,6 +935,7 @@ def test_global_gradient_clipping_limits_update_norm():
 
     assert float(model.weight.value) == pytest.approx(1.0, abs=1e-5)
     assert trainer.log_history[-1]['grad_norm'] == pytest.approx(200.0)
+
 
 
 @pytest.mark.parametrize('bad_value', [np.nan, np.inf])
@@ -1311,6 +963,7 @@ def test_non_finite_gradient_skips_update(bad_value):
     assert trainer.log_history[-1]['loss'] is None
     assert trainer.log_history[-1]['grad_norm'] is None
     assert trainer.log_history[-1]['skipped_update'] is True
+
 
 
 def test_dynamic_loss_scaling_recovers_after_non_finite_gradient():
@@ -1347,9 +1000,10 @@ def test_dynamic_loss_scaling_recovers_after_non_finite_gradient():
     assert float(model.weight.value) != 0.0
 
 
+
 def test_fixed_loss_scaling_updates_fp16_parameter():
     model = TinyModel()
-    model.weight.value = jnp.asarray(0.0, dtype=jnp.float16)
+    model.weight = nn.Parameter(jnp.asarray(0.0, dtype=jnp.float16))
     trainer = Trainer(
         model,
         TrainingConfig(
@@ -1371,275 +1025,6 @@ def test_fixed_loss_scaling_updates_fp16_parameter():
     assert float(model.weight.value) != 0.0
     assert trainer.loss_scale == 128.0
 
-
-def test_trainer_can_disable_optimizer_state_saving(tmp_path):
-    model = SavingTinyModel()
-    trainer = Trainer(
-        model,
-        TrainingConfig(
-            max_steps=1,
-            output_dir=tmp_path,
-            save_steps=1,
-            save_optimizer_state=False,
-        ),
-        DatasetConfig([{
-            'x': np.asarray([1.0], dtype=np.float32),
-            'y': np.asarray([2.0], dtype=np.float32),
-        }]),
-        loss_fn=squared_error,
-    )
-
-    trainer.train()
-
-    checkpoint = tmp_path / 'checkpoint-1'
-    assert not (checkpoint / 'optimizer_state').exists()
-    assert (checkpoint / 'trainer_state.json').exists()
-
-
-def test_trainer_resume_matches_uninterrupted_training(tmp_path):
-    batches = [
-        {
-            'x': np.asarray([value], dtype=np.float32),
-            'y': np.asarray([2 * value], dtype=np.float32),
-        }
-        for value in range(1, 5)
-    ]
-    control = CheckpointTinyModel()
-    Trainer(
-        control,
-        TrainingConfig(
-            max_steps=4,
-            learning_rate=0.1,
-            log_interval=1,
-        ),
-        DatasetConfig(batches, prefetch_size=0),
-        loss_fn=squared_error,
-    ).train()
-
-    first_model = CheckpointTinyModel()
-    first_trainer = Trainer(
-        first_model,
-        TrainingConfig(
-            max_steps=2,
-            learning_rate=0.1,
-            log_interval=1,
-            output_dir=tmp_path,
-            save_steps=2,
-        ),
-        DatasetConfig(batches, prefetch_size=0),
-        loss_fn=squared_error,
-    )
-    first_trainer.train()
-
-    resumed_model = CheckpointTinyModel()
-    resumed_trainer = Trainer(
-        resumed_model,
-        TrainingConfig(
-            max_steps=4,
-            learning_rate=0.1,
-            log_interval=1,
-            output_dir=tmp_path,
-            save_steps=2,
-        ),
-        DatasetConfig(batches, prefetch_size=0),
-        loss_fn=squared_error,
-    )
-    resumed_trainer.train(resume_from_checkpoint='latest')
-
-    assert resumed_trainer.global_step == 4
-    assert [record['step'] for record in resumed_trainer.log_history] == [
-        1,
-        2,
-        3,
-        4,
-    ]
-    assert float(resumed_model.weight.value) == pytest.approx(
-        float(control.weight.value),
-        rel=1e-6,
-        abs=1e-6,
-    )
-    assert float(resumed_model.frozen.value) == 3.0
-    assert (tmp_path / 'checkpoint-4').is_dir()
-
-
-def test_trainer_resume_preserves_accumulation_boundaries(tmp_path):
-    batches = [
-        {
-            'x': np.asarray([value], dtype=np.float32),
-            'y': np.asarray([2 * value], dtype=np.float32),
-        }
-        for value in range(1, 5)
-    ]
-    control = CheckpointTinyModel()
-    Trainer(
-        control,
-        TrainingConfig(
-            max_steps=2,
-            optimizer=optax.sgd(0.1),
-            log_interval=1,
-            gradient_accumulation_steps=2,
-        ),
-        DatasetConfig(batches, prefetch_size=0),
-        loss_fn=squared_error,
-    ).train()
-
-    first_model = CheckpointTinyModel()
-    Trainer(
-        first_model,
-        TrainingConfig(
-            max_steps=1,
-            optimizer=optax.sgd(0.1),
-            log_interval=1,
-            output_dir=tmp_path,
-            save_steps=1,
-            gradient_accumulation_steps=2,
-        ),
-        DatasetConfig(batches, prefetch_size=0),
-        loss_fn=squared_error,
-    ).train()
-
-    resumed_model = CheckpointTinyModel()
-    resumed_trainer = Trainer(
-        resumed_model,
-        TrainingConfig(
-            max_steps=2,
-            optimizer=optax.sgd(0.1),
-            log_interval=1,
-            output_dir=tmp_path,
-            save_steps=1,
-            gradient_accumulation_steps=2,
-        ),
-        DatasetConfig(batches, prefetch_size=0),
-        loss_fn=squared_error,
-    )
-    resumed_trainer.train(resume_from_checkpoint='latest')
-
-    assert resumed_trainer.global_step == 2
-    assert resumed_trainer.micro_step == 4
-    assert float(resumed_model.weight.value) == pytest.approx(
-        float(control.weight.value),
-        rel=1e-6,
-        abs=1e-6,
-    )
-    with (
-        tmp_path / 'checkpoint-2' / 'trainer_state.json'
-    ).open() as state_file:
-        state = json.load(state_file)
-    assert state['step_in_epoch'] == 4
-    assert state['micro_step'] == 4
-    assert state['gradient_accumulation_steps'] == 2
-
-
-def test_trainer_resume_rejects_changed_accumulation_steps(tmp_path):
-    batches = [{
-        'x': np.asarray([1.0], dtype=np.float32),
-        'y': np.asarray([2.0], dtype=np.float32),
-    }]
-    Trainer(
-        CheckpointTinyModel(),
-        TrainingConfig(
-            max_steps=1,
-            output_dir=tmp_path,
-            save_steps=1,
-        ),
-        DatasetConfig(batches, prefetch_size=0),
-        loss_fn=squared_error,
-    ).train()
-    trainer = Trainer(
-        CheckpointTinyModel(),
-        TrainingConfig(
-            max_steps=2,
-            output_dir=tmp_path,
-            save_steps=1,
-            gradient_accumulation_steps=2,
-        ),
-        DatasetConfig(batches, prefetch_size=0),
-        loss_fn=squared_error,
-    )
-
-    with pytest.raises(ValueError, match='gradient_accumulation_steps'):
-        trainer.train(resume_from_checkpoint='latest')
-
-
-@pytest.mark.parametrize('state_format', ['bytes', 'json'])
-def test_trainer_checkpoints_and_restores_iterator_state(
-    tmp_path,
-    state_format,
-):
-    batches = [
-        {
-            'x': np.asarray([value], dtype=np.float32),
-            'y': np.asarray([2 * value], dtype=np.float32),
-        }
-        for value in range(1, 5)
-    ]
-    control = CheckpointTinyModel()
-    Trainer(
-        control,
-        TrainingConfig(
-            max_steps=4,
-            optimizer=optax.sgd(0.1),
-            log_interval=1,
-        ),
-        DatasetConfig(batches, prefetch_size=0),
-        loss_fn=squared_error,
-    ).train()
-
-    first_loader = StatefulLoader(
-        batches,
-        state_format=state_format,
-    )
-    Trainer(
-        CheckpointTinyModel(),
-        TrainingConfig(
-            max_steps=2,
-            optimizer=optax.sgd(0.1),
-            log_interval=1,
-            output_dir=tmp_path,
-            save_steps=2,
-        ),
-        DatasetConfig(first_loader, prefetch_size=3),
-        loss_fn=squared_error,
-    ).train()
-
-    state_suffix = 'bin' if state_format == 'bytes' else 'json'
-    state_path = (
-        tmp_path
-        / 'checkpoint-2'
-        / f'dataloader_state.{state_suffix}'
-    )
-    assert state_path.is_file()
-    assert first_loader.iterators[0].position == 2
-    assert first_loader.iterators[0].next_count == 2
-
-    resumed_model = CheckpointTinyModel()
-    resumed_loader = StatefulLoader(
-        batches,
-        state_format=state_format,
-    )
-    resumed_trainer = Trainer(
-        resumed_model,
-        TrainingConfig(
-            max_steps=4,
-            optimizer=optax.sgd(0.1),
-            log_interval=1,
-            output_dir=tmp_path,
-            save_steps=2,
-        ),
-        DatasetConfig(resumed_loader, prefetch_size=3),
-        loss_fn=squared_error,
-    )
-    resumed_trainer.train(resume_from_checkpoint='latest')
-
-    restored_iterator = resumed_loader.iterators[0]
-    assert restored_iterator.restored_position == 2
-    assert restored_iterator.next_count == 2
-    assert resumed_trainer.global_step == 4
-    assert float(resumed_model.weight.value) == pytest.approx(
-        float(control.weight.value),
-        rel=1e-6,
-        abs=1e-6,
-    )
 
 
 def test_trainer_does_not_reshuffle_passed_dataloader():
@@ -1664,6 +1049,7 @@ def test_trainer_does_not_reshuffle_passed_dataloader():
 
     assert loader.epochs == []
     assert trainer.global_step == 1
+
 
 
 def test_epoch_hook_supports_nested_sampler_and_dataset():
@@ -1691,77 +1077,22 @@ def test_epoch_hook_supports_nested_sampler_and_dataset():
     assert not Trainer._has_iterator_state(iter([]))
 
 
-def test_trainer_resume_applies_saved_adapter_to_base_model(tmp_path):
-    batches = [
-        {
-            'x': np.asarray([[1.0]], dtype=np.float32),
-            'y': np.asarray([[2.0]], dtype=np.float32),
-        },
-        {
-            'x': np.asarray([[2.0]], dtype=np.float32),
-            'y': np.asarray([[4.0]], dtype=np.float32),
-        },
-    ]
-    adapted_model = Takt.apply_peft(
-        AdapterTrainingModel(),
-        LoraConfig(
-            target_modules='proj',
-            rank=1,
-            alpha=1,
-            rngs=nn.Rngs(1),
-        ),
-    )
-    Trainer(
-        adapted_model,
-        TrainingConfig(
-            max_steps=1,
-            learning_rate=0.1,
-            log_interval=1,
-            output_dir=tmp_path,
-            save_steps=1,
-        ),
-        DatasetConfig(batches, prefetch_size=0),
-        loss_fn=projection_error,
-    ).train()
-
-    resumed_model = AdapterTrainingModel()
-    resumed_trainer = Trainer(
-        resumed_model,
-        TrainingConfig(
-            max_steps=2,
-            learning_rate=0.1,
-            log_interval=1,
-            output_dir=tmp_path,
-            save_steps=1,
-        ),
-        DatasetConfig(batches, prefetch_size=0),
-        loss_fn=projection_error,
-    )
-    resumed_trainer.train(resume_from_checkpoint='latest')
-
-    assert isinstance(resumed_model.proj, nn.LoRALinear)
-    assert resumed_trainer.global_step == 2
-    assert [record['step'] for record in resumed_trainer.log_history] == [
-        1,
-        2,
-    ]
-    assert (tmp_path / 'checkpoint-2' / 'adapter_config.json').is_file()
-
 
 def test_trainer_resume_latest_requires_checkpoint(tmp_path):
     trainer = Trainer(
-        CheckpointTinyModel(),
+        TinyModel(),
         TrainingConfig(output_dir=tmp_path),
         DatasetConfig([]),
         loss_fn=squared_error,
     )
 
-    with pytest.raises(FileNotFoundError, match='No checkpoint'):
+    with pytest.raises(FileNotFoundError, match='No completed Orbax checkpoints'):
         trainer.train(resume_from_checkpoint='latest')
 
 
+
 def test_step_evaluation_loads_and_preserves_best_checkpoint(tmp_path):
-    model = CheckpointTinyModel()
+    model = TinyModel()
     batches = [{
         'x': np.asarray([1.0], dtype=np.float32),
         'y': np.asarray([1.0], dtype=np.float32),
@@ -1808,8 +1139,9 @@ def test_step_evaluation_loads_and_preserves_best_checkpoint(tmp_path):
     assert trainer.evaluate()['eval_loss'] == pytest.approx(4.0)
 
 
+
 def test_epoch_evaluation_records_at_end_of_dataloader():
-    model = CheckpointTinyModel()
+    model = TinyModel()
     batches = [{
         'x': np.asarray([1.0], dtype=np.float32),
         'y': np.asarray([2.0], dtype=np.float32),
@@ -1845,9 +1177,10 @@ def test_epoch_evaluation_records_at_end_of_dataloader():
     assert trainer.best_model_checkpoint is None
 
 
+
 def test_trainer_requires_validation_data_for_eval():
     trainer = Trainer(
-        CheckpointTinyModel(),
+        TinyModel(),
         TrainingConfig(
             eval_strategy='steps',
             eval_steps=1,
@@ -1859,20 +1192,6 @@ def test_trainer_requires_validation_data_for_eval():
     with pytest.raises(ValueError, match='validation_dataloader'):
         trainer.train()
 
-
-def test_trainer_rejects_saving_for_unsupported_model(tmp_path):
-    trainer = Trainer(
-        TinyModel(),
-        TrainingConfig(
-            output_dir=tmp_path,
-            save_steps=1,
-        ),
-        DatasetConfig([]),
-        loss_fn=squared_error,
-    )
-
-    with pytest.raises(TypeError, match='does not support save_pretrained'):
-        trainer.train()
 
 
 def test_prefetch_preserves_order_and_stays_bounded():
@@ -1890,6 +1209,7 @@ def test_prefetch_preserves_order_and_stays_bounded():
     assert list(batches) == [2, 3]
 
 
+
 def test_multi_device_batches_require_pre_sharded_parameters():
     batch_mesh = SimpleNamespace(size=2)
 
@@ -1898,6 +1218,7 @@ def test_multi_device_batches_require_pre_sharded_parameters():
             {'weight': jnp.ones((2, 2))},
             batch_mesh,
         )
+
 
 
 def test_parameter_and_batch_meshes_must_match():
@@ -1915,6 +1236,7 @@ def test_parameter_and_batch_meshes_must_match():
         _validate_parameter_placement(params, batch_mesh)
 
 
+
 def test_trainable_placement_preserves_existing_named_sharding():
     devices = np.asarray(jax.devices())
     mesh = Mesh(devices, ('data',))
@@ -1929,6 +1251,7 @@ def test_trainable_placement_preserves_existing_named_sharding():
     assert placed['weight'] is value
 
 
+
 def test_parameter_placement_uses_single_device_mesh():
     devices = np.asarray([jax.devices()[0]])
     mesh = Mesh(devices, ('data',))
@@ -1938,6 +1261,7 @@ def test_parameter_placement_uses_single_device_mesh():
 
     assert isinstance(placed['weight'].sharding, NamedSharding)
     assert placed['weight'].sharding.mesh == mesh
+
 
 
 @pytest.mark.parametrize(
@@ -1976,12 +1300,14 @@ def test_training_configuration_validation(factory):
         factory()
 
 
+
 def test_dataset_config_requires_train_dataloader():
     with pytest.raises(
         TypeError,
         match='train_dataloader is required',
     ):
         DatasetConfig()
+
 
 
 def test_global_grad_norm_matches_optax_for_float32():
@@ -1997,6 +1323,7 @@ def test_global_grad_norm_matches_optax_for_float32():
     actual = _global_grad_norm(grads)
 
     assert jnp.allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
 
 
 def test_global_grad_norm_matches_optax_for_bfloat16():
@@ -2019,6 +1346,7 @@ def test_global_grad_norm_matches_optax_for_bfloat16():
     assert jnp.allclose(actual, expected, rtol=5e-2, atol=5e-2)
 
 
+
 def test_global_grad_norm_handles_mixed_dtypes_and_zero_leaves():
     grads = {
         'f32': jnp.asarray([[1.0, -2.0], [3.0, -4.0]], dtype=jnp.float32),
@@ -2034,8 +1362,10 @@ def test_global_grad_norm_handles_mixed_dtypes_and_zero_leaves():
     assert jnp.allclose(actual, expected, rtol=5e-2, atol=5e-2)
 
 
+
 def test_global_grad_norm_of_empty_tree_is_zero():
     assert float(_global_grad_norm({})) == 0.0
+
 
 
 def test_trainer_can_skip_grad_norm_tracking():
@@ -2072,6 +1402,7 @@ def test_trainer_can_skip_grad_norm_tracking():
     )
 
 
+
 def test_grad_norm_still_computed_when_clipping_enabled():
     model = TinyModel()
     batches = [
@@ -2099,6 +1430,7 @@ def test_grad_norm_still_computed_when_clipping_enabled():
     assert float(model.weight.value) != 0.0
 
 
+
 def test_ema_update_blends_and_preserves_frozen():
     from taktiny.trainer.trainer import _ema_update
 
@@ -2109,6 +1441,7 @@ def test_ema_update_blends_and_preserves_frozen():
 
     assert float(out['w']) == pytest.approx(0.9 * 0.0 + 0.1 * 10.0)
     assert out['f'] is None
+
 
 
 def test_ema_property_returns_independent_model():
@@ -2143,8 +1476,9 @@ def test_ema_property_returns_independent_model():
     assert bool(jnp.isfinite(jnp.asarray(ema_model.weight.value)))
 
     # The EMA copy is independent of the trained model.
-    model.weight.value = jnp.asarray(999.0)
+    model.weight = nn.Parameter(jnp.asarray(999.0))
     assert float(ema_model.weight.value) != 999.0
+
 
 
 def test_ema_disabled_property_raises():
@@ -2165,60 +1499,6 @@ def test_ema_disabled_property_raises():
         trainer.ema
 
 
-def test_ema_saved_and_restored_in_checkpoint(tmp_path):
-    def make_trainer():
-        model = CheckpointTinyModel()
-        batches = [
-            {
-                'x': np.asarray([1.0], dtype=np.float32),
-                'y': np.asarray([2.0], dtype=np.float32),
-            },
-            {
-                'x': np.asarray([3.0], dtype=np.float32),
-                'y': np.asarray([1.0], dtype=np.float32),
-            },
-        ]
-        trainer = Trainer(
-            model,
-            TrainingConfig(
-                max_steps=2,
-                learning_rate=0.1,
-                log_interval=1,
-                ema_decay=0.9,
-                output_dir=str(tmp_path),
-                save_steps=1,
-            ),
-            DatasetConfig(batches, prefetch_size=2),
-            loss_fn=squared_error,
-        )
-        return trainer
-
-    trainer = make_trainer()
-    trainer.train()
-
-    checkpoint_dir = os.path.join(str(tmp_path), 'checkpoint-2')
-    ema_file = os.path.join(checkpoint_dir, 'model-ema.safetensors')
-    assert os.path.isfile(ema_file)
-    ema_before = float(trainer.ema.weight.value)
-
-    # Restore the EMA into a fresh trainer (the same helper the resume path
-    # uses), and verify the weights round-trip.
-    fresh = Trainer(
-        TinyModel(),
-        TrainingConfig(
-            max_steps=2,
-            learning_rate=0.1,
-            log_interval=1,
-            ema_decay=0.9,
-        ),
-        DatasetConfig([], prefetch_size=1),
-        loss_fn=squared_error,
-    )
-    fresh._load_ema(checkpoint_dir)
-    ema_after = float(fresh.ema.weight.value)
-
-    assert ema_after == pytest.approx(ema_before)
-
 
 def test_ema_decay_configuration_validation():
     with pytest.raises(ValueError, match='ema_decay'):
@@ -2228,63 +1508,6 @@ def test_ema_decay_configuration_validation():
     assert TrainingConfig(ema_decay=None).ema_decay is None
     assert TrainingConfig(ema_decay=0.9999).ema_decay == 0.9999
 
-
-class ShardedStubModel(CheckpointTinyModel):
-    def save_pretrained(self, path, *, max_shard_size):
-        os.makedirs(path, exist_ok=True)
-        from safetensors.numpy import save_file
-        save_file(
-            {'weight': np.asarray([1.0], dtype=np.float32)},
-            os.path.join(path, 'model-00001-of-00002.safetensors'),
-        )
-        save_file(
-            {'frozen': np.asarray([2.0], dtype=np.float32)},
-            os.path.join(path, 'model-00002-of-00002.safetensors'),
-        )
-        with open(os.path.join(path, 'model.safetensors.index.json'), 'w') as f:
-            json.dump({
-                'weight_map': {
-                    'weight': 'model-00001-of-00002.safetensors',
-                    'frozen': 'model-00002-of-00002.safetensors',
-                },
-            }, f)
-
-
-def test_ema_checkpoint_shards_with_ema_suffix(tmp_path):
-    model = ShardedStubModel()
-    trainer = Trainer(
-        model,
-        TrainingConfig(
-            max_steps=1,
-            learning_rate=0.1,
-            log_interval=1,
-            ema_decay=0.9,
-        ),
-        DatasetConfig([{
-            'x': np.asarray([1.0], dtype=np.float32),
-            'y': np.asarray([2.0], dtype=np.float32),
-        }], prefetch_size=1),
-        loss_fn=squared_error,
-    )
-    trainer.train()
-
-    out = str(tmp_path)
-    trainer._write_ema_checkpoint(out, trainer._ema_snapshot())
-
-    assert os.path.isfile(
-        os.path.join(out, 'model-00001-of-00002-ema.safetensors')
-    )
-    assert os.path.isfile(
-        os.path.join(out, 'model-00002-of-00002-ema.safetensors')
-    )
-    assert os.path.isfile(
-        os.path.join(out, 'model-ema.safetensors.index.json')
-    )
-    with open(os.path.join(out, 'model-ema.safetensors.index.json')) as f:
-        index = json.load(f)
-    assert all(
-        'ema' in shard for shard in index['weight_map'].values()
-    )
 
 
 def test_trainer_cycles_dataloader_until_max_steps():

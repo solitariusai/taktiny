@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import jax.numpy as jnp
 import qwix
 
@@ -43,17 +41,13 @@ def test_explicit_rule_can_quantize_embedding():
 
 
 def test_grouped_shortcut_falls_back_for_small_linear_axis():
-    parameter = SimpleNamespace(
-        dtype=jnp.bfloat16,
-        input_axis_count=1,
-        quantization_batch_axis_count=0,
-    )
     rule, = quantization_rules('int4')
 
     quantized = quantize_linear_weight(
         jnp.arange(12, dtype=jnp.bfloat16).reshape(4, 3),
-        parameter,
         rule,
+        input_axis_count=1,
+        batch_axis_count=0,
     )
 
     assert isinstance(quantized, qwix.QArray)
