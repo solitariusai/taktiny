@@ -22,7 +22,7 @@ from typing import Any
 import jax.numpy as jnp
 
 from taktiny.nn.base import Module, Parameter
-from taktiny.nn.modules.linear import default_linear_initializer
+from taktiny.nn.modules.linear import default_kernel_initializer
 from taktiny.nn.modules.peft import VeRALinear
 from taktiny.nn.rng import Rngs
 from taktiny.takt.adapter.base import AdapterBase
@@ -42,7 +42,7 @@ class VeRAAdapter(AdapterBase):
         dtype: DType | None = None,
         d_initial: float = 0.1,
         rngs: Rngs,
-        initializer: Initializer = default_linear_initializer,
+        initializer: Initializer = default_kernel_initializer,
         vera_A: Parameter | None = None,
         vera_B: Parameter | None = None,
         **kwargs: Any,

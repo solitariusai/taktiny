@@ -13,8 +13,7 @@
 # limitations under the License.
 """Transformations for existing model instances."""
 
-from .prelude import Takt
-from .peft import (
+from taktiny.takt.adapter import (
     AdaLoRAAdapter,
     BaseAdapter,
     DoRAAdapter,
@@ -23,6 +22,7 @@ from .peft import (
     LoRAAdapter,
     VeRAAdapter,
 )
+from taktiny.takt.base import Takt
 
 __all__ = [
     'AdaLoRAAdapter',

@@ -15,12 +15,10 @@
 
 from __future__ import annotations
 
-from typing import Any, TypeVar
+from typing import Any
 
 from taktiny.nn.base import Module, iter_children
 from taktiny.takt.adapter.base import AdapterBase
-
-M = TypeVar('M', bound=Module)
 
 
 def _replace_child(parent: Module, name: str, child: Module) -> None:
@@ -50,7 +48,7 @@ def _replace_child(parent: Module, name: str, child: Module) -> None:
     setattr(parent, name, child)
 
 
-class Takt:
+class Takt[M]:
     """Apply adapter objects to existing Taktiny models."""
 
     @classmethod
@@ -119,7 +117,7 @@ class Takt:
         return model
 
     @classmethod
-    def update_adapters(cls, model: Module, **kwargs: Any) -> tuple[Any, ...]:
+    def update_adapters(cls, model: M, **kwargs: Any) -> tuple[Any, ...]:
         """Run each applied adapter's optional post-step update hook.
 
         This is independent of any trainer. A trainer may call this method

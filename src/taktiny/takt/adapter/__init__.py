@@ -13,16 +13,18 @@
 # limitations under the License.
 """Parameter-efficient fine-tuning adapters."""
 
-from .adapter import BaseAdapter
-from .adalora import AdaLoRAAdapter
-from .dora import DoRAAdapter
-from .lora import LoRAAdapter
-from .loha import LoHaAdapter
-from .lokr import LoKrAdapter
-from .vera import VeRAAdapter
+from taktiny.takt.adapter.adalora import AdaLoRAAdapter
+from taktiny.takt.adapter.base import AdapterBase
+from taktiny.takt.adapter.base import AdapterBase as BaseAdapter
+from taktiny.takt.adapter.dora import DoRAAdapter
+from taktiny.takt.adapter.loha import LoHaAdapter
+from taktiny.takt.adapter.lokr import LoKrAdapter
+from taktiny.takt.adapter.lora import LoRAAdapter
+from taktiny.takt.adapter.vera import VeRAAdapter
 
 __all__ = [
     'AdaLoRAAdapter',
+    'AdapterBase',
     'BaseAdapter',
     'DoRAAdapter',
     'LoHaAdapter',
