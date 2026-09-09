@@ -13,15 +13,10 @@
 # limitations under the License.
 """Base modules for implementing a deep neural network model"""
 
-from .module import *
-from .rng import *
-from .block import *
-from .convolution import *
-from .embedding import *
-from .flatten import *
-from .linear import *
-from .lora import *
-from .normalization import *
-from .regularization import *
-from .activation import *
-from .resampling import *
+from taktiny.nn.base import *
+from taktiny.nn.block import *
+from taktiny.nn.flatten import *
+from taktiny.nn.modules import *
+from taktiny.nn.regularization import *
+from taktiny.nn.resampling import *
+from taktiny.nn.rng import *

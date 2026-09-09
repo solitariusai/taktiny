@@ -1,20 +1,43 @@
 [project]
 name = "taktiny"
 version = "0.0.1"
-description = "Add your description here"
-readme = "README.md"
+description = "A Deep Learning library built on JAX"
 requires-python = ">=3.12"
+authors = [
+    { name = "Shinapri" }
+]
+readme = { file = "README.md", content-type = "text/markdown" }
+license = { file = "LICENSE.md" }
 dependencies = [
     "aqtp>=0.9.0",
-    "datasets>=5.0.1",
     "grain>=0.2.18",
-    "huggingface-hub>=1.22.0",
     "jax>=0.10.2",
+    "optax>=0.2.8",
     "orbax-checkpoint>=0.12.1",
     "qwix>=0.1.8",
-    "safetensors>=0.8.0",
-    "transformers>=5.13.0",
 ]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+keywords = [
+    "jax", 
+    "deep-learning", 
+    "neural-networks", 
+    "machine-learning", 
+    "peft", 
+]
+
+[project.urls]
+Homepage = "https://github.com/solitariusai/taktiny"
+Repository = "https://github.com/solitariusai/taktiny"
+Issues = "https://github.com/solitariusai/taktiny/issues"
 
 [project.optional-dependencies]
 tensorboard = ["tensorboardX"]
@@ -27,17 +50,49 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
-    "diffusers>=0.39.0",
+    "datasets>=5.0.1",
     "equinox>=0.13.8",
     "flax>=0.12.7",
+    "matplotlib>=3.11.1",
     "optax>=0.2.8",
     "pytest>=9.1.1",
-    "tiktoken>=0.13.0",
-    "torchvision>=0.27.1",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.16.6",
+    "taktiny",
+]
+docs = [
+    "furo>=2025.12.19",
+    "myst-parser>=4.0.0",
+    "sphinx>=9.0.0",
+    "sphinx-autodoc-typehints>=3.0.0",
+    "sphinx-copybutton>=0.5.2",
+    "sphinx-design>=0.7.0",
+    "taktiny",
 ]
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["*_test.py"]
 markers = [
     "gpu: requires a JAX GPU backend",
     "tpu: requires a JAX TPU backend",
 ]
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+]
+
+[tool.uv.sources]
+taktiny = { workspace = true }
+
+[tool.ruff]
+line-length = 150
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401", "F403", "F405"]
+

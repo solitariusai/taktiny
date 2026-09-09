@@ -24,6 +24,13 @@ from taktiny.utils.typing import Batch, PathLike, PyTree
 
 @dataclass(frozen=True)
 class TrainingConfig:
+    """Training controls and native Orbax checkpoint policy.
+
+    save_async uses Orbax's asynchronous checkpointer; train() waits for pending
+    writes before returning. save_optimizer_state=False creates a weights/state
+    snapshot that cannot provide exact training resume. Retention keeps the best
+    and latest checkpoints, which can exceed save_total_limit=1 by one directory.
+    """
     max_steps: int | None = None
     learning_rate: float = 1e-3
     schedule: Callable[[Any], Any] | None = None
@@ -32,14 +39,12 @@ class TrainingConfig:
     log_interval: int = 10
     seed: int = 42
     jit_compile: bool = True
-    donate_batch: bool = False
     output_dir: str | PathLike | None = None
     save_steps: int | None = None
     save_total_limit: int | None = None
     save_at_end: bool = False
     save_optimizer_state: bool = True
     save_async: bool = False
-    max_shard_size: int | str = '5GB'
     eval_strategy: str = 'no'
     eval_steps: int | None = None
     metric_for_best_model: str = 'eval_loss'
@@ -215,24 +220,22 @@ class TrainingConfig:
 
 @dataclass(frozen=True)
 class DatasetConfig:
-    """Configure an existing dataloader or an automatic HF dataset source."""
+    """Caller-provided iterables of batches and optional device placement.
+
+    Loading, preprocessing, batching, and shuffling belong to the caller.
+    Trainer never downloads datasets or changes a loader's sampling policy.
+    """
 
     # A generic iterable that yields batches (e.g. Grain, PyTorch, or custom).
-    # When supplied, all repo-loading options below are ignored.
     train_dataloader: Iterable[Batch] | None = None
     validation_dataloader: Iterable[Batch] | None = None
     # Sharding applied to every batch leaf, or a matching sharding PyTree.
     batch_sharding: PyTree | None = None
-    shuffle: bool = True
-    seed: int = 42
     prefetch_size: int = 2
 
     def __post_init__(self) -> None:
         if self.train_dataloader is None:
             raise TypeError('train_dataloader is required')
-
-        if isinstance(self.seed, bool) or not isinstance(self.seed, int):
-            raise TypeError('seed should be an integer')
 
         if (
             isinstance(self.prefetch_size, bool)
@@ -241,8 +244,15 @@ class DatasetConfig:
         ):
             raise ValueError('prefetch_size should be a non-negative integer')
 
+        for name in ('train_dataloader', 'validation_dataloader'):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, (str, bytes)) or not hasattr(value, '__iter__')
+            ):
+                raise TypeError(f'{name} must be an iterable of batches, not a repository ID')
+
 
 __all__ = [
-    'TrainingConfig',
     'DatasetConfig',
+    'TrainingConfig',
 ]

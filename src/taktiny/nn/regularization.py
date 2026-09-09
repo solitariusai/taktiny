@@ -16,40 +16,57 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Literal, TypeAlias
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
 
-from taktiny.nn.module import Module
-from taktiny.nn.rng import Rngs
-from taktiny.nn.continuo import (
-    _canonical_axis,
+from taktiny.nn.base import Module
+from taktiny.nn.rng import Rngs, get_context_rng
+from taktiny.nn.utils import (
     _canonical_axes,
+    _canonical_axis,
     _constrain,
     _validate_probability,
 )
-from taktiny.utils.typing import Axes, ShardMode
+from taktiny.utils.typing import Axes
 
-
-StochasticDepthMode: TypeAlias = Literal['batch', 'row']
+type StochasticDepthMode = Literal['batch', 'row']
 
 
 def _mask_shape(
     shape: Sequence[int],
     broadcast_axes: tuple[int, ...],
 ) -> tuple[int, ...]:
+    """Computes the mask shape for a given input shape and broadcast axes.
+
+    Args:
+        shape (Sequence[int]): The shape of the input tensor.
+        broadcast_axes (tuple[int, ...]): Axes to broadcast (set to 1).
+
+    Returns:
+        tuple[int, ...]: The computed mask shape.
+    """
     return tuple(
         1 if axis in broadcast_axes else size
         for axis, size in enumerate(shape)
     )
-
 
 def _feature_broadcast_axes(
     ndim: int,
     channel_axis: int,
     batch_axis: int | None,
 ) -> tuple[int, ...]:
+    """Computes the broadcast axes for feature-wise operations.
+
+    Args:
+        ndim (int): Number of dimensions of the input tensor.
+        channel_axis (int): The axis corresponding to features/channels.
+        batch_axis (int | None): The axis corresponding to the batch size, if any.
+
+    Returns:
+        tuple[int, ...]: Axes to broadcast over (all axes except batch and channel).
+    """
     channel_axis = _canonical_axis(channel_axis, ndim, name='channel_axis')
     canonical_batch_axis = None
     if batch_axis is not None:
@@ -66,28 +83,68 @@ def _feature_broadcast_axes(
         if axis not in (canonical_batch_axis, channel_axis)
     )
 
-
 def _next_key(rngs: Rngs | None) -> jax.Array:
+    """Consume a key from an explicit stream or the current runtime context.
+
+    Args:
+        rngs: Explicit stream, or None to resolve get_context_rng at call time.
+
+    Returns:
+        jax.Array: The next PRNG key.
+    """
+
     if rngs is None:
-        raise ValueError('rngs is required in training mode when p is nonzero')
+        rngs = get_context_rng()
     return rngs()
 
-
 def _validate_rngs(rngs: Rngs | None) -> Rngs | None:
+    """Validates that the provided rngs argument is of type Rngs or None.
+
+    Args:
+        rngs (Rngs | None): The object to validate.
+
+    Returns:
+        Rngs | None: The validated rngs object.
+    """
+
     if rngs is None:
         return None
+
     if not isinstance(rngs, Rngs):
         raise TypeError('rngs must be an Rngs or None')
+
     return rngs
 
-
 class Dropout(Module):
-    """Randomly zero activation elements and rescale retained values.
+    """Applies Dropout to the input.
 
-    ``broadcast_axes`` shares one mask value across selected input dimensions.
-    An empty tuple gives ordinary elementwise dropout. Randomness comes from
-    ``rngs`` supplied during construction. :meth:`Module.train` and
-    :meth:`Module.eval` control whether dropout is active.
+    Args:
+        p (float, optional): The probability of an element to be zeroed. Defaults to 0.5.
+        broadcast_axes (Axes, optional): Axes along which the dropout mask is broadcast. Defaults to ().
+        rngs: Explicit random stream. If None, the active set_context_rng
+            stream is looked up at call time. Evaluation and deterministic
+            dropout cases do not require or advance a stream.
+
+    Examples:
+        Use a temporary runtime stream without storing RNG state in the layer:
+
+        >>> from taktiny import nn
+        >>> import jax.numpy as jnp
+        >>> dropout = nn.Dropout(0.5)
+        >>> with nn.set_context_rng(rngs=nn.Rngs(42)):
+        ...     y = dropout(jnp.ones((8, 4)))
+        >>> y.shape
+        (8, 4)
+
+        Or install a persistent default for the current Python context:
+
+        >>> _ = nn.set_context_rng(rngs=nn.Rngs(42))
+        >>> y = dropout(jnp.ones((8, 4)))
+        >>> _ = nn.set_context_rng(None)  # Clear the default.
+
+        Explicit rngs take priority over either form. Under JAX transformations,
+        pass RNG state into the function, establish the scope inside it, and
+        return the updated state; see set_context_rng for a compiled example.
     """
 
     def __init__(
@@ -96,7 +153,6 @@ class Dropout(Module):
         *,
         broadcast_axes: Axes = (),
         rngs: Rngs | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
         self.p = _validate_probability(p)
         self.broadcast_axes = (
@@ -105,14 +161,22 @@ class Dropout(Module):
             else tuple(broadcast_axes)
         )
         self.rngs = _validate_rngs(rngs)
-        self.shard_mode = shard_mode
 
     def _apply(
         self,
         x: jax.Array,
-        *,
         broadcast_axes: tuple[int, ...],
     ) -> jax.Array:
+        """Applies dropout to the input tensor.
+
+        Args:
+            x (jax.Array): The input tensor.
+            broadcast_axes (tuple[int, ...]): Axes along which the dropout mask is broadcast.
+
+        Returns:
+            jax.Array: The output tensor after applying dropout.
+        """
+
         if not self.training or self.p == 0:
             return x
         if self.p == 1:
@@ -130,9 +194,18 @@ class Dropout(Module):
     def __call__(
         self,
         x: jax.Array,
-        *,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
+        """Applies dropout to the input tensor and constrains its sharding.
+
+        Args:
+            x (jax.Array): The input tensor.
+            out_sharding (jax.sharding.Sharding | None, optional): Optional sharding specification for the output. Defaults to None.
+
+        Returns:
+            jax.Array: The output tensor after applying dropout.
+        """
+
         x = jnp.asarray(x)
         axes = _canonical_axes(
             self.broadcast_axes,
@@ -144,14 +217,21 @@ class Dropout(Module):
             x,
             broadcast_axes=axes,
         )
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         return f'p={self.p:g}, broadcast_axes={self.broadcast_axes}'
 
-
 class FeatureDropout(Dropout):
-    """Drop complete feature maps in a channels-first or channels-last array."""
+    """Applies Feature Dropout (Spatial Dropout) to the input.
+
+    Args:
+        p (float, optional): The probability of a feature to be zeroed. Defaults to 0.5.
+        channel_axis (int, optional): The axis corresponding to features/channels. Defaults to -1.
+        batch_axis (int | None, optional): The axis corresponding to the batch size, if any. Defaults to 0.
+        rngs: Explicit random stream, or None to use the active
+            set_context_rng stream at call time.
+    """
 
     def __init__(
         self,
@@ -160,18 +240,27 @@ class FeatureDropout(Dropout):
         channel_axis: int = -1,
         batch_axis: int | None = 0,
         rngs: Rngs | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
-        super().__init__(p, rngs=rngs, shard_mode=shard_mode)
+        
+
+        super().__init__(p, rngs=rngs)
         self.channel_axis = channel_axis
         self.batch_axis = batch_axis
 
     def __call__(
         self,
         x: jax.Array,
-        *,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
+        """Applies feature dropout to the input tensor.
+
+        Args:
+            x (jax.Array): The input tensor.
+            out_sharding (jax.sharding.Sharding | None, optional): Optional sharding specification for the output. Defaults to None.
+
+        Returns:
+            jax.Array: The output tensor after applying feature dropout.
+        """
         x = jnp.asarray(x)
         output = self._apply(
             x,
@@ -181,7 +270,7 @@ class FeatureDropout(Dropout):
                 self.batch_axis,
             ),
         )
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         return (
@@ -189,9 +278,16 @@ class FeatureDropout(Dropout):
             f'batch_axis={self.batch_axis}'
         )
 
-
 class AlphaDropout(Module):
-    """SELU-compatible dropout preserving zero mean and unit variance."""
+    """Applies Alpha Dropout to the input, maintaining the self-normalizing property.
+
+    Args:
+        p (float, optional): The probability of an element to be dropped. Defaults to 0.5.
+        broadcast_axes (Axes, optional): Axes along which the dropout mask is broadcast. Defaults to ().
+        rngs: Explicit random stream, or None to use the active
+            set_context_rng stream at call time. Evaluation does not
+            consume randomness.
+    """
 
     _alpha_prime = -1.7580993408473766
 
@@ -201,7 +297,6 @@ class AlphaDropout(Module):
         *,
         broadcast_axes: Axes = (),
         rngs: Rngs | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
         self.p = _validate_probability(p, allow_one=False)
         self.broadcast_axes = (
@@ -210,14 +305,21 @@ class AlphaDropout(Module):
             else tuple(broadcast_axes)
         )
         self.rngs = _validate_rngs(rngs)
-        self.shard_mode = shard_mode
 
     def _apply(
         self,
         x: jax.Array,
-        *,
         broadcast_axes: tuple[int, ...],
     ) -> jax.Array:
+        """Applies alpha dropout to the input tensor.
+
+        Args:
+            x (jax.Array): The input tensor.
+            broadcast_axes (tuple[int, ...]): Axes along which the dropout mask is broadcast.
+
+        Returns:
+            jax.Array: The output tensor after applying alpha dropout.
+        """
         if not self.training or self.p == 0:
             return x
         if not jnp.issubdtype(x.dtype, jnp.floating):
@@ -244,9 +346,17 @@ class AlphaDropout(Module):
     def __call__(
         self,
         x: jax.Array,
-        *,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
+        """Applies alpha dropout to the input tensor and constrains its sharding.
+
+        Args:
+            x (jax.Array): The input tensor.
+            out_sharding (jax.sharding.Sharding | None, optional): Optional sharding specification for the output. Defaults to None.
+
+        Returns:
+            jax.Array: The output tensor after applying alpha dropout.
+        """
         x = jnp.asarray(x)
         axes = _canonical_axes(
             self.broadcast_axes,
@@ -258,14 +368,21 @@ class AlphaDropout(Module):
             x,
             broadcast_axes=axes,
         )
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         return f'p={self.p:g}, broadcast_axes={self.broadcast_axes}'
 
-
 class FeatureAlphaDropout(AlphaDropout):
-    """SELU-compatible dropout sharing a mask across spatial dimensions."""
+    """Applies Feature Alpha Dropout to the input.
+
+    Args:
+        p (float, optional): The probability of a feature to be dropped. Defaults to 0.5.
+        channel_axis (int, optional): The axis corresponding to features/channels. Defaults to -1.
+        batch_axis (int | None, optional): The axis corresponding to the batch size, if any. Defaults to 0.
+        rngs: Explicit random stream, or None to use the active
+            set_context_rng stream at call time.
+    """
 
     def __init__(
         self,
@@ -274,18 +391,25 @@ class FeatureAlphaDropout(AlphaDropout):
         channel_axis: int = -1,
         batch_axis: int | None = 0,
         rngs: Rngs | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
-        super().__init__(p, rngs=rngs, shard_mode=shard_mode)
+        super().__init__(p, rngs=rngs)
         self.channel_axis = channel_axis
         self.batch_axis = batch_axis
 
     def __call__(
         self,
         x: jax.Array,
-        *,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
+        """Applies feature alpha dropout to the input tensor.
+
+        Args:
+            x (jax.Array): The input tensor.
+            out_sharding (jax.sharding.Sharding | None, optional): Optional sharding specification for the output. Defaults to None.
+
+        Returns:
+            jax.Array: The output tensor after applying feature alpha dropout.
+        """
         x = jnp.asarray(x)
         output = self._apply(
             x,
@@ -295,7 +419,7 @@ class FeatureAlphaDropout(AlphaDropout):
                 self.batch_axis,
             ),
         )
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         return (
@@ -303,9 +427,16 @@ class FeatureAlphaDropout(AlphaDropout):
             f'batch_axis={self.batch_axis}'
         )
 
-
 class StochasticDepth(Dropout):
-    """Randomly drop complete residual branches per batch or per row."""
+    """Applies Stochastic Depth to the input.
+
+    Args:
+        p (float): The probability of dropping a path.
+        mode (StochasticDepthMode, optional): The stochastic depth mode, either 'batch' or 'row'. Defaults to 'row'.
+        batch_axis (int, optional): The axis corresponding to the batch size. Defaults to 0.
+        rngs: Explicit random stream, or None to use the active
+            set_context_rng stream at call time.
+    """
 
     def __init__(
         self,
@@ -314,9 +445,8 @@ class StochasticDepth(Dropout):
         *,
         batch_axis: int = 0,
         rngs: Rngs | None = None,
-        shard_mode: ShardMode = ShardMode.AUTO,
     ) -> None:
-        super().__init__(p, rngs=rngs, shard_mode=shard_mode)
+        super().__init__(p, rngs=rngs)
         if mode not in {'batch', 'row'}:
             raise ValueError("mode must be 'batch' or 'row'")
         self.mode = mode
@@ -325,9 +455,17 @@ class StochasticDepth(Dropout):
     def __call__(
         self,
         x: jax.Array,
-        *,
         out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
+        """Applies stochastic depth to the input tensor.
+
+        Args:
+            x (jax.Array): The input tensor.
+            out_sharding (jax.sharding.Sharding | None, optional): Optional sharding specification for the output. Defaults to None.
+
+        Returns:
+            jax.Array: The output tensor after applying stochastic depth.
+        """
         x = jnp.asarray(x)
         if self.mode == 'batch':
             broadcast_axes = tuple(range(x.ndim))
@@ -344,17 +482,17 @@ class StochasticDepth(Dropout):
             x,
             broadcast_axes=broadcast_axes,
         )
-        return _constrain(output, out_sharding, self.shard_mode)
+        return _constrain(output, out_sharding)
 
     def extra_repr(self) -> str:
         return f'p={self.p:g}, mode={self.mode!r}, batch_axis={self.batch_axis}'
 
 
 __all__ = [
-    'StochasticDepthMode',
-    'Dropout',
-    'FeatureDropout',
     'AlphaDropout',
+    'Dropout',
     'FeatureAlphaDropout',
+    'FeatureDropout',
     'StochasticDepth',
+    'StochasticDepthMode',
 ]

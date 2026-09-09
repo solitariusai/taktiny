@@ -11,49 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A Deep Learning framework built on JAX"""
 
 __author__ = "Shinapri"
 __version__ = "0.0.1"
 __description__ = (
-    "A Deep Learning framework built on JAX, featuring OOP-style modeling, "
-    "full-lifecycle trainers, and native architectures spanning Transformers, Diffusion, and SSMs."
+    "A Deep Learning library built on JAX, featuring OOP-style modeling, data pre-processing and trainers."
 )
 
-from taktiny.cosettes import kernels, layers
-from taktiny.cosettes.overture import ModelOutput
-from taktiny.maestro.prelude import Maestro
-from taktiny.maestro.config import ModelConfig
-from taktiny.takt import Takt
-from taktiny import nn, peft
-from taktiny import transforms as tt
-from taktiny.trainer import (
-    DatasetConfig,
-    TensorBoardCallback,
-    Trainer,
-    TrainerCallback,
-    TrainingConfig,
-    WandbCallback,
-)
-
-from taktiny.maestro.opus import *
+from taktiny import data as data
+from taktiny import nn as nn
+from taktiny import takt as takt
+from taktiny import trainer as trainer
+from taktiny import utils as utils
+from taktiny.takt import Takt as Takt
+from taktiny.utils.transforms import scan, vmap
 
 __all__ = [
-    'Maestro',
-    'Takt',
-    'PeftConfig',
-    'LoraConfig',
-    'ModelConfig',
-    'ModelOutput',
-    'Trainer',
-    'TrainerCallback',
-    'TensorBoardCallback',
-    'WandbCallback',
-    'TrainingConfig',
-    'DatasetConfig',
-    'tt',
+    'data',
     'nn',
-    'layers',
-    'kernels',
-    'peft'
+    'takt',
+    'trainer',
+    'utils',
+    'Takt',
+    'vmap',
+    'scan',
 ]

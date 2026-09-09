@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .trainer import *
-from .config import *
-from .callbacks import *
-from .loss import *
-from .rl.rl import *
-from .sft import *
+from taktiny.trainer.callbacks import *
+from taktiny.trainer.checkpoint import *
+from taktiny.trainer.config import *
+from taktiny.trainer.evaluate import *
+from taktiny.trainer.trainer import *

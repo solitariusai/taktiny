@@ -1,56 +1,139 @@
-# Taktiny Documentation
+# Taktiny
 
-Taktiny is an experimental neural-network library built directly on JAX. It
-provides object-oriented modules that are JAX PyTrees, transformer building
-blocks, Hugging Face Safetensors loading, Qwix weight-only quantization, PEFT,
-and an Optax-based training loop.
+:::{container} taktiny-intro
+A deep learning library built on JAX.
 
-The project is under active development. APIs and model coverage can change
-between revisions.
+Define models with Python modules, transform them with JAX, and choose how to
+load data, distribute computation, and run training.
+:::
 
-## Current Scope
+[Installation](getting_started/installation.md) ·
+[Quickstart](getting_started/quickstart.md) ·
+[API reference](api/nn.md)
 
-- `nn.Module` and `nn.Parameter` objects compatible with JAX transformations
-- Causal language models with KV-cached generation and streaming
-- Hugging Face configuration and checkpoint loading through `Maestro`
-- Full-model and LoRA-adapter Safetensors serialization
-- Qwix INT8, INT4, NF4, and selective PTQ while loading
-- Logical parameter axes, JAX mesh placement, and decoder rematerialization
-- Grain-compatible data operations and resumable trainer checkpoints
-- Low-level attention, MoE, ragged, and SparseCore kernel entry points
+:::{container} taktiny-project-note
+Taktiny is experimental. APIs may change as the library develops.
+:::
 
-The implemented causal model families are Llama, original Qwen, Qwen2,
-Qwen3, Gemma, Gemma2, and text-only Gemma3. Other architecture names in the
-internal registry are development placeholders and are not supported merely
-because they are registered.
+## A model is a PyTree
 
-Multimodal generation, native Taktiny execution through vLLM TPU, and concrete
-RL algorithms remain experimental or incomplete. Their current boundaries are
-documented explicitly rather than presented as production features.
+Layers compose as ordinary Python objects. A module can be passed to a JAX
+transformation alongside its inputs.
 
-## Documentation
+```python
+import jax
+import jax.numpy as jnp
+from taktiny import nn
 
-- [Getting Started](getting_started.md): install, load, inspect, and generate
-- [Core Concepts](core_concepts.md): modules, parameters, RNGs, stacks, sharding,
-  and rematerialization
-- [Models and Checkpoints](models_and_checkpoints.md): Maestro, implemented
-  families, quantized loading, serialization, and Hub upload
-- [Generation](generation.md): native batched generation, sampling, streaming,
-  and forward contexts
-- [Data Pipelines](data.md): Grain composition, batched tokenization, packing,
-  workers, and resume boundaries
-- [Training](training.md): losses, Optax, gradient controls, evaluation,
-  callbacks, sharding, checkpointing, and resume
-- [PEFT](peft.md): LoRA, QLoRA-style loading, adapter checkpoints, and merging
-- [Layers](layers.md): primitives, transformer layers, containers, and module
-  transformations
-- [Kernels](kernels.md): attention, MoE, embedding entry points, and hardware
-  constraints
-- [Experimental APIs](experimental.md): accurate multimodal, vLLM, RL, and
-  architecture-placeholder boundaries
-- [API Reference](api_reference.md): compact signatures and symbols by module
 
-## Version Note
+class MLP(nn.Module):
+    def __init__(self, *, rngs: nn.Rngs):
+        self.hidden = nn.Linear(16, 32, rngs=rngs)
+        self.output = nn.Linear(32, 4, rngs=rngs)
 
-These pages describe the latest `experiment` implementation, not the older
-source snapshot carried by the documentation worktree itself.
+    def __call__(self, x):
+        return self.output(jax.nn.relu(self.hidden(x)))
+
+
+model = MLP(rngs=nn.Rngs(0))
+forward = jax.jit(model)
+
+y = forward(jnp.ones((8, 16)))
+print(y.shape)  # (8, 4)
+```
+
+The [quickstart](getting_started/quickstart.md) continues with data loading,
+optimization, and evaluation.
+
+## Find your way
+
+::::{grid} 1 1 2 2
+:gutter: 3
+:class-container: taktiny-doc-index
+
+:::{grid-item}
+### Start here
+
+Set up your environment and train a first model.
+
+- [Install Taktiny](getting_started/installation.md)
+- [Build and train a model](getting_started/quickstart.md)
+:::
+
+:::{grid-item}
+### Guides
+
+Work with the parts of a training pipeline.
+
+- [Saving and Loading Models](guides/checkpoint.md)
+- [Parameter-efficient fine-tuning](guides/peft.md)
+- [Data loading and preprocessing](guides/data.md)
+- [Training and checkpoints](guides/trainer.md)
+- [Sharding and parallelism](guides/spmd.md)
+:::
+
+:::{grid-item}
+### Tutorials
+
+Complete examples, from simple models to image generation.
+
+- [Linear regression](tutorial/linear_regression.md)
+- [Image classification](tutorial/image_classification.md)
+- [Generative adversarial networks](tutorial/gan.md)
+:::
+
+:::{grid-item}
+### API reference
+
+Signatures, arguments, and examples by package.
+
+- [Neural network modules](api/nn.md)
+- [Adapter injection](api/takt.md)
+- [Data transforms and loaders](api/data.md)
+- [Trainer and callbacks](api/trainer.md)
+- [JAX and quantization utilities](api/utils.md)
+:::
+::::
+
+```{toctree}
+:maxdepth: 2
+:hidden:
+:caption: Getting Started
+
+getting_started/installation
+getting_started/quickstart
+```
+
+```{toctree}
+:maxdepth: 2
+:hidden:
+:caption: Maybe Useful
+
+guides/checkpoint
+guides/peft
+guides/data
+guides/trainer
+guides/spmd
+```
+
+```{toctree}
+:maxdepth: 2
+:hidden:
+:caption: Tutorials
+
+tutorial/linear_regression
+tutorial/image_classification
+tutorial/gan
+```
+
+```{toctree}
+:maxdepth: 2
+:hidden:
+:caption: API Reference
+
+api/nn
+api/takt
+api/data
+api/trainer
+api/utils
+```
