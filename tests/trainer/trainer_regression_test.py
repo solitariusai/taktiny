@@ -759,9 +759,9 @@ def test_wandb_callback_lazily_owns_run(monkeypatch):
 
 
 def test_callback_api_is_exported_at_package_root():
-    assert taktiny.TrainerCallback is TrainerCallback
-    assert taktiny.TensorBoardCallback is TensorBoardCallback
-    assert taktiny.WandbCallback is WandbCallback
+    assert taktiny.trainer.TrainerCallback is TrainerCallback
+    assert taktiny.trainer.TensorBoardCallback is TensorBoardCallback
+    assert taktiny.trainer.WandbCallback is WandbCallback
 
 
 
