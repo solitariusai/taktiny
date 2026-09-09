@@ -36,4 +36,4 @@ jobs:
         run: uv sync --frozen --group dev
 
       - name: Run tests
-        run: uv run --frozen pytest
+        run: make test
