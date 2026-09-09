@@ -36,9 +36,9 @@ class MLP(nn.Module):
 
 
 model = MLP(rngs=nn.Rngs(0))
-forward = jax.jit(lambda model, x: model(x))
+forward = jax.jit(model)
 
-y = forward(model, jnp.ones((8, 16)))
+y = forward(jnp.ones((8, 16)))
 print(y.shape)  # (8, 4)
 ```
 

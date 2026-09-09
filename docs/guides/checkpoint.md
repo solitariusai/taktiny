@@ -1,4 +1,4 @@
-# Saving and Loading Models
+# Saving and loading models
 
 Taktiny separates **model state** from **serialization**.
 
