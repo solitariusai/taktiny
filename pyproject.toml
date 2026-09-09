@@ -1,6 +1,6 @@
 [project]
 name = "taktiny"
-version = "0.0.1"
+version = "0.0.1rc1"
 description = "Build, train, and scale neural networks with JAX."
 requires-python = ">=3.12"
 authors = [

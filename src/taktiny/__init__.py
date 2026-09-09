@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from importlib.metadata import version
+
 __author__ = "Shinapri"
-__version__ = "0.0.1"
+__version__ = version('taktiny')
 __description__ = (
-    "A Deep Learning library built on JAX, featuring OOP-style modeling, data pre-processing and trainers."
+    "Build, train, and scale neural networks with JAX."
 )
 
 from taktiny import data as data
