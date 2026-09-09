@@ -19,5 +19,3 @@ zcratch*
 
 # Sphinx documentation build
 docs/_build/
-# Jupyter notebooks
-notebook/
