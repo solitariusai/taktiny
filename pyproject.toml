@@ -1,7 +1,7 @@
 [project]
 name = "taktiny"
 version = "0.0.1"
-description = "A Deep Learning library built on JAX"
+description = "Build, train, and scale neural networks with JAX."
 requires-python = ">=3.12"
 authors = [
     { name = "Shinapri" }
@@ -36,6 +36,7 @@ keywords = [
 
 [project.urls]
 Homepage = "https://github.com/solitariusai/taktiny"
+Documentation = "https://solitariusai.github.io/taktiny"
 Repository = "https://github.com/solitariusai/taktiny"
 Issues = "https://github.com/solitariusai/taktiny/issues"
 
