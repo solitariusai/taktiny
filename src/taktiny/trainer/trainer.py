@@ -21,7 +21,7 @@ import re
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sized
 from itertools import islice
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -437,8 +437,9 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
             raise ValueError(
                 'validation_dataloader is required when evaluation is enabled'
             )
-        if saving_enabled and self.training_config.output_dir is not None:
-            os.makedirs(self.training_config.output_dir, exist_ok=True)
+        output_dir = self.training_config.output_dir
+        if saving_enabled and output_dir is not None:
+            os.makedirs(output_dir, exist_ok=True)
 
         self._call_event('on_train_begin')
 
@@ -496,7 +497,7 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
                 return self.loss_fn(
                     current_params,
                     batch,
-                    rng=rng,
+                    **{'rng': rng},
                 )
             return self.loss_fn(current_params, batch)
 
@@ -617,7 +618,7 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
         total_steps = None
         if isinstance(self._train_dataloader, Sized):
             try:
-                dataloader_length = len(self._train_dataloader)
+                dataloader_length = len(cast(Sized, self._train_dataloader))
             except TypeError:
                 dataloader_length = None
             if dataloader_length is not None:
@@ -699,7 +700,7 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
                     accumulated_grads,
                     is_leaf=lambda value: value is None,
                 )
-                averaged_loss = accumulated_loss / divisor
+                averaged_loss = cast(Any, accumulated_loss) / divisor
                 if accumulated_metrics is not None:
                     step_metrics = jax.tree.map(lambda v: v / divisor, accumulated_metrics)
                 else:
@@ -979,7 +980,7 @@ class Trainer(TrainerEvaluateMixin, TrainerCheckpointMixin):
                 step_in_epoch = skip_batches
                 dataloader = self._train_dataloader
                 assert dataloader is not None
-                data_iterator = iter(dataloader)
+                data_iterator = iter(cast(Iterable[Any], dataloader))
                 self._active_data_iterator = data_iterator
                 restored_iterator = (
                     resume_checkpoint is not None
