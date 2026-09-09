@@ -1,0 +1,318 @@
+/* Paper and ink. Furo still owns the responsive navigation and page layout. */
+
+body[data-theme] {
+    -webkit-font-smoothing: antialiased;
+    --font-stack--heading: Georgia, 'Times New Roman', serif;
+    --color-link: var(--color-foreground-primary);
+    --color-link--hover: var(--color-foreground-primary);
+    --color-link-underline: var(--color-foreground-primary);
+    --color-link-underline--hover: var(--color-foreground-primary);
+    --color-admonition-title: var(--color-foreground-primary);
+    --color-admonition-title-background: var(--color-background-hover);
+    --color-api-background: var(--color-background-hover);
+    --color-api-background-hover: var(--color-background-hover);
+    --color-api-name: var(--color-foreground-primary);
+    --color-api-pre-name: var(--color-foreground-primary);
+    --color-brand-visited: var(--color-foreground-primary);
+    --color-highlight-on-target: var(--color-background-hover);
+}
+
+.content {
+    line-height: 1.65;
+}
+
+.content h1,
+.content h2,
+.content h3 {
+    color: var(--color-foreground-primary);
+    font-family: var(--font-stack--heading);
+    font-weight: 700;
+    line-height: 1.25;
+}
+
+.content h1 {
+    font-size: clamp(2.8rem, 6vw, 4rem);
+    letter-spacing: -0.045em;
+    margin-bottom: 1.4rem;
+    padding-bottom: 0.45rem;
+    border-bottom: 3px double var(--color-foreground-primary);
+}
+
+.content h2 {
+    font-size: 1.8rem;
+    letter-spacing: -0.02em;
+    margin-top: 2.5rem;
+}
+
+.content h3 {
+    font-size: 1.15rem;
+    margin-top: 1.8rem;
+}
+
+.content a {
+    text-underline-offset: 0.18em;
+    text-decoration-thickness: 1px;
+}
+
+.content a:hover {
+    text-decoration: underline;
+    text-decoration-style: wavy;
+}
+
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+label:focus-visible,
+summary:focus-visible {
+    outline: 2px solid var(--color-brand-primary);
+    outline-offset: 3px;
+}
+
+.sidebar-brand-text {
+    font-family: var(--font-stack--heading);
+    font-size: 1.7rem;
+    font-weight: 700;
+}
+
+.sidebar-brand.centered {
+    text-align: left;
+}
+
+.sidebar-logo-container {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    margin: var(--sidebar-item-spacing-vertical) 0;
+}
+
+.sidebar-logo {
+    display: block;
+    margin: 0;
+    width: 100%;
+    max-width: none;
+}
+
+body[data-theme="dark"] .sidebar-logo {
+    filter: invert(1);
+}
+
+@media (prefers-color-scheme: dark) {
+    body:not([data-theme="light"]) .sidebar-logo {
+        filter: invert(1);
+    }
+}
+
+.sidebar-drawer {
+    border-right: 1px dashed var(--color-foreground-primary);
+}
+
+.sidebar-search-container {
+    border-top: 1px solid var(--color-foreground-primary);
+    border-bottom: 1px solid var(--color-foreground-primary);
+}
+
+.sidebar-tree .current > .reference {
+    text-decoration: underline;
+    text-underline-offset: 0.25em;
+}
+
+.sidebar-tree .caption,
+.toc-title,
+.taktiny-doc-index p.rubric {
+    font-family: 'Courier New', Courier, monospace;
+}
+
+.theme-toggle {
+    border: 0;
+    border-radius: 0;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+    padding: 0.25rem;
+    margin: 0;
+}
+
+.content-icon-container {
+    align-items: center;
+    position: sticky;
+    top: 1rem;
+    z-index: 5;
+    background: var(--color-background-primary);
+    gap: 0.25rem;
+}
+
+.content-icon-container .view-this-page,
+.content-icon-container .edit-this-page {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+}
+
+.content-icon-container .view-this-page svg,
+.content-icon-container .edit-this-page svg {
+    display: block;
+}
+
+/* On phones Furo already keeps the theme control in its sticky header. */
+@media (max-width: 63em) {
+    .content-icon-container {
+        position: static;
+    }
+}
+
+.sidebar-tree .caption-text {
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+}
+
+.content .taktiny-intro {
+    color: var(--color-foreground-secondary);
+    font-size: 1.1rem;
+    max-width: 38rem;
+    margin-bottom: 1.25rem;
+}
+
+.taktiny-intro > p:first-child {
+    color: var(--color-foreground-primary);
+    font-size: 1.35rem;
+    line-height: 1.45;
+    margin-top: 0;
+    margin-bottom: 0.65rem;
+}
+
+.content .taktiny-project-note {
+    border-left: 3px double var(--color-background-border);
+    color: var(--color-foreground-secondary);
+    font-size: 0.875rem;
+    margin: 1.5rem 0 2.5rem;
+    padding-left: 0.8rem;
+}
+
+.taktiny-doc-index .sd-col {
+    min-width: 0;
+}
+
+.taktiny-doc-index p.rubric {
+    border-top: 1px solid var(--color-background-border);
+    color: var(--color-foreground-primary);
+    font-size: 1.05rem;
+    font-weight: 600;
+    margin-top: 0;
+    padding-top: 1rem;
+}
+
+.taktiny-doc-index p {
+    color: var(--color-foreground-secondary);
+    font-size: 0.925rem;
+}
+
+.taktiny-doc-index ul {
+    list-style: none;
+    padding-left: 0;
+}
+
+.taktiny-doc-index li {
+    margin-bottom: 0.4rem;
+}
+
+/* Keep examples scrollable and API signatures readable on narrow screens. */
+body[data-theme] div.highlight {
+    border: 1px solid var(--color-background-border);
+    border-radius: 2px 1px 3px 1px;
+    box-shadow: 3px 3px 0 var(--color-background-primary),
+                4px 4px 0 var(--color-foreground-primary);
+    margin-bottom: 1.5rem;
+    background: var(--color-code-background);
+    color: var(--color-code-foreground);
+}
+
+/* Monochrome syntax retains bold/italic distinctions instead of token colors. */
+.highlight pre,
+.highlight span {
+    color: inherit;
+    background: transparent;
+}
+
+div.highlight pre {
+    line-height: 1.6;
+}
+
+code.literal {
+    border-radius: 4px;
+}
+
+dl.py > dt {
+    border-radius: 2px;
+    overflow-wrap: anywhere;
+}
+
+.admonition {
+    border: 1px solid var(--color-foreground-primary);
+    border-radius: 0;
+    box-shadow: none;
+    --color-admonition-title: var(--color-foreground-primary);
+    --color-admonition-title-background: var(--color-background-hover);
+}
+
+.content .admonition {
+    border-color: var(--color-foreground-primary);
+}
+
+.content .admonition > .admonition-title {
+    background-color: var(--color-background-hover);
+}
+
+.content .admonition > .admonition-title::before {
+    background-color: var(--color-foreground-primary);
+}
+
+/* Other pages can still use sphinx-design, without the landing-page effects. */
+.sd-card {
+    border: 1px solid var(--color-foreground-primary);
+    border-radius: 0;
+    box-shadow: none;
+}
+
+.sd-card-title {
+    font-weight: 600;
+}
+
+.sd-tab-set > input:checked + label {
+    color: var(--color-brand-content);
+    border-color: var(--color-brand-content);
+}
+
+table.docutils th {
+    font-weight: 600;
+}
+
+@media (max-width: 46em) {
+    .content h2 {
+        margin-top: 2rem;
+    }
+
+    .content .taktiny-intro {
+        font-size: 1rem;
+    }
+
+    .taktiny-intro > p:first-child {
+        font-size: 1.2rem;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    html {
+        scroll-behavior: auto;
+    }
+
+    .sidebar-drawer,
+    .toc-drawer,
+    .sd-card,
+    .sd-tab-set > label {
+        transition: none;
+    }
+}

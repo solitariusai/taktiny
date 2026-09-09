@@ -41,9 +41,9 @@ Because `nn.Module` instances are pure JAX PyTrees, you can pass them directly t
 
 ```python
 # JIT-compile the model forward pass
-jitted_forward = jax.jit(lambda m, x: m(x))
+jit_model = jax.jit(model)
 x = jnp.ones((8, 16))
-logits = jitted_forward(model, x)
+logits = jit_model(x)
 print("Output logits shape:", logits.shape)  # (8, 4)
 ```
 
