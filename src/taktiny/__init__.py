@@ -11,36 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A Deep Learning framework built on JAX"""
 
 __author__ = "Shinapri"
 __version__ = "0.0.1"
 __description__ = (
-    "A Deep Learning framework built on JAX, featuring OOP-style modeling, "
-    "full-lifecycle trainers, and native architectures spanning Transformers, Diffusion, and SSMs."
+    "A Deep Learning library built on JAX, featuring OOP-style modeling, data pre-processing and trainers."
 )
 
-from taktiny import nn
-# from taktiny.takt import Takt
-from taktiny.trainer import (
-    DatasetConfig,
-    TensorBoardCallback,
-    Trainer,
-    TrainerCallback,
-    TrainingConfig,
-    WandbCallback,
-)
-from taktiny.utils import typing
-from taktiny.utils.transforms import *
+from taktiny import data as data
+from taktiny import nn as nn
+from taktiny import takt as takt
+from taktiny import trainer as trainer
+from taktiny import utils as utils
+from taktiny.takt import Takt as Takt
+from taktiny.utils.transforms import scan, vmap
 
 __all__ = [
-    'DatasetConfig',
-    'Takt',
-    'TensorBoardCallback',
-    'Trainer',
-    'TrainerCallback',
-    'TrainingConfig',
-    'WandbCallback',
+    'data',
     'nn',
-    'typing'
+    'takt',
+    'trainer',
+    'utils',
+    'Takt',
+    'vmap',
+    'scan',
 ]
