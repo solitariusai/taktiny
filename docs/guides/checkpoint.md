@@ -279,43 +279,6 @@ quantized_model.load_state_dict(state)
 
 This preserves the expected structure of the quantized parameters during restoration.
 
-## Saving Model Configuration
-
-A state dictionary stores model state, not enough information to recreate arbitrary Python model classes.
-
-For a self-contained checkpoint, save architecture configuration separately from the weights.
-
-For example:
-
-```python
-import json
-
-config = {
-    "in_features": 32,
-    "hidden_features": 128,
-    "out_features": 4,
-}
-
-with open("config.json", "w") as f:
-    json.dump(config, f)
-```
-
-The model can later be reconstructed from that configuration:
-
-```python
-with open("config.json") as f:
-    config = json.load(f)
-
-model = MLP(
-    **config,
-    rngs=nn.Rngs(0),
-)
-```
-
-The saved state can then be restored normally.
-
-This separation keeps the checkpoint format independent from Python object serialization and avoids requiring arbitrary model objects to be pickled.
-
 ## Hierarchical vs. Flat State
 
 Use `state_dict()` when saving and restoring a Taktiny model directly. Its nested structure naturally mirrors the module hierarchy.
