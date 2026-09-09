@@ -65,10 +65,11 @@ Set up your environment and train a first model.
 
 Work with the parts of a training pipeline.
 
+- [Saving and Loading Models](guides/checkpoint.md)
+- [Parameter-efficient fine-tuning](guides/peft.md)
 - [Data loading and preprocessing](guides/data.md)
 - [Training and checkpoints](guides/trainer.md)
 - [Sharding and parallelism](guides/spmd.md)
-- [Parameter-efficient fine-tuning](guides/peft.md)
 :::
 
 :::{grid-item}
@@ -108,10 +109,11 @@ getting_started/quickstart
 :hidden:
 :caption: Maybe Useful
 
-guides/spmd
+guides/checkpoint
 guides/peft
 guides/data
 guides/trainer
+guides/spmd
 ```
 
 ```{toctree}
