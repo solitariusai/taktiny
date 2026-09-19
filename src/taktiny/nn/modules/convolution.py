@@ -224,7 +224,7 @@ class Conv(Module):
                 f'({groups})'
             )
 
-        if out_channels[0] % groups != 0:
+        if math.prod(out_channels) % groups != 0:
             raise ValueError(
                 f'out_channels ({out_channels}) must be divisible by groups '
                 f'({groups})'
