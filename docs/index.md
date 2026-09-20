@@ -92,6 +92,7 @@ Signatures, arguments, and examples by package.
 - [Data transforms and loaders](api/data.md)
 - [Trainer and callbacks](api/trainer.md)
 - [JAX and quantization utilities](api/utils.md)
+- [Ensemble modeling](api/ensemble.md)
 :::
 ::::
 
@@ -136,4 +137,5 @@ api/takt
 api/data
 api/trainer
 api/utils
+api/ensemble
 ```
