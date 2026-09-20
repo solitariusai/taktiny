@@ -219,8 +219,8 @@ class Conv(Module):
         quant: Optional Qwix quantization configuration. A ``QtRule`` or
             ``QtProvider`` keeps floating-point trainable parameters and
             quantizes convolution operands; ``bwd_qtype`` controls gradient
-            quantization. INT4/NF4 and grouped training use quantized values
-            with floating-point contractions, not native low-bit kernels.
+            quantization. Supported training formats and grouping depend on
+            Qwix QT kernels and the execution backend.
             Tiled training quantization and ``additional_qt_config`` are
             unsupported. Training rules cannot be combined with ``dot_general``.
             Other rules retain weight-only quantization behavior.
@@ -756,8 +756,8 @@ class ConvTranspose(Module):
         quant: Optional Qwix quantization configuration. A ``QtRule`` or
             ``QtProvider`` keeps floating-point trainable parameters and
             quantizes convolution operands; ``bwd_qtype`` controls gradient
-            quantization. INT4/NF4 training uses quantized values with
-            floating-point contractions, not native low-bit kernels.
+            quantization. Supported training formats depend on Qwix QT
+            kernels and the execution backend.
             Tiled training quantization and ``additional_qt_config`` are
             unsupported. Training rules cannot be combined with ``dot_general``.
             Other rules retain weight-only quantization behavior.

@@ -8,8 +8,8 @@ from taktiny import nn
 
 
 @pytest.mark.parametrize('cls', [nn.Conv, nn.ConvTranspose])
-@pytest.mark.parametrize('qtype', ['int8', 'int4', 'nf4'])
-@pytest.mark.parametrize('groups', [1, (2, 2)])
+@pytest.mark.parametrize('qtype', ['int8'])
+@pytest.mark.parametrize('groups', [1])
 @pytest.mark.parametrize('backward', [False, True])
 def test_convolution_training(cls, qtype, groups, backward):
     rule = qwix.QtRule(weight_qtype=qtype, act_qtype=qtype, bwd_qtype=qtype if backward else None)
@@ -32,14 +32,27 @@ def test_convolution_training(cls, qtype, groups, backward):
 
 
 @pytest.mark.parametrize('cls', [nn.Conv, nn.ConvTranspose])
-def test_depthwise_2d_qt(cls):
-    rule = qwix.QtRule(weight_qtype='nf4', act_qtype='nf4', bwd_qtype='nf4')
-    layer = cls((2, 2), (2, 2), (2, 3), groups=(2, 2), padding='SAME',
+@pytest.mark.parametrize('qtype', ['int8', 'int4', 'nf4'])
+@pytest.mark.parametrize('groups', [1, (2, 2)])
+def test_convolution_delegates_errors_to_qwix(monkeypatch, cls, qtype, groups):
+    from taktiny.utils import ops
+
+    class BackendError(RuntimeError):
+        pass
+
+    def unavailable(lhs, rhs, config, *args):
+        assert config.lhs_qtype == qtype
+        assert config.rhs_qtype == qtype
+        assert config.dlhs_grad_qtype == qtype
+        raise BackendError('unsupported backend')
+
+    monkeypatch.setattr(ops.conv_general_qt, 'conv_general_qt', unavailable)
+    rule = qwix.QtRule(weight_qtype=qtype, act_qtype=qtype, bwd_qtype=qtype)
+    layer = cls((2, 2), (2, 2), (2, 3), groups=groups, padding='SAME',
                 quant=rule, rngs=nn.Rngs(0))
     x = jnp.ones((4, 5, 2, 2))  # Unbatched.
-    gradient = jax.jit(jax.grad(lambda m: m(x).sum()))(layer)
-    assert gradient.kernel.shape == layer.kernel.shape
-    assert jnp.all(jnp.isfinite(gradient.kernel.value))
+    with pytest.raises(BackendError, match='unsupported backend'):
+        layer(x)
 
 
 @pytest.mark.parametrize('cls', [nn.Conv, nn.ConvTranspose])

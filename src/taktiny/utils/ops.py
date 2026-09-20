@@ -47,17 +47,6 @@ def _rule(quant: QuantConfig, module_path: str, op: str) -> qwix.QuantizationRul
     return None
 
 
-def _is_low_bit(dtype: DTypeLike | None) -> bool:
-    if dtype is None:
-        return False
-    if isinstance(dtype, str) and dtype == 'nf4':
-        return True
-    try:
-        return jnp.dtype(dtype) == jnp.dtype(jnp.int4)
-    except TypeError:
-        return False
-
-
 def _rule_dot(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None, *,
               rule, lhs_weight=False, rhs_weight=True, out_sharding=None):
     if jnp.iscomplexobj(lhs) or jnp.iscomplexobj(rhs):
@@ -85,12 +74,7 @@ def _rule_dot(lhs, rhs, dimension_numbers, precision=None, preferred_element_typ
         )
         if rule.additional_qt_config:
             config = replace(config, **rule.additional_qt_config)
-        low_bit = any(_is_low_bit(dtype) for dtype in (
-            config.lhs_qtype, config.rhs_qtype, config.dlhs_grad_qtype, config.drhs_grad_qtype,
-            config.dlhs_residual_qtype, config.drhs_residual_qtype,
-        ))
-        output = (_low_bit_training_dot(lhs, rhs, dimension_numbers, config, precision)
-                  if low_bit else dot_general_qt.dot_general_qt(lhs, rhs, dimension_numbers, config))
+        output = dot_general_qt.dot_general_qt(lhs, rhs, dimension_numbers, config)
         return output if preferred_element_type is None else output.astype(preferred_element_type)
 
     def prepare(value, contracting, weight):
@@ -115,78 +99,6 @@ def _rule_dot(lhs, rhs, dimension_numbers, precision=None, preferred_element_typ
                             preferred_element_type=preferred_element_type, out_sharding=out_sharding)
 
 
-def _low_bit_training_dot(lhs, rhs, dimensions, config, precision):
-    """Portable Qwix quantization with dense contractions and quantized VJPs."""
-    from qwix._src.core import dot_general as qwix_dot
-    from qwix._src.core import qarray
-
-    if config.lhs_collect_quant_stat is not None or config.rhs_collect_quant_stat is not None:
-        raise NotImplementedError('Low-bit functional training does not maintain calibration state')
-    if config.dlhs_stochastic_rounding_noise_fn is not None or config.drhs_stochastic_rounding_noise_fn is not None:
-        raise NotImplementedError('Low-bit functional training does not support stochastic rounding')
-
-    def quantized(value, qtype, dims, other_rank, left, method, tile, disable_axes):
-        if qtype is None:
-            return value, None
-        how = qwix_dot.get_how_to_quantize(
-            dimension_numbers=dims, ndims=(value.ndim, other_rank) if left else (other_rank, value.ndim),
-            for_lhs=left, qtype=qtype, tile_size=tile, calibration_method=method,
-        )
-        if disable_axes:
-            how = replace(how, channelwise_axes=())
-        calibration = qarray.calibrate(value, how)
-        return qwix.dequantize(qarray.quantize(value, how)), calibration
-
-    def forward(a, b):
-        qa, ca = quantized(a, config.lhs_qtype, dimensions, b.ndim, True,
-                           config.lhs_calibration_method, config.tile_size, config.lhs_disable_channelwise_axes)
-        qb, cb = quantized(b, config.rhs_qtype, dimensions, a.ndim, False,
-                           config.rhs_calibration_method, config.tile_size, config.rhs_disable_channelwise_axes)
-        output = jax.lax.dot_general(qa, qb, dimensions, precision=precision)
-        return output, (a, b, ca, cb)
-
-    @jax.custom_vjp
-    def operation(a, b):
-        return forward(a, b)[0]
-
-    def backward(residuals, gradient):
-        a, b, ca, cb = residuals
-
-        def operand_gradient(for_lhs):
-            dims, permutation = dot_general_qt._update_dimension_numbers_for_backward(
-                dimensions, (a.ndim, b.ndim), for_dlhs=for_lhs,
-            )
-            prefix = 'dlhs' if for_lhs else 'drhs'
-            gtype = getattr(config, prefix + '_grad_qtype')
-            tile = getattr(config, prefix + '_tile_size')
-            original = b if for_lhs else a
-            forward_type = config.rhs_qtype if for_lhs else config.lhs_qtype
-            rtype = getattr(config, prefix + '_residual_qtype')
-            # Low-bit residuals are re-quantized along the backward contraction
-            # axes instead of applying the native storage scale-shifting trick.
-            value = original
-            if not config.use_original_residuals and forward_type is not None:
-                rtype = forward_type
-            qg, _ = quantized(gradient, gtype, dims, value.ndim, True,
-                              getattr(config, prefix + '_grad_calibration_method'), tile,
-                              getattr(config, prefix + '_grad_disable_channelwise_axes'))
-            qr, _ = quantized(value, rtype, dims, gradient.ndim, False,
-                              getattr(config, prefix + '_residual_calibration_method'), tile,
-                              getattr(config, prefix + '_residual_disable_channelwise_axes'))
-            return jax.lax.dot_general(qg, qr, dims, precision=precision).transpose(permutation)
-
-        da, db = operand_gradient(True), operand_gradient(False)
-        if not config.disable_gradient_clipping:
-            if ca is not None:
-                da = qarray.clip_gradient_to_calibration(da, a, ca, config.lhs_calibration_method)
-            if cb is not None:
-                db = qarray.clip_gradient_to_calibration(db, b, cb, config.rhs_calibration_method)
-        return da.astype(a.dtype), db.astype(b.dtype)
-
-    operation.defvjp(forward, backward)
-    return operation(lhs, rhs)
-
-
 def _as_operand(value: ArrayLike | qwix.QArray) -> Array | qwix.QArray:
     return value if isinstance(value, qwix.QArray) else jnp.asarray(value)
 
@@ -207,62 +119,22 @@ def _rule_conv(
     _validate_conv_training_rule(rule)
     dims = jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
     bwd_type = normalize_qtype(rule.bwd_qtype)
-    portable = (
-        any(_is_low_bit(dtype) for dtype in (rule.act_qtype, rule.weight_qtype, bwd_type))
-        or feature_group_count != 1 or batch_group_count != 1
-        or rule.weight_calibration_method != 'absmax'
-        or (rule.act_calibration_method or 'absmax') != 'absmax'
+    config = conv_general_qt.ConvGeneralQtConfig(
+        lhs_qtype=rule.act_qtype, rhs_qtype=rule.weight_qtype,
+        lhs_calibration_method=rule.act_calibration_method or 'absmax',
+        rhs_calibration_method=rule.weight_calibration_method,
+        lhs_disable_channelwise_axes=rule.disable_channelwise_axes,
+        rhs_disable_channelwise_axes=rule.disable_channelwise_axes,
+        dlhs_grad_qtype=bwd_type, drhs_grad_qtype=bwd_type,
+        dlhs_grad_calibration_method=rule.bwd_calibration_method,
+        drhs_grad_calibration_method=rule.bwd_calibration_method,
+        dlhs_grad_disable_channelwise_axes=rule.disable_channelwise_axes,
+        drhs_grad_disable_channelwise_axes=rule.disable_channelwise_axes,
     )
-    if not portable:
-        config = conv_general_qt.ConvGeneralQtConfig(
-            lhs_qtype=rule.act_qtype, rhs_qtype=rule.weight_qtype,
-            lhs_calibration_method=rule.act_calibration_method or 'absmax',
-            rhs_calibration_method=rule.weight_calibration_method,
-            lhs_disable_channelwise_axes=rule.disable_channelwise_axes,
-            rhs_disable_channelwise_axes=rule.disable_channelwise_axes,
-            dlhs_grad_qtype=bwd_type, drhs_grad_qtype=bwd_type,
-            dlhs_grad_calibration_method=rule.bwd_calibration_method,
-            drhs_grad_calibration_method=rule.bwd_calibration_method,
-            dlhs_grad_disable_channelwise_axes=rule.disable_channelwise_axes,
-            drhs_grad_disable_channelwise_axes=rule.disable_channelwise_axes,
-        )
-        output = conv_general_qt.conv_general_qt(
-            lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation,
-            dims, feature_group_count, batch_group_count, out_sharding,
-        )
-    else:
-        def rounded(value, dtype, axis, calibration):
-            if dtype is None:
-                return value
-            return qwix.dequantize(qwix.quantize(
-                value, dtype, channelwise_axes=() if rule.disable_channelwise_axes else (axis,),
-                calibration_method=calibration,
-            ))
-
-        def dense_conv(a, b):
-            return jax.lax.conv_general_dilated(
-                a, b, window_strides, padding, lhs_dilation, rhs_dilation,
-                dims, feature_group_count, batch_group_count, precision,
-                out_sharding=out_sharding,
-            )
-
-        def forward(a, b):
-            qa = rounded(a, rule.act_qtype, dims.lhs_spec[0], rule.act_calibration_method or 'absmax')
-            qb = rounded(b, rule.weight_qtype, dims.rhs_spec[0], rule.weight_calibration_method)
-            return dense_conv(qa, qb), (qa, qb)
-
-        @jax.custom_vjp
-        def operation(a, b):
-            return forward(a, b)[0]
-
-        def backward(residuals, gradient):
-            qa, qb = residuals
-            qg = rounded(gradient, bwd_type, dims.out_spec[0], rule.bwd_calibration_method)
-            _, pullback = jax.vjp(dense_conv, qa, qb)
-            return pullback(qg)
-
-        operation.defvjp(forward, backward)
-        output = operation(lhs, rhs)
+    output = conv_general_qt.conv_general_qt(
+        lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation,
+        dims, feature_group_count, batch_group_count, out_sharding,
+    )
     return output if preferred_element_type is None else output.astype(preferred_element_type)
 
 
@@ -318,10 +190,8 @@ def linear(
     parameters and a QtRule. Static activation scales and stochastic rounding
     are not supported by these stateless functions. QT currently does not
     support an explicit ``out_sharding`` argument.
-    INT4/NF4 training uses a portable custom-gradient path: values are
-    quantized with Qwix, then dequantized for floating-point contractions.
-    Backward residuals are requantized along their contraction axes. This
-    supports low-bit training numerics, not native low-bit acceleration.
+    Training uses Qwix QT kernels; supported formats and backward operations
+    depend on Qwix and the execution backend.
 
     Returns a dense JAX array. ``preferred_element_type`` selects its dtype,
     including after bias addition; otherwise the dtype is promoted from the

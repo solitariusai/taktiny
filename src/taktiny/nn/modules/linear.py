@@ -77,8 +77,8 @@ class Linear(Module):
         quant: Optional Qwix quantization configuration. Strings and PTQ rules
             quantize the stored kernel. QtRule (or QtProvider) keeps floating-
             point parameters and quantizes forward/backward computations;
-            ``bwd_qtype`` selects backward quantization. INT4/NF4 training
-            uses quantized values with portable floating-point contractions.
+            ``bwd_qtype`` selects backward quantization. Supported training
+            formats depend on Qwix QT kernels and the execution backend.
             QT does not support static calibration, stochastic rounding,
             explicit output sharding, or a simultaneous custom dot_general.
         dot_general: Optional implementation of ``dot_general``. It is used
