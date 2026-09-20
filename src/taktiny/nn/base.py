@@ -568,4 +568,50 @@ def module(cls):
         },
     )
 
-__all__ = ['Module', 'Parameter', 'module']
+class Pytree:
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """
+        Initializes subclasses and registers them as PyTree nodes.
+        """
+        super().__init_subclass__(**kwargs)
+        register_pytree_node_class(cls)
+
+    def extra_repr(self) -> str: return ""
+    def __repr__(self) -> str:
+        lines, _, _ = build_tree_repr("", self, is_root=True)
+        return "\n".join(lines)
+    def tree_flatten(
+        self,
+    ) -> tuple[tuple[PyTree, ...], tuple[tuple[str, ...], dict[str, Any]]]:
+        dynamic_names = []
+        dynamic_vals = []
+        static_data = {}
+
+        for k, v in self.__dict__.items():
+            if _is_dynamic(v):
+                dynamic_names.append(k)
+                dynamic_vals.append(v)
+            else:
+                static_data[k] = v
+
+        return tuple(dynamic_vals), (tuple(dynamic_names), static_data)
+
+    @classmethod
+    def tree_unflatten(
+        cls,
+        aux_data: Any,
+        children: Sequence[PyTree],
+    ) -> Self:
+        obj = object.__new__(cls)
+        dynamic_names, static_data = aux_data
+
+        obj.__dict__.update(static_data)
+        for k, v in zip(dynamic_names, children):
+            obj.__dict__[k] = v
+
+        return obj
+
+    def __call__(self, *args: Any, **kwds: Any) -> Any:
+        ...
+
+__all__ = ['Module', 'Parameter', 'module', 'Pytree']

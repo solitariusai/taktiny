@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from functools import partial
 from itertools import product
 from typing import cast
 
@@ -47,6 +48,7 @@ from taktiny.nn.utils import (
     _validate_positive_float,
     _window_output_shape,
 )
+from taktiny.utils.ops import _rule, _rule_conv, _validate_conv_training_rule
 from taktiny.utils.quantization import (
     quantize_conv_weight,
     resolve_quantization_rule,
@@ -214,7 +216,14 @@ class Conv(Module):
         rngs: Random number generator used to initialize parameters.
         kernel_initializer: Function used to initialize the kernel.
         bias_initializer: Function used to initialize the bias.
-        quant: Optional Qwix quantization configuration for the kernel.
+        quant: Optional Qwix quantization configuration. A ``QtRule`` or
+            ``QtProvider`` keeps floating-point trainable parameters and
+            quantizes convolution operands; ``bwd_qtype`` controls gradient
+            quantization. INT4/NF4 and grouped training use quantized values
+            with floating-point contractions, not native low-bit kernels.
+            Tiled training quantization and ``additional_qt_config`` are
+            unsupported. Training rules cannot be combined with ``dot_general``.
+            Other rules retain weight-only quantization behavior.
         dot_general: Optional drop-in convolution callable. The name is kept
             for compatibility with other parameterized modules.
         axis_names: Optional logical names for every kernel axis.
@@ -363,7 +372,13 @@ class Conv(Module):
             )
 
         kernel_array = kernel_initializer(rngs(), weight_shape, dtype)
-        if quant is not None:
+        selected_rule = _rule(quant, '', 'conv_general_dilated')
+        self._training_rule = selected_rule if isinstance(selected_rule, qwix.QtRule) else None
+        if self._training_rule is not None:
+            _validate_conv_training_rule(self._training_rule)
+            if dot_general is not None:
+                raise ValueError('QtRule and a custom dot_general cannot be supplied together')
+        if quant is not None and self._training_rule is None:
             rule = resolve_quantization_rule(
                 quant,
                 '',
@@ -637,6 +652,8 @@ class Conv(Module):
             self._out_channel_count,
         )
         conv_general_dilated = (
+            partial(_rule_conv, rule=self._training_rule)
+            if self._training_rule is not None else
             qwix.conv_general_dilated
             if isinstance(kernel, qwix.QArray)
             else self.dot_general or jax.lax.conv_general_dilated
@@ -736,7 +753,14 @@ class ConvTranspose(Module):
         rngs: Random number generator used to initialize parameters.
         kernel_initializer: Function used to initialize the kernel.
         bias_initializer: Function used to initialize the bias.
-        quant: Optional Qwix quantization configuration for the kernel.
+        quant: Optional Qwix quantization configuration. A ``QtRule`` or
+            ``QtProvider`` keeps floating-point trainable parameters and
+            quantizes convolution operands; ``bwd_qtype`` controls gradient
+            quantization. INT4/NF4 training uses quantized values with
+            floating-point contractions, not native low-bit kernels.
+            Tiled training quantization and ``additional_qt_config`` are
+            unsupported. Training rules cannot be combined with ``dot_general``.
+            Other rules retain weight-only quantization behavior.
         dot_general: Optional replacement for ``conv_general_dilated``.
         axis_names: Optional logical names for every kernel axis.
         partition_spec: Optional partition specification for the kernel.
@@ -873,7 +897,13 @@ class ConvTranspose(Module):
             )
 
         kernel_array = kernel_initializer(rngs(), kernel_shape, dtype)
-        if quant is not None:
+        selected_rule = _rule(quant, '', 'conv_general_dilated')
+        self._training_rule = selected_rule if isinstance(selected_rule, qwix.QtRule) else None
+        if self._training_rule is not None:
+            _validate_conv_training_rule(self._training_rule)
+            if dot_general is not None:
+                raise ValueError('QtRule and a custom dot_general cannot be supplied together')
+        if quant is not None and self._training_rule is None:
             rule = resolve_quantization_rule(
                 quant,
                 '',
@@ -1054,6 +1084,8 @@ class ConvTranspose(Module):
             ]
             group_kernel = group_kernel[reverse_slices]
             conv_general_dilated = (
+                partial(_rule_conv, rule=self._training_rule)
+                if self._training_rule is not None else
                 qwix.conv_general_dilated
                 if isinstance(group_kernel, qwix.QArray)
                 else self.dot_general or jax.lax.conv_general_dilated

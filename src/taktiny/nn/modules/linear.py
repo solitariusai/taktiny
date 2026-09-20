@@ -24,6 +24,7 @@ from jax.typing import DTypeLike
 from taktiny.nn.base import Module, Parameter
 from taktiny.nn.rng import Rngs
 from taktiny.nn.utils import _constrain, _normalize_shape
+from taktiny.utils.ops import _rule, _rule_dot
 from taktiny.utils.quantization import (
     quantize_linear_weight,
     resolve_quantization_rule,
@@ -73,7 +74,13 @@ class Linear(Module):
             to LeCun uniform initialization.
         bias_initializer: Function used to initialize the bias. Defaults to
             zeros.
-        quant: Optional Qwix quantization configuration for the kernel.
+        quant: Optional Qwix quantization configuration. Strings and PTQ rules
+            quantize the stored kernel. QtRule (or QtProvider) keeps floating-
+            point parameters and quantizes forward/backward computations;
+            ``bwd_qtype`` selects backward quantization. INT4/NF4 training
+            uses quantized values with portable floating-point contractions.
+            QT does not support static calibration, stochastic rounding,
+            explicit output sharding, or a simultaneous custom dot_general.
         dot_general: Optional implementation of ``dot_general``. It is used
             for non-quantized kernels instead of ``jax.lax.dot_general``.
         axis_names: Optional logical axis names for the kernel. The names of
@@ -142,7 +149,11 @@ class Linear(Module):
             )
 
         kernel_array = kernel_initializer(rngs(), kernel_shape, dtype)
-        if quant is not None:
+        selected_rule = _rule(quant, '', 'dot_general')
+        self._training_rule = selected_rule if isinstance(selected_rule, qwix.QtRule) else None
+        if self._training_rule is not None and dot_general is not None:
+            raise ValueError('QtRule and a custom dot_general cannot be supplied together')
+        if quant is not None and self._training_rule is None:
             rule = resolve_quantization_rule(
                 quant,
                 '',
@@ -215,7 +226,13 @@ class Linear(Module):
         )
         weight = self.kernel.value
 
-        if isinstance(weight, qwix.QArray):
+        if self._training_rule is not None:
+            out = _rule_dot(
+                x, weight, dimension_numbers, rule=self._training_rule,
+                precision=self.precision, preferred_element_type=self.preferred_element_type,
+                out_sharding=out_sharding,
+            )
+        elif isinstance(weight, qwix.QArray):
             out = qwix.dot_general(
                 x,
                 weight,
