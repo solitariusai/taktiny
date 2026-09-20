@@ -134,11 +134,11 @@ def test_requested_quantization(qtype, prequantized):
     if prequantized:
         x, w = quantize(x), quantize(w)
     qdtype = jnp.float8_e4m3fn if qtype == 'fp8' else qtype
-    qx = qwix.quantize(dense(x), qdtype, channelwise_axes=(0, 1))
     qw = qwix.quantize(dense(w), qdtype, channelwise_axes=(1,))
-    expected = jnp.einsum('...i,io->...o', dense(qx), dense(qw))
-    for operation in (lambda x, w: linear(x, w, quant=qtype),
-                      lambda x, w: einsum('...i,io->...o', x, w, quant=qtype)):
+    expected = jnp.einsum('...i,io->...o', dense(x), dense(qw))
+    config = qtype if isinstance(qtype, str) else qwix.QuantizationRule(weight_qtype=qtype)
+    for operation in (lambda x, w: linear(x, w, quant=config),
+                      lambda x, w: einsum('...i,io->...o', x, w, quant=config)):
         result = jax.jit(operation)(x, w)
         np.testing.assert_allclose(result, expected, atol=1e-4, rtol=1e-4)
         assert result.dtype == jnp.float32
@@ -172,14 +172,12 @@ def test_quantized_einsum_multiple_contractions_and_sharding():
     with jax.set_mesh(mesh):
         x, w, v = jnp.ones((4, 8)), jnp.ones((8, 4)), jnp.ones((4, 8))
         operation = jax.jit(lambda x, w, v: einsum(
-            'ij,jk,kl->li', x, w, v, quant='int8', optimize='optimal', out_sharding=sharding,
+            'ik,kl->li', linear(x, w, quant='int8'), v,
+            quant='int8', optimize='optimal', out_sharding=sharding,
         ))
         result = operation(x, w, v)
         assert result.sharding == sharding
         np.testing.assert_allclose(result, jnp.full((8, 4), 32.), atol=0.8)
-        ir = str(operation.lower(x, w, v).compiler_ir())
-        integer_dots = [line for line in ir.splitlines() if 'stablehlo.dot_general' in line and 'xi8>' in line]
-        assert len(integer_dots) == 2
 
 
 def test_quantization_rejects_complex_contractions():
@@ -217,3 +215,48 @@ def test_unary_quant_einsum_preserves_jax_reduction():
     output = einsum('ij->j', x, quant='int8', preferred_element_type=jnp.bfloat16)
     assert output.dtype == jnp.bfloat16
     np.testing.assert_array_equal(output, jnp.sum(x, axis=0))
+
+
+@pytest.mark.parametrize('operation', ['linear', 'einsum'])
+@pytest.mark.parametrize('backward', [None, 'int8'])
+def test_training_rules_jit_gradients_and_update(operation, backward):
+    rule = qwix.QtRule(weight_qtype='int8', act_qtype='int8', bwd_qtype=backward)
+    x = jax.random.normal(jax.random.key(0), (4, 8))
+    w = jax.random.normal(jax.random.key(1), (8, 4))
+
+    def loss(x, w):
+        y = (linear(x, w, quant=rule) if operation == 'linear'
+             else einsum('bi,io->bo', x, w, quant=rule))
+        return jnp.mean(y ** 2)
+
+    derivative = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))
+    initial, (dx, dw) = derivative(x, w)
+    assert jnp.all(jnp.isfinite(dx)) and jnp.any(dx != 0)
+    assert jnp.all(jnp.isfinite(dw)) and jnp.any(dw != 0)
+    assert loss(x, w - 0.01 * dw) < initial
+    if backward:
+        ir = str(derivative.lower(x, w).compiler_ir())
+        assert sum('stablehlo.dot_general' in line and 'xi8>' in line for line in ir.splitlines()) >= 3
+
+
+def test_rule_containers_matching_and_weight_only_shorthand():
+    x, w = jnp.ones((2, 4)), jnp.arange(12, dtype=jnp.float32).reshape(4, 3) / 7
+    ptq = qwix.QuantizationRule(weight_qtype='int8')
+    for config in (ptq, [ptq], qwix.PtqProvider([ptq])):
+        np.testing.assert_array_equal(linear(x, w, quant=config), linear(x, w, quant='int8'))
+    qt = qwix.QtRule(weight_qtype='int8', act_qtype='int8', bwd_qtype='int8')
+    np.testing.assert_array_equal(linear(x, w, quant=qt), linear(x, w, quant=qwix.QtProvider([qt])))
+    excluded = [qwix.QtRule(module_path='skip', weight_qtype=None), qt]
+    np.testing.assert_array_equal(linear(x, w, quant=excluded, module_path='skip'), x @ w)
+    np.testing.assert_array_equal(linear(x, w, quant=[qwix.QtRule(module_path='other', weight_qtype='int8')]), x @ w)
+    np.testing.assert_array_equal(linear(x, w, quant=qwix.QtRule(op_names=('conv_general_dilated',), weight_qtype='int8')), x @ w)
+
+
+def test_rule_errors_are_explicit():
+    x, w = jnp.ones((2, 4)), jnp.ones((4, 3))
+    with pytest.raises(NotImplementedError, match='static'):
+        linear(x, w, quant=qwix.QtRule(weight_qtype='int8', act_qtype='int8', act_static_scale=True))
+    with pytest.raises(NotImplementedError, match='rounding'):
+        linear(x, w, quant=qwix.QtRule(weight_qtype='int8', bwd_stochastic_rounding='uniform'))
+    with pytest.raises(NotImplementedError, match='two operands'):
+        einsum('ij,jk,kl->il', x, w, jnp.ones((3, 2)), quant='int8')

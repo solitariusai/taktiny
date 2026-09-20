@@ -64,14 +64,14 @@ def quantization_rules(quantization: Any) -> tuple[qwix.QuantizationRule, ...]:
         )
     if isinstance(quantization, qwix.QuantizationRule):
         return (quantization,)
-    if isinstance(quantization, qwix.PtqProvider):
+    if isinstance(quantization, (qwix.PtqProvider, qwix.QtProvider)):
         return tuple(quantization._rules)  # Qwix exposes no public rule accessor.
     if isinstance(quantization, Sequence):
         rules = tuple(quantization)
         if all(isinstance(rule, qwix.QuantizationRule) for rule in rules):
             return rules
     raise TypeError(
-        'quant must be a Qwix QuantizationRule, PtqProvider, '
+        'quant must be a Qwix QuantizationRule, PtqProvider, QtProvider, '
         'a sequence of rules, or a qtype string'
     )
 
