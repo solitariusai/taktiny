@@ -1,5 +1,4 @@
 # Copyright 2026 Shinapri.
-# coding=utf-8
 # Copyright 2025 Optuna, Hugging Face
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
