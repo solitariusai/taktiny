@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import re
+from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -336,4 +337,132 @@ def einsum(
     return output.astype(result_dtype)
 
 
-__all__ = ['linear', 'einsum']
+def conv_general_dilated(
+    lhs: ArrayLike | qwix.QArray,
+    rhs: ArrayLike | qwix.QArray,
+    window_strides: Sequence[int],
+    padding: str | Sequence[tuple[int, int]],
+    lhs_dilation: Sequence[int] | None = None,
+    rhs_dilation: Sequence[int] | None = None,
+    dimension_numbers: tuple[str, str, str] | jax.lax.ConvDimensionNumbers | None = None,
+    feature_group_count: int = 1,
+    batch_group_count: int = 1,
+    precision: PrecisionLike = None,
+    preferred_element_type: DTypeLike | None = None,
+    *,
+    out_sharding: NamedSharding | None = None,
+    quant: QuantConfig = None,
+    module_path: str = '',
+) -> Array:
+    """Convolve activations ``lhs`` with kernel ``rhs`` using JAX or Qwix.
+
+    Layout, strides, dilation, and grouping follow
+    ``jax.lax.conv_general_dilated``. ``dimension_numbers`` describes input,
+    kernel, and output layouts, e.g. ``('NWC', 'WIO', 'NWC')`` for channels-last
+    1-D convolution. Padding is ``'VALID'``, ``'SAME'``, ``'SAME_LOWER'``, or
+    one ``(low, high)`` pair per spatial dimension. Dilation inserts gaps in
+    the input or kernel; strides control output sampling.
+
+    Dense array-like inputs use JAX; QArrays use Qwix. ``quant`` accepts a
+    weight-only dtype string, a Qwix rule, a rule sequence, or PtqProvider /
+    QtProvider. Rules match ``module_path`` and ``conv_general_dilated`` in
+    first-match order. A selected rule dequantizes existing QArrays before
+    applying its ``act_qtype`` to lhs and ``weight_qtype`` to rhs. Unmatched
+    or disabled rules use dense computation.
+
+    Ordinary rules quantize operands at each call. For training, use floating-
+    point parameters and QtRule; ``bwd_qtype`` controls backward quantization
+    through Qwix QT. Supported formats and gradients depend on Qwix and the
+    backend. Tiled convolution quantization, static activation calibration,
+    QT stochastic rounding, and convolution ``additional_qt_config`` are
+    unsupported.
+
+    Returns a dense array. ``preferred_element_type`` selects the result dtype;
+    otherwise operand dtypes (scale dtypes for QArrays) are promoted. FP8
+    inputs promote to BF16 and quantized integer inputs to FP32. Precision is
+    forwarded to JAX/PTQ; Qwix QT controls its own contraction precision.
+    ``out_sharding`` is forwarded to the convolution operation.
+
+    Example:
+        >>> conv_general_dilated(
+        ...     jnp.ones((1, 8, 2)), jnp.ones((3, 2, 4)), (1,), 'SAME',
+        ...     dimension_numbers=('NWC', 'WIO', 'NWC'),
+        ... ).shape
+        (1, 8, 4)
+    """
+    lhs, rhs = _as_operand(lhs), _as_operand(rhs)
+    if isinstance(quant, str):
+        quant = qwix.QuantizationRule(weight_qtype=normalize_qtype(quant))
+    rule = _rule(quant, module_path, 'conv_general_dilated')
+    implicit_dtype = _dtype(lhs, rhs, quantized=rule is not None)
+    result_dtype = implicit_dtype \
+        if preferred_element_type is None\
+            else jnp.dtype(preferred_element_type)
+    compute_dtype = jnp.result_type(implicit_dtype, result_dtype)
+    dims = jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
+    kwargs: dict[str, Any] = dict(
+        window_strides=window_strides, 
+        padding=padding, 
+        lhs_dilation=lhs_dilation,
+        rhs_dilation=rhs_dilation, 
+        dimension_numbers=dims,
+        feature_group_count=feature_group_count, 
+        batch_group_count=batch_group_count,
+        precision=precision, 
+        preferred_element_type=compute_dtype, 
+        out_sharding=out_sharding,
+    )
+    if rule is not None:
+        left, right = _dense(lhs).astype(compute_dtype), _dense(rhs).astype(compute_dtype)
+        if jnp.iscomplexobj(left) or jnp.iscomplexobj(right):
+            raise TypeError('quantized operations require real-valued operands')
+        if isinstance(rule, qwix.QtRule):
+            output = _rule_conv(left, right, rule=rule, **kwargs)
+        else:
+            if rule.tile_size is not None:
+                raise NotImplementedError('Convolution does not support tiled quantization')
+
+            def prepare(value, qtype, axis, calibration):
+                if qtype is None:
+                    return value
+                return qwix.quantize(
+                    value, 
+                    qtype, 
+                    calibration_method=calibration,
+                    channelwise_axes=(axis,)
+                )
+
+            output = qwix.conv_general_dilated(
+                prepare(
+                    left, 
+                    rule.act_qtype, 
+                    dims.lhs_spec[0], 
+                    rule.act_calibration_method or 'absmax'
+                ),
+                prepare(
+                    right, 
+                    rule.weight_qtype, 
+                    dims.rhs_spec[0], 
+                    rule.weight_calibration_method
+                ),
+                **kwargs,
+            )
+    elif quant is None and (isinstance(lhs, qwix.QArray) or isinstance(rhs, qwix.QArray)):
+        output = qwix.conv_general_dilated(
+            _promote(lhs, compute_dtype), 
+            _promote(rhs, compute_dtype), 
+            **kwargs
+        )
+    else:
+        output = jax.lax.conv_general_dilated(
+            _dense(lhs).astype(compute_dtype), 
+            _dense(rhs).astype(compute_dtype), 
+            **kwargs,
+        )
+    return output.astype(result_dtype)
+
+
+def dot_general(): ...
+
+
+__all__ = ['linear', 'einsum', 'conv_general_dilated']
