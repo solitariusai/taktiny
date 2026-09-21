@@ -98,6 +98,40 @@ def test_orbax_checkpoint_is_readable_without_trainer(tmp_path):
     assert state['process_count'] == 1
 
 
+@pytest.mark.parametrize('split_step', [2, 3])
+@pytest.mark.parametrize('accumulation', [1, 2])
+def test_scheduled_resume_matches_every_step_and_optimizer(tmp_path, split_step, accumulation):
+    # Keep the schedule horizon identical across interrupted and full runs.
+    schedule = optax.warmup_cosine_decay_schedule(0.0, 0.03, 2, 8)
+    config = dict(
+        schedule=schedule, optimizer=optax.adamw(schedule), jit_compile=True,
+        gradient_accumulation_steps=accumulation, ema_decay=0.8,
+        save_at_end=True, save_async=True,
+    )
+    reference = make_trainer(max_steps=8, output_dir=tmp_path / 'full', **config)
+    reference.train()
+    partial = make_trainer(max_steps=split_step, output_dir=tmp_path / 'split', **config)
+    partial.train()
+    resumed = make_trainer(max_steps=8, output_dir=tmp_path / 'split', **config)
+    resumed.train('latest')
+
+    assert_trees_equal(reference.model, resumed.model)
+    assert_trees_equal(reference.ema, resumed.ema)
+    np.testing.assert_array_equal(jax.random.key_data(reference.rngs.key),
+                                  jax.random.key_data(resumed.rngs.key))
+    assert resumed.micro_step == reference.micro_step
+    assert len(reference.log_history) == len(resumed.log_history) == 8
+    for expected, actual in zip(reference.log_history, resumed.log_history):
+        assert actual['step'] == expected['step']
+        for field in ('loss', 'learning_rate', 'grad_norm'):
+            assert actual[field] == pytest.approx(expected[field], rel=1e-6, abs=1e-7)
+
+    with ocp.StandardCheckpointer() as checkpointer:
+        full_state = checkpointer.restore(str(tmp_path / 'full/checkpoint-8/optimizer_state'))
+        split_state = checkpointer.restore(str(tmp_path / 'split/checkpoint-8/optimizer_state'))
+    assert_trees_equal(full_state, split_state)
+
+
 class StatefulLoader:
     def __init__(self, binary=False):
         self.binary = binary
