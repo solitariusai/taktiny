@@ -34,6 +34,19 @@ rules are resolved at construction; the mesh is captured when creating an
 iterator. Placement occurs after batching and retains the iterator's Grain
 checkpoint methods. Existing record-shard and worker arguments are unchanged.
 
+For data already available through an in-memory source, Grain's default reader
+threads may add overhead. Configure its reader separately from worker processes:
+
+```python
+import grain.python as grain
+
+dataloader = DataLoader(
+    source,
+    batch_size=4096,
+    read_options=grain.ReadOptions(num_threads=0, prefetch_buffer_size=0),
+)
+```
+
 ```{eval-rst}
 .. autoclass:: taktiny.data.DataLoader
    :members:

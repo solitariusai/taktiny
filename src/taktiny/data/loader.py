@@ -171,6 +171,9 @@ class DataLoader(grain.DataLoader):
         worker_count: Child workers; 0 runs locally, None lets Grain choose.
             Sources and transforms must be serializable when workers are used.
         worker_buffer_size: Positive per-worker prefetch buffer size.
+        read_options: Grain reader settings. None uses Grain's defaults. For an
+            in-memory source, ``grain.ReadOptions(num_threads=0,
+            prefetch_buffer_size=0)`` avoids threaded record prefetching.
         axis_names: Logical axis names for output arrays, or a mapping from
             batch fields to axis names. Names describe the final batched rank
             and override partition_spec for that field, using logical rules
@@ -210,6 +213,7 @@ class DataLoader(grain.DataLoader):
         shard_count: int = 1,
         worker_count: int | None = 0,
         worker_buffer_size: int = 1,
+        read_options: grain.ReadOptions | None = None,
         axis_names: AxisNames | Mapping[str, AxisNames | None] | None = None,
         partition_spec: PartitionSpec | Mapping[str, PartitionSpec | None] | None = None,
     ) -> None:
@@ -344,6 +348,7 @@ class DataLoader(grain.DataLoader):
             operations=operations,
             worker_count=worker_count,
             worker_buffer_size=worker_buffer_size,
+            read_options=read_options,
         )
 
     def __iter__(self):
