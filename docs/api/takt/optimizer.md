@@ -11,6 +11,16 @@ advances its own state; it does not store the model.
 
 ## Example
 
+Use `include` to select parameters by full regex match against dot-separated
+paths. For example, `Optimizer(model, optax.adamw(1e-3), include=[r'.*lora_A.*',
+r'.*lora_B.*'])` updates only matching leaves. Unselected leaves receive no
+weight decay or optimizer moments. `None` selects the full tree; `[]` freezes
+everything. Nonempty patterns matching nothing raise an error.
+
+When `include` is supplied, Optax receives a flat dictionary of selected paths.
+Any optimizer masks or tree-shaped extra arguments must match that dictionary.
+Selection does not remove the cost of computing gradients for frozen leaves.
+
 Pass the optimizer into a compiled training step and return it alongside the
 model so its updated state is available to the next step.
 

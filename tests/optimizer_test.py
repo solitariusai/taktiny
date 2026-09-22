@@ -8,6 +8,48 @@ from taktiny import nn
 from taktiny.takt.optimizer import Optimizer
 
 
+@pytest.mark.parametrize('compiled', [False, True])
+def test_include_freezes_updates_and_moments(compiled):
+    model = nn.Linear(2, 1, rngs=nn.Rngs(0))
+    optimizer = Optimizer(model, optax.adamw(0.1, weight_decay=0.5), include=['bias'])
+    assert set(optimizer.state[0].mu) == {'bias'}
+    kernel = model.kernel.value
+
+    def step(model, optimizer):
+        grads = jax.tree.map(jnp.ones_like, model)
+        return optimizer.update(model, grads), optimizer
+
+    if compiled:
+        step = jax.jit(step)
+    for _ in range(3):
+        model, optimizer = step(model, optimizer)
+    np.testing.assert_array_equal(model.kernel.value, kernel)
+    assert jnp.any(model.bias.value != 0)
+    assert int(optimizer.state[0].count) == 3
+
+
+def test_include_nested_paths_and_empty():
+    model = {'layers': [nn.Linear(2, 1, rngs=nn.Rngs(0))]}
+    optimizer = Optimizer(model, optax.adam(0.1), include=[r'layers\.0\.kernel'])
+    assert set(optimizer.state[0].mu) == {'layers.0.kernel'}
+    frozen = Optimizer(model, optax.adamw(0.1), include=[])
+    assert not frozen.state[0].mu
+    updated = frozen.update(model, jax.tree.map(jnp.ones_like, model))
+    assert_tree_close(updated, model)
+    assert int(frozen.state[0].count) == 0
+
+
+def test_include_validation():
+    model = {'weight': jnp.ones(2)}
+    with pytest.raises(ValueError, match='matched no'):
+        Optimizer(model, optax.adam(0.1), include=['missing'])
+    with pytest.raises(TypeError, match='sequence'):
+        Optimizer(model, optax.adam(0.1), include='weight')
+    optimizer = Optimizer(model, optax.adam(0.1), include=['weight'])
+    with pytest.raises(ValueError, match='structures'):
+        optimizer.update({'other': jnp.ones(2)}, model)
+
+
 def assert_tree_close(actual, expected):
     assert jax.tree.structure(actual) == jax.tree.structure(expected)
     for a, b in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
