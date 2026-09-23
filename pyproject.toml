@@ -1,6 +1,6 @@
 [project]
 name = "taktiny"
-version = "0.0.1rc1"
+version = "0.0.1"
 description = "Build, train, and scale neural networks with JAX."
 requires-python = ">=3.12"
 authors = [
@@ -9,9 +9,8 @@ authors = [
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE.md" }
 dependencies = [
-    "aqtp>=0.9.0",
     "grain>=0.2.18",
-    "jax>=0.10.2",
+    "jax>=0.10.2,<0.11.2",
     "optax>=0.2.8",
     "orbax-checkpoint>=0.12.1",
     "qwix>=0.1.8",
@@ -41,6 +40,11 @@ Repository = "https://github.com/solitariusai/taktiny"
 Issues = "https://github.com/solitariusai/taktiny/issues"
 
 [project.optional-dependencies]
+cuda = ["jax[cuda]"]
+cuda12 = ["jax[cuda12]"]
+cuda13 = ["jax[cuda13]"]
+rocm7-local = ["jax[rocm7-local]"]
+tpu = ["jax[tpu]"]
 tensorboard = ["tensorboardX"]
 wandb = ["wandb"]
 reporting = ["tensorboardX", "wandb"]
@@ -52,8 +56,6 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "datasets>=5.0.1",
-    "equinox>=0.13.8",
-    "flax>=0.12.7",
     "matplotlib>=3.11.1",
     "optax>=0.2.8",
     "pytest>=9.1.1",
@@ -66,6 +68,7 @@ docs = [
     "myst-parser>=4.0.0",
     "sphinx>=9.0.0",
     "sphinx-autodoc-typehints>=3.0.0",
+    "sphinx-codeautolink>=0.18.1",
     "sphinx-copybutton>=0.5.2",
     "sphinx-design>=0.7.0",
     "taktiny",
@@ -96,4 +99,3 @@ select = ["E", "F", "I", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "F403", "F405"]
-
