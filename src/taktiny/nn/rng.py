@@ -59,6 +59,37 @@ class Rngs:
         self._key, _k = jax.random.split(self._key, 2)
         return _k
 
+    def split_key(self, num_splits: int) -> tuple[jax.Array, ...]:
+        """Return independent keys and advance this stream once.
+
+        Args:
+            num_splits: Number of keys to return; must be a positive integer.
+
+        Returns:
+            A tuple of ``num_splits`` keys. The first key from the split is
+            retained as this stream's new state.
+        """
+        if isinstance(num_splits, bool) or not isinstance(num_splits, int):
+            raise TypeError('num_splits must be a positive integer')
+        if num_splits < 1:
+            raise ValueError('num_splits must be a positive integer')
+
+        splits = jax.random.split(self.key, num_splits + 1)
+        self._key = splits[0]
+        return tuple(splits[1:])
+
+    def split_rngs(self, num_splits: int) -> tuple[Rngs, ...]:
+        """Return independent ``Rngs`` streams and advance this stream once.
+
+        Args:
+            num_splits: Number of streams to return; must be a positive integer.
+
+        Returns:
+            A tuple of ``num_splits`` streams, each initialized from a
+            distinct key returned by :meth:`split_key`.
+        """
+        return tuple(Rngs(rng) for rng in self.split_key(num_splits))
+
     @property
     def key(self) -> PRNGKey:
         """Return the current PRNGKey state.

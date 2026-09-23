@@ -15,7 +15,8 @@
 from __future__ import annotations
 
 import typing as tp
-from collections.abc import Iterator, Mapping, Sequence
+import re
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Any, Self
 
 import jax
@@ -63,6 +64,24 @@ def iter_children(obj: object) -> Iterator[tuple[str, Module | Parameter]]:
             for key, x in v.items():
                 name = str(key) if k == 'layers' else f'{k}.{key}'
                 yield name, x
+
+
+def _state_include_paths(
+    paths: Iterable[str], include: Sequence[str],
+) -> set[str]:
+    """Select parameter paths using Optimizer-style full regex matches."""
+    if isinstance(include, str) or not isinstance(include, Sequence):
+        raise TypeError('include must be a sequence of regex strings or None')
+    if any(not isinstance(pattern, str) for pattern in include):
+        raise TypeError('include must contain regex strings')
+    patterns = tuple(re.compile(pattern) for pattern in include)
+    selected = {
+        path for path in paths
+        if any(pattern.fullmatch(path) for pattern in patterns)
+    }
+    if patterns and not selected:
+        raise ValueError('include patterns matched no parameter paths')
+    return selected
 
 def build_tree_repr(
     name: str,
@@ -196,9 +215,11 @@ class Module:
         return self
 
     def extra_repr(self) -> str: return ""
+
     def __repr__(self) -> str:
         lines, _, _ = build_tree_repr("", self, is_root=True)
         return "\n".join(lines)
+
     def tree_flatten(
         self,
     ) -> tuple[tuple[PyTree, ...], tuple[tuple[str, ...], dict[str, Any]]]:
@@ -230,22 +251,28 @@ class Module:
 
         return obj
 
-    def flat_state_dict(self, prefix: str = '') -> StateDict:
+    def flat_state_dict(
+        self, prefix: str = '', *, include: Sequence[str] | None = None,
+    ) -> StateDict:
         """Returns a flattened dictionary containing the module's state.
 
         Args:
             prefix (str, optional): A prefix to prepend to all keys. Defaults to ''.
+            include: Full-match regexes for dotted parameter paths, including
+                ``prefix``. ``None`` includes all paths; an empty sequence
+                includes none. Nonempty patterns matching nothing raise
+                ``ValueError``.
 
         Returns:
             StateDict: A dictionary mapping flattened parameter names to their values.
         """
-        state = {}
-        for name, child in iter_children(self):
-            if isinstance(child, Parameter):
-                state[prefix + name] = child.value
-            elif isinstance(child, Module):
-                state.update(child.flat_state_dict(prefix + name + '.'))
-        return state
+        parameters = self.flat_parameter_dict(prefix)
+        selected = None if include is None else _state_include_paths(parameters, include)
+        return {
+            name: parameter.value
+            for name, parameter in parameters.items()
+            if selected is None or name in selected
+        }
 
     def flat_parameter_dict(self, prefix: str = '') -> ParameterDict:
         """Returns a flattened dictionary containing the module's parameters.
@@ -264,51 +291,89 @@ class Module:
                 state.update(child.flat_parameter_dict(prefix + name + '.'))
         return state
 
-    def state_dict(self) -> StateDict:
+    def state_dict(self, *, include: Sequence[str] | None = None) -> StateDict:
         """Returns a hierarchical dictionary containing the module's state.
+
+        Args:
+            include: Full-match regexes for dotted parameter paths. ``None``
+                includes all paths; an empty sequence includes none. Empty
+                branches are omitted when filtering. Nonempty patterns
+                matching nothing raise ``ValueError``.
 
         Returns:
             StateDict: A nested dictionary representing the module state.
         """
-        state = {}
-        for name, child in iter_children(self):
-            if isinstance(child, Parameter):
-                state[name] = child.value
-            elif isinstance(child, Module):
-                state[name] = child.state_dict()
-        return state
+        selected = None if include is None else _state_include_paths(
+            self.flat_parameter_dict(), include,
+        )
+
+        def collect(module: Module, prefix: str) -> StateDict:
+            state: StateDict = {}
+            for name, child in iter_children(module):
+                path = prefix + name
+                if isinstance(child, Parameter):
+                    if selected is None or path in selected:
+                        state[name] = child.value
+                elif isinstance(child, Module):
+                    nested = collect(child, path + '.')
+                    if selected is None or nested:
+                        state[name] = nested
+            return state
+
+        return collect(self, '')
 
     def load_flat_state_dict(
         self,
         state: Mapping[str, PyTree],
         prefix: str = '',
+        *,
+        include: Sequence[str] | None = None,
     ) -> None:
         """Loads state values from a flattened dictionary into the module.
 
         Args:
             state (Mapping[str, PyTree]): Flattened dictionary of state values.
             prefix (str, optional): Prefix used in the flattened keys. Defaults to ''.
+            include: Full-match regexes for dotted target parameter paths,
+                including ``prefix``. Only selected keys present in ``state``
+                are loaded. ``None`` selects all; an empty sequence selects
+                none. Nonempty patterns matching nothing raise ``ValueError``.
         """
-        for name, child in iter_children(self):
-            if isinstance(child, Parameter):
-                full_name = prefix + name
-                if full_name in state:
-                    child._value = state[full_name]
-            elif isinstance(child, Module):
-                child.load_flat_state_dict(state, prefix + name + '.')
+        parameters = self.flat_parameter_dict(prefix)
+        selected = None if include is None else _state_include_paths(parameters, include)
+        for name, parameter in parameters.items():
+            if (selected is None or name in selected) and name in state:
+                parameter._value = state[name]
 
-    def load_state_dict(self, state: Mapping[str, PyTree]) -> None:
+    def load_state_dict(
+        self, state: Mapping[str, PyTree], *, include: Sequence[str] | None = None,
+    ) -> None:
         """Loads state values from a hierarchical dictionary into the module.
 
         Args:
             state (Mapping[str, PyTree]): Hierarchical dictionary of state values.
+            include: Full-match regexes for dotted target parameter paths.
+                Only selected keys present in ``state`` are loaded. ``None``
+                selects all; an empty sequence selects none. Nonempty patterns
+                matching nothing raise ``ValueError``.
         """
-        for name, child in iter_children(self):
-            if isinstance(child, Parameter):
-                if name in state:
-                    child._value = state[name]
-            elif isinstance(child, Module) and name in state:
-                child.load_state_dict(state[name])
+        selected = None if include is None else _state_include_paths(
+            self.flat_parameter_dict(), include,
+        )
+
+        def assign(module: Module, values: Mapping[str, PyTree], prefix: str) -> None:
+            for name, child in iter_children(module):
+                path = prefix + name
+                if isinstance(child, Parameter):
+                    if (selected is None or path in selected) and name in values:
+                        child._value = values[name]
+                elif (isinstance(child, Module) and name in values
+                      and (selected is None or any(
+                          full_name.startswith(path + '.') for full_name in selected
+                      ))):
+                    assign(child, values[name], path + '.')
+
+        assign(self, state, '')
 
     def __call__(self, *args: Any, **kwds: Any) -> Any:
         ...
@@ -325,7 +390,8 @@ class Parameter(Module):
             Note that this does not automatically freeze the parameter in raw JAX; it must be explicitly 
             filtered (e.g., by Taktiny's Trainer or JAX tree utilities) before being passed to an optimizer. Defaults to True.
         axis_names (AxisNames | None, optional): Logical axis names for advanced sharding or tensor parallelism. Defaults to None.
-        partition_spec (PartitionSpec | None, optional): Explicit hardware sharding specification. If provided along with axis_names, active logical mapping rules will override this value. Defaults to None.
+        partition_spec (PartitionSpec | None, optional): Explicit hardware sharding specification. If provided along with axis_names,
+            active logical mapping rules will override this value. Defaults to None.
         metadata (dict[str, Any] | Sequence[tuple[str, Any]] | None, optional): Optional metadata dictionary for custom layer logic. Defaults to None.
 
     Example:
