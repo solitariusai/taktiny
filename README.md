@@ -1,56 +1,44 @@
 # Taktiny
 
-Taktiny modules are Python objects registered as JAX PyTrees. The library does
-not assume a particular model architecture or dataset format, and its
-components can be used independently.
+A neural networks library for JAX. Build models from Python modules, pass them
+through JAX transformations, and use the data and training tools that fit your
+project.
 
-The project is experimental and APIs may change.
+Taktiny is experimental; APIs may change.
 
+[Installation](docs/getting_started/installation.md) ·
 [Quickstart](docs/getting_started/quickstart.md) ·
 [Guides](docs/index.md) ·
 [API reference](docs/api/nn.md)
 
-## What’s included
+## Install
 
-- **Models:** `Module` and `Parameter`, linear and convolutional layers,
-  embeddings, normalization, recurrent layers, attention, and other neural
-  network components.
-- **Data:** Grain-backed data loading, transforms, batching, and packing for
-  caller-provided records.
-- **Training:** An Optax-based trainer with evaluation, callbacks, gradient
-  accumulation, and Orbax checkpoints.
-- **Sharding:** Partition specifications and logical axis mappings for JAX
-  device meshes.
-- **Adapters:** LoRA, DoRA, AdaLoRA, LoHa, LoKr, and VeRA.
-- **Quantization:** Quantization utilities backed by Qwix.
-
-The data, training, and model APIs can also be used separately with existing
-JAX code.
-
-## Installation
-
-Taktiny requires Python **3.12+** and JAX **0.10.2+**.
-
-Install with `uv`:
+Taktiny requires Python 3.12 or newer. Install the PyPI release with `uv` or
+`pip`:
 
 ```bash
-uv add git+https://github.com/solitariusai/taktiny.git@experiment
+uv add taktiny
+# or
+pip install taktiny
 ```
 
-Or with `pip`:
+The default installation uses JAX on CPU. For accelerator extras and source
+installs, see the [installation guide](docs/getting_started/installation.md).
+The `master` branch is the more-stable source branch; `experiment` has newer,
+less-tested changes.
 
-```bash
-pip install git+https://github.com/solitariusai/taktiny.git@experiment
-```
+## Build and train a model
 
-## Define a model
-
-Modules hold their parameters directly and are registered as JAX PyTrees.
+Modules own their parameters and are JAX PyTrees. Pass a model and optimizer
+through a compiled training step just as you would pass arrays:
 
 ```python
 import jax
 import jax.numpy as jnp
+import optax
+
 from taktiny import nn
+from taktiny.takt import Optimizer
 
 
 class MLP(nn.Module):
@@ -63,124 +51,70 @@ class MLP(nn.Module):
 
 
 model = MLP(rngs=nn.Rngs(0))
+optimizer = Optimizer(model, optax.adam(1e-2))
 
-jit_model = jax.jit(model)
-output = jit_model(jnp.ones((4, 8)))
 
-assert output.shape == (4, 1)
+@jax.jit
+def train_step(model, optimizer, x, y):
+    def loss_fn(model):
+        return jnp.mean((model(x) - y) ** 2)
+
+    loss, grads = jax.value_and_grad(loss_fn)(model)
+    model = optimizer.update(model, grads)
+    return model, optimizer, loss
+
+
+x = jax.random.normal(jax.random.key(1), (32, 8))
+y = jnp.sum(x, axis=-1, keepdims=True)
+
+for _ in range(20):
+    model, optimizer, loss = train_step(model, optimizer, x, y)
+
+print(loss)
 ```
 
-Passing the model as an argument to a compiled function makes its parameters
-part of the function inputs rather than capturing them in a closure.
+`Optimizer(include=[r"hidden\..*"])` selects parameters by full regex match
+when you want to update only part of a model. The
+[quickstart](docs/getting_started/quickstart.md) continues with data loading,
+evaluation, and inference.
 
-## Prepare data and train
+## Work with weights
 
-The following example trains the model above on in-memory records.
+Use dotted paths to obtain or load a subset of parameters:
 
 ```python
-import numpy as np
-import optax
+hidden_state = model.flat_state_dict(include=[r"hidden\..*"])
 
-from taktiny.data import DataLoader
-from taktiny.trainer import DatasetConfig, Trainer, TrainingConfig
-
-
-inputs = np.random.default_rng(0).normal(size=(32, 8)).astype(np.float32)
-records = [{"x": x, "y": x.sum(keepdims=True)} for x in inputs]
-
-loader = DataLoader(
-    records,
-    batch_size=8,
-    shuffle=True,
-    seed=0,
-    num_epochs=None,
-)
-
-
-def loss_fn(model, batch):
-    return jnp.mean((model(batch["x"]) - batch["y"]) ** 2)
-
-
-trainer = Trainer(
-    model=model,
-    loss_fn=loss_fn,
-    training_config=TrainingConfig(
-        max_steps=20,
-        optimizer=optax.adam(1e-3),
-        log_interval=10,
-    ),
-    dataset_config=DatasetConfig(
-        train_dataloader=loader,
-    ),
-)
-
-trainer.train()
-
-assert trainer.global_step == 20
+restored = MLP(rngs=nn.Rngs(2))
+restored.load_flat_state_dict(hidden_state, include=[r"hidden\..*"])
 ```
 
-`Trainer` accepts iterables of batches. Checkpointing is optional.
+`state_dict()` and `load_state_dict()` offer the same `include` filter with a
+nested dictionary. All four methods accept `None` for the full state or `[]`
+for no parameters. See the [checkpoint guide](docs/guides/checkpoint.md) for
+saving to disk and restoring sharded weights.
 
-See the [trainer guide](docs/guides/trainer.md) for evaluation, saving, and
-resuming.
+## Explore
 
-## Apply an adapter
-
-Adapters can be applied to matching module paths.
-
-```python
-from taktiny.takt import LoRAAdapter, Takt
-
-
-adapted = MLP(rngs=nn.Rngs(1))
-
-adapted = Takt.apply_adapter(
-    adapted,
-    LoRAAdapter(
-        targets="hidden",
-        rank=4,
-        alpha=8,
-        rngs=nn.Rngs(2),
-    ),
-)
-
-assert adapted(jnp.ones((4, 8))).shape == (4, 1)
-```
-
-`targets` accepts module-path regex patterns. Applying an adapter freezes
-existing parameters and adds trainable adapter parameters.
-
-See the [PEFT guide](docs/guides/peft.md).
-
-## Documentation
-
-- [Quickstart](docs/getting_started/quickstart.md)
-- [Data loading and transforms](docs/guides/data.md)
-- [Sharding](docs/guides/spmd.md)
-- [Training and checkpoints](docs/guides/trainer.md)
-- [PEFT and adapters](docs/guides/peft.md)
-- [Tutorials](docs/tutorial)
+- [Layers and modules](docs/api/nn.md): linear and convolutional layers,
+  embeddings, normalization, recurrent layers, attention, and more. Linear and
+  convolutional layers support structured feature dimensions.
+- [Data](docs/guides/data.md): Grain-backed loading, transforms, batching, and
+  packing for caller-provided records.
+- [Sharding](docs/guides/spmd.md): logical axis names and JAX mesh placement.
+- [Quantization](docs/api/utils/quantization.md): Qwix-backed quantization
+  utilities and operations.
+- [Trainer](docs/guides/trainer.md): an experimental configurable training loop
+  with evaluation, callbacks, accumulation, and Orbax checkpoints.
+- [PEFT](docs/guides/peft.md): low-rank layers and an experimental adapter
+  framework.
 
 ## Development
 
-Run the test suite on CPU:
-
 ```bash
-make test
+uv sync --frozen --group dev
+JAX_PLATFORMS=cpu make test-fast
 ```
 
-Project layout:
-
-```text
-src/taktiny/
-├── nn/        Modules, layers, parameters, and RNG utilities
-├── data/      Loading and preprocessing
-├── takt/      Adapter injection
-├── trainer/   Training, evaluation, callbacks, and checkpoints
-└── utils/     Sharding, transforms, quantization, and typing
-```
-
-## License
-
-Taktiny is distributed under the Apache License 2.0.
-See [`LICENSE.md`](LICENSE.md).
+The code lives in `src/taktiny/`, with tests in `tests/`. Taktiny is licensed
+under [Apache 2.0](LICENSE.md).
