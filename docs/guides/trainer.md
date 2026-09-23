@@ -1,24 +1,24 @@
-# Trainer & Callbacks
+# Training with `Trainer`
 
-The `taktiny.trainer` package provides a general-purpose training loop for JAX models. It integrates Optax optimization, gradient accumulation, mixed-precision loss scaling, evaluation, exponential moving averages (EMA), device placement, callbacks, and Orbax checkpointing.
+:::{note}
+`Trainer`, its configuration, and its callbacks are experimental. Their
+interfaces may change between releases.
+:::
 
-The trainer does not own the data pipeline. You provide:
+{py:class}`Trainer<taktiny.trainer.Trainer>` runs the
+optimization loop for a model, loss function, and iterable of batches that you
+provide. Add evaluation, gradient accumulation, callbacks, or Orbax
+checkpoints as the training run needs them. Build the data pipeline with
+{py:class}`DataLoader<taktiny.data.DataLoader>` or any iterable that yields
+ready-to-use batches.
 
-* a Taktiny model,
-* a loss function,
-* an iterable of training batches,
-* and the desired training configuration.
+## Train a model
 
-This keeps loading, preprocessing, batching, and sampling independent from the training loop.
-
-## Basic Training
-
-A minimal training setup defines a model and loss function, then constructs a `Trainer`.
+Each item in `train_batches` below is already a batch with a leading batch
+dimension. The Trainer applies four optimizer steps:
 
 ```python
 import jax.numpy as jnp
-import optax
-
 from taktiny import nn
 from taktiny.trainer import DatasetConfig, Trainer, TrainingConfig
 
@@ -36,61 +36,65 @@ def loss_fn(model, batch):
     return jnp.mean((logits - batch["label"]) ** 2)
 
 
-model = MLP(rngs=nn.Rngs(0))
-
-train_data = [
-    {
-        "image": jnp.ones(32),
-        "label": jnp.zeros(4),
-    }
-] * 10
-
-learning_rate = 3e-4
+train_batches = [
+    {"image": jnp.ones((8, 32)), "label": jnp.zeros((8, 4))}
+    for _ in range(4)
+]
 
 trainer = Trainer(
-    model=model,
+    model=MLP(rngs=nn.Rngs(0)),
     loss_fn=loss_fn,
     training_config=TrainingConfig(
-        max_steps=1000,
-        optimizer=optax.adamw(learning_rate),
-        schedule=optax.constant_schedule(learning_rate),
-        output_dir="/tmp/checkpoints",
-        log_interval=50,
-        save_steps=500,
+        max_steps=4,
+        learning_rate=3e-4,
+        log_interval=1,
     ),
     dataset_config=DatasetConfig(
-        train_dataloader=train_data,
-        prefetch_size=2,
+        train_dataloader=train_batches,
+        prefetch_size=0,
     ),
 )
 
 trainer.train()
 ```
 
-## Loss Functions
-
-The trainer calls the provided loss function with the current model and batch:
+With `optimizer` unset, Trainer uses AdamW with `learning_rate` and
+`weight_decay`. To use another Optax transformation, pass it as `optimizer`:
 
 ```python
-def loss_fn(model, batch):
-    logits = model(batch["image"])
-    return jnp.mean((logits - batch["label"]) ** 2)
+import optax
+
+optimizer = optax.adam(3e-4)
+config = TrainingConfig(max_steps=4, optimizer=optimizer)
 ```
 
-Loss functions may also accept an `rng` keyword argument. When present, the trainer supplies a per-step PRNG key:
+For a changing learning rate, pass `schedule=...` to `TrainingConfig` with
+the default optimizer, or pass the schedule directly to a custom Optax
+optimizer.
+
+## Write the loss function
+
+The loss function receives the current model and one batch and returns a
+scalar JAX array. Add an `rng` keyword parameter when the training step uses
+randomness; Trainer supplies a per-step key:
 
 ```python
+import jax
+
+
 def loss_fn(model, batch, *, rng):
-    ...
+    noise = 0.01 * jax.random.normal(rng, batch["image"].shape)
+    prediction = model(batch["image"] + noise)
+    return jnp.mean((prediction - batch["label"]) ** 2)
 ```
 
-This is useful when the training step contains stochastic operations such as dropout or random augmentation.
+For extra training metrics, return `(loss, metrics)` and construct Trainer with
+`loss_has_aux=True`. The metrics mapping is included in step logs.
 
-The returned value should be a scalar JAX array representing the loss to minimize.
+## Configure optimization
 
-## Training Configuration
-
-`TrainingConfig` defines optimization, evaluation, numerical-stability, and checkpointing behavior.
+`TrainingConfig` groups the controls for optimization, evaluation, numerical
+stability, and checkpointing. Common options are:
 
 | Category          | Options                                                                             |
 | ----------------- | ----------------------------------------------------------------------------------- |
@@ -102,9 +106,10 @@ The returned value should be a scalar JAX array representing the loss to minimiz
 | **Checkpointing** | `output_dir`, `save_steps`, `save_total_limit`, `save_at_end`, `save_async`         |
 | **Execution**     | `max_steps`, `jit_compile`, `seed`, `log_interval`                                  |
 
-### Gradient Accumulation
+### Gradient accumulation
 
-Set `gradient_accumulation_steps` to accumulate gradients across multiple batches before applying an optimizer update:
+Set `gradient_accumulation_steps` to accumulate gradients across multiple
+batches before applying an optimizer update:
 
 ```python
 TrainingConfig(
@@ -112,13 +117,14 @@ TrainingConfig(
 )
 ```
 
-With an accumulation factor of `4`, the trainer evaluates four micro-batches before performing one optimizer step.
+With an accumulation factor of `4`, Trainer evaluates four micro-batches
+before each optimizer step. This provides a larger effective batch size while
+keeping each individual batch small.
 
-This is useful when the desired effective batch size does not fit in device memory.
+### Gradient clipping
 
-### Gradient Clipping
-
-Use `max_grad_norm` to clip gradients by their global norm before applying optimizer updates:
+Use `max_grad_norm` to clip gradients by their global norm before applying
+optimizer updates:
 
 ```python
 TrainingConfig(
@@ -126,11 +132,12 @@ TrainingConfig(
 )
 ```
 
-Gradient norm computation can be disabled separately with `compute_grad_norm=False`.
+`compute_grad_norm=False` skips norm tracking when clipping is unset. Clipping
+still computes the norm it needs.
 
-### Loss Scaling
+### Loss scaling
 
-Loss scaling can improve numerical stability when training with low-precision arithmetic.
+Loss scaling can improve numerical stability with low-precision arithmetic.
 
 For dynamic loss scaling:
 
@@ -140,9 +147,11 @@ TrainingConfig(
 )
 ```
 
-The trainer scales the loss before differentiation and unscales the resulting gradients before optimization.
+Trainer scales the loss before differentiation and unscales the resulting
+gradients before optimization.
 
-When non-finite gradients are detected, the optimizer update can be skipped and the dynamic loss scale adjusted automatically.
+With the default `skip_non_finite=True`, a non-finite step skips its optimizer
+update and dynamic scaling adjusts the scale.
 
 A fixed scale may also be provided:
 
@@ -152,13 +161,10 @@ TrainingConfig(
 )
 ```
 
-Additional dynamic-scaling behavior can be controlled with:
+`initial_loss_scale` and `loss_scale_growth_interval` control how a dynamic
+scale starts and grows.
 
-* `initial_loss_scale`
-* `loss_scale_growth_interval`
-* `skip_non_finite`
-
-### Exponential Moving Average
+### Exponential moving average
 
 Set `ema_decay` to maintain an exponential moving average of model parameters:
 
@@ -168,150 +174,155 @@ TrainingConfig(
 )
 ```
 
-EMA weights provide a smoothed version of the model parameters and may be used during evaluation or checkpoint selection.
-
-The decay value must be between `0` and `1`.
+The decay must satisfy `0 < ema_decay < 1`. After training starts,
+`trainer.ema` returns an independent model containing the averaged weights.
+Use that model when you want to evaluate or save the EMA version.
 
 ## Evaluation
 
-Evaluation can be disabled or scheduled periodically.
-
-For step-based evaluation:
+Provide a validation iterable and choose when Trainer evaluates it. For
+step-based evaluation:
 
 ```python
-TrainingConfig(
+validation_batches = train_batches[:1]
+
+config = TrainingConfig(
     eval_strategy="steps",
-    eval_steps=100,
+    eval_steps=2,
+)
+
+dataset_config = DatasetConfig(
+    train_dataloader=train_batches,
+    validation_dataloader=validation_batches,
 )
 ```
 
-Supported evaluation strategies are:
-
-* `"no"` — disable automatic evaluation,
-* `"steps"` — evaluate every `eval_steps`,
-* `"epoch"` — evaluate at epoch boundaries when supported by the data source.
-
-A validation iterable must be supplied through `DatasetConfig` when evaluation is enabled:
+The strategies are `"no"` (the default), `"steps"`, and `"epoch"`. The epoch
+strategy evaluates at the end of each completed pass through the training
+iterable. For a model-selection metric, set:
 
 ```python
-DatasetConfig(
-    train_dataloader=train_loader,
-    validation_dataloader=validation_loader,
-)
-```
-
-The metric used to determine the best checkpoint can be configured with:
-
-```python
-TrainingConfig(
+config = TrainingConfig(
+    max_steps=4,
+    eval_strategy="steps",
+    eval_steps=2,
     metric_for_best_model="eval_loss",
     greater_is_better=False,
+    load_best_model_at_end=True,
+    output_dir="./checkpoints",
 )
 ```
 
-Set `load_best_model_at_end=True` to restore the best checkpoint after training.
+`load_best_model_at_end=True` restores the best checkpoint after training.
+Checkpoint selection uses the metric named by `metric_for_best_model`.
 
-## Dataset Configuration
+## Supply batches
 
-`DatasetConfig` describes the batch iterables consumed by the trainer.
+`DatasetConfig` holds training and optional validation iterables. Each item
+should already have the shape and fields expected by your loss function:
 
 ```python
 dataset_config = DatasetConfig(
-    train_dataloader=train_loader,
-    validation_dataloader=validation_loader,
+    train_dataloader=train_batches,
     prefetch_size=2,
 )
 ```
 
-The trainer accepts generic Python iterables, including:
+Lists of batches, generators, custom iterables, and
+{py:class}`DataLoader<taktiny.data.DataLoader>` all work here. For data
+preparation and batching, see the [data guide](data.md).
 
-* lists,
-* generators,
-* custom iterable datasets,
-* and `taktiny.data.DataLoader` instances.
+### Batch sharding
 
-Loading, preprocessing, batching, shuffling, and sampling remain the responsibility of the data pipeline.
-
-### Batch Sharding
-
-Use `batch_sharding` to place incoming batches according to a JAX sharding specification:
+Use `batch_sharding` to place incoming batches on a JAX mesh. A single
+`Sharding` applies to every array leaf; a matching PyTree can give different
+fields different placements:
 
 ```python
-DatasetConfig(
-    train_dataloader=train_loader,
-    batch_sharding=batch_sharding,
+from jax.sharding import NamedSharding, PartitionSpec as P
+
+dataset_config = DatasetConfig(
+    train_dataloader=train_batches,
+    batch_sharding=NamedSharding(mesh, P("data")),
 )
 ```
 
-`batch_sharding` may be a single sharding object applied to batch leaves or a PyTree matching the structure of the batch.
-
-This allows data placement to integrate with `Mesh`, `NamedSharding`, and other distributed JAX configurations.
+Here `mesh` is a JAX mesh with a `"data"` axis, as in the [SPMD guide](spmd.md).
+This spec partitions the leading batch dimension on that axis. You can also
+configure placement in `DataLoader`; choose one placement point for a pipeline.
 
 ### Prefetching
 
-`prefetch_size` controls how many batches may be prepared ahead of the training loop:
+`prefetch_size` controls how many batches Trainer prepares ahead of the
+training loop:
 
 ```python
-DatasetConfig(
-    train_dataloader=train_loader,
+dataset_config = DatasetConfig(
+    train_dataloader=train_batches,
     prefetch_size=4,
 )
 ```
 
-Set it to `0` to disable prefetching.
+Use `0` for direct iteration. Benchmark the value with your data pipeline and
+device transfer time.
 
 ## Checkpointing
 
-Taktiny uses Orbax for checkpoint management.
-
-Enable periodic checkpointing with:
+Trainer saves checkpoints with Orbax. Set an output directory and a save
+interval to keep snapshots during a run:
 
 ```python
-TrainingConfig(
+config = TrainingConfig(
+    max_steps=4,
+    learning_rate=3e-4,
     output_dir="./checkpoints",
-    save_steps=500,
+    save_steps=2,
     save_total_limit=3,
 )
 ```
 
-Additional options include:
+`save_at_end=True` also writes at the end of training, and `save_async=True`
+overlaps checkpoint writes with training. Checkpoints include optimizer state by
+default. To resume, construct a Trainer with the same model structure, optimizer,
+and data order, then call:
 
-* `save_at_end` — save a checkpoint when training finishes,
-* `save_async` — use asynchronous Orbax checkpoint writes,
-* `save_optimizer_state` — include optimizer state for exact training resumption,
-* `load_best_model_at_end` — restore the best checkpoint after training.
+```python
+trainer.train(resume_from_checkpoint="latest")
+```
 
-If optimizer state is omitted, a checkpoint may still restore model weights but cannot reproduce the exact optimizer state required to resume training.
+`"latest"` selects the highest-numbered checkpoint in `output_dir`; you can
+also pass a checkpoint directory. Use `save_optimizer_state=False` for a
+weight-and-trainer-state snapshot when restoring the optimizer trajectory is
+unnecessary. The [checkpoint guide](checkpoint.md) covers weight-only model
+checkpoints separately.
 
 ## Callbacks
 
-Callbacks extend the training loop without modifying the trainer itself.
-
-```python
-trainer = Trainer(
-    ...,
-    callbacks=[
-        MyCallback(),
-    ],
-)
-```
-
-Custom callbacks can subclass `TrainerCallback` and implement lifecycle hooks such as step completion or evaluation events.
+Callbacks receive training events and logs. For example, collect the reported
+loss each time Trainer logs:
 
 ```python
 from taktiny.trainer import TrainerCallback
 
 
-class MyCallback(TrainerCallback):
-    def on_step_end(self, *args, **kwargs):
-        ...
+class LossHistory(TrainerCallback):
+    def __init__(self):
+        self.values = []
+
+    def on_log(self, trainer, logs):
+        if logs["loss"] is not None:
+            self.values.append(logs["loss"])
+
+
+history = LossHistory()
 ```
 
-Built-in reporting integrations include:
+Pass `callbacks=[history]` when constructing Trainer. Other hooks include
+`on_train_begin`, `on_step_end`, `on_save`, `on_evaluate`, and `on_train_end`.
 
 ### TensorBoard
 
-`TensorBoardCallback` writes training and evaluation metrics for visualization in TensorBoard.
+`TensorBoardCallback` writes training and evaluation metrics for visualization:
 
 ```python
 from taktiny.trainer import TensorBoardCallback
@@ -319,10 +330,11 @@ from taktiny.trainer import TensorBoardCallback
 
 ### Weights & Biases
 
-`WandbCallback` reports training metrics to Weights & Biases.
+`WandbCallback` reports training metrics to Weights & Biases:
 
 ```python
 from taktiny.trainer import WandbCallback
 ```
 
-These integrations are optional dependencies and can be installed separately when needed.
+Install the corresponding `tensorboard` or `wandb` optional dependency before
+using these callbacks.

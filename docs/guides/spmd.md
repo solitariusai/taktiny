@@ -1,12 +1,11 @@
-# SPMD & Distributed Sharding
+# Sharding across devices
 
-Sharding describes how an array is distributed across devices. You still write
-operations on the whole array; JAX executes the computation using its shards
-and handles the required communication.
+Sharding places different parts of an array on different devices. Write
+operations on the whole array; JAX runs them across its shards and handles
+communication between devices.
 
 Taktiny uses JAX's `Mesh`, `PartitionSpec`, and `NamedSharding`. Logical axis
-names let a model describe its dimensions without hard-coding a device layout
-into every layer.
+names let a model describe its dimensions independently of a device layout.
 
 ## Mesh axes and array dimensions
 
@@ -22,20 +21,20 @@ by the entire spec replicate the array. For example, `P(None, "model")`
 partitions a matrix's columns along `model` and replicates it along `data`.
 `P()` requests full replication.
 
-The spec describes array dimensions, not individual devices. Each partitioned
-dimension must be divisible by the product of the sizes of its assigned mesh axes.
+Each entry in a spec describes one array dimension. Its size must be divisible
+by the product of the sizes of its assigned mesh axes.
 
 ## A complete four-device example
 
-To try a 2 × 2 mesh without an accelerator, save the Python block below as
+Try the following example on four CPU devices. Save the Python block as
 `sharding_example.py` and run:
 
 ```bash
 JAX_PLATFORMS=cpu XLA_FLAGS='--xla_force_host_platform_device_count=4' uv run python sharding_example.py
 ```
 
-Set the environment before JAX initializes its backend. These are four logical
-CPU devices for testing, not four physical accelerators.
+Set the environment before JAX initializes its backend. The flag exposes four
+logical CPU devices for testing.
 
 ```python
 import jax
@@ -102,14 +101,14 @@ Taktiny preserves the original `axis_names` and stores the resolved mesh spec
 separately. For `Linear`, the bias uses the trailing output axis names and
 spec entries.
 
-The mapping applies when the initializer or parameter is created. Leaving the
-context restores previous rules; it does not move existing arrays. Changing
-rules later does not automatically reshard an existing model either.
+The rules apply when the initializer or parameter is created. The `with` block
+restores the previous rules on exit. To move an existing array to a new layout,
+use `jax.device_put` with the desired sharding.
 
 ### When both arguments are supplied
 
-`axis_names` takes precedence over `partition_spec`. The explicit spec is not
-a fallback for individual unmapped dimensions:
+`axis_names` takes precedence over `partition_spec`: the resolved logical
+names replace the entire explicit spec, including unmapped dimensions:
 
 ```python
 with jax.set_mesh(mesh), map_logical_axis_names({"output": "model"}):
@@ -123,16 +122,17 @@ with jax.set_mesh(mesh), map_logical_axis_names({"output": "model"}):
 assert overridden.kernel.partition_spec == P(None, "model")
 ```
 
-Here `input` is unmapped, so it resolves to `None`, not the explicit spec's
-`"data"`. If no logical names match any rules, every dimension resolves to
-`None` and the parameter is replicated on the active mesh.
+Here `input` is unmapped, so it resolves to `None`. If no logical names match
+any rules, every dimension resolves to `None` and the parameter is replicated
+on the active mesh.
 
-To use an explicit spec, omit `axis_names`. To request replication while keeping
-logical names, map those names to `None` when creating the parameter.
+For an explicit layout, pass `partition_spec` on its own. To replicate a
+parameter while keeping logical names, map those names to `None` when creating
+it.
 
 ## Rule order and scope
 
-Inspect a mapping without creating an array using `logical_to_mesh_axes`:
+Preview a mapping with `logical_to_mesh_axes`:
 
 ```python
 from taktiny.utils.spmd import logical_to_mesh_axes
@@ -148,10 +148,10 @@ assert logical_to_mesh_axes(
 ) == P(None, "model")
 ```
 
-Rules are considered in order. A mesh axis cannot partition two dimensions of
-the same array, so the first available assignment wins. In the second example,
-`output` claims `model`, leaving `input` unpartitioned. Repeating a non-`None`
-logical name within one array raises an error.
+Rules are considered in order. Each mesh axis can partition one dimension of
+an array, so the first available assignment wins. In the second example,
+`output` claims `model`, leaving `input` unpartitioned. Give each named array
+dimension a distinct logical name.
 
 A logical name can map to a tuple of mesh axes. For example,
 `{"feature": ("data", "model")}` partitions one dimension across both axes;
@@ -162,30 +162,25 @@ prepend their rules, giving them priority over outer rules, and restore the
 previous rules on exit.
 
 For longer-lived configuration, `set_logical_axis_rules(rules)` replaces the
-current rule sequence; `get_logical_axis_rules()` reads it. The storage is
-thread-local, not shared across threads or processes.
+current rule sequence; `get_logical_axis_rules()` reads it. Set rules in each
+thread or process that constructs parameters.
 
-Calling `map_logical_axis_names(...)` without `with` also changes the rules
-immediately, but prepends them instead of replacing them. Merely constructing
-that context object has this effect; it does not wait until context entry.
+Calling `map_logical_axis_names(...)` without `with` prepends rules immediately.
+Use `set_logical_axis_rules(...)` when you want to replace the full sequence.
 
 ## When initialization is sharded
 
 Layers such as `Linear` wrap their initializers with `with_logical_partitioning`
 when sharding arguments are supplied. With an active `jax.set_mesh(mesh)`
-context and a resolved spec, the wrapper compiles the initializer with
-`jax.jit(..., out_shardings=spec)`. Its returned array is already sharded;
-you do not need a separate post-initialization placement step.
+context and a resolved spec, the wrapper uses
+`jax.jit(..., out_shardings=spec)`. The initialized parameter already has its
+requested layout. The output layout describes the returned array; the
+initializer may still use temporary storage while it runs.
 
-This describes the output layout, not every temporary allocation inside the
-initializer. Invalid specs, incompatible dimensions, and other compilation
-errors from this wrapper are not silently converted into replication.
-
-The wrapper has a fallback for a missing active mesh: it calls the original
-initializer. A parameter can therefore retain sharding metadata without its
-array having that layout. Construct parameters inside the mesh context when
-you want placement at initialization, and check the array's `.sharding`, not
-only its metadata.
+Construct parameters inside the mesh context for placement at initialization.
+Outside that context, the initializer returns an ordinary array while the
+parameter can still retain its sharding metadata. Check `parameter.value.sharding`
+to inspect the actual layout.
 
 You can wrap a custom initializer directly:
 
@@ -203,12 +198,12 @@ assert weight.sharding.spec == P(None, "model")
 ```
 
 Use the usual initializer signature `(key, shape, dtype)`. Logical rules are
-resolved when the wrapped initializer is called, not when it is wrapped.
+resolved when the wrapped initializer is called.
 
 ## Match names to the parameter shape
 
 A parameter needs one logical axis entry per array dimension. A feature shape
-with several dimensions therefore needs several entries, not one name:
+with several dimensions therefore needs several entries:
 
 ```python
 with jax.set_mesh(mesh), map_logical_axis_names({"output": "model"}):
@@ -224,11 +219,11 @@ assert nd_layer.bias.value.shape == (3, 4)
 assert nd_layer.bias.partition_spec == P(None, "model")
 ```
 
-Check each layer's parameter layout before copying a spec: convolution kernels
+Check each layer's parameter layout when choosing names: convolution kernels
 also have spatial dimensions, and bilinear kernels have dimensions for both
 inputs before the output dimensions.
 
-## Inspect placement and keep data loading separate
+## Inspect and place arrays
 
 For an ordinary array-backed parameter, `parameter.value.sharding` reports its
 actual placement. `array.addressable_shards` exposes the shards accessible
@@ -236,18 +231,16 @@ from the current process, including their global indices and local arrays.
 Replication can mean several devices hold the same global slice.
 
 Use `jax.device_put(array, NamedSharding(mesh, spec))` to explicitly place or
-reshard an existing array. Updating parameter metadata alone does not move its
-value.
+reshard an existing array. For input batches, either use `jax.device_put` as
+in the first example or configure `DataLoader` with `axis_names` or
+`partition_spec` to place completed batches. Choose output layouts at the JIT
+boundary when your application needs a particular layout.
 
-Parameter specs do not automatically assign layouts to input batches. Place
-batches explicitly, as in the first example, and choose output layouts at the
-JIT boundary when your application requires them.
-
-Likewise, `DataLoader(shard_index=..., shard_count=...)` partitions source
-records between processes; it does not produce device-sharded JAX arrays.
-These examples use one process with four devices. Multi-process execution also
-requires JAX distributed initialization and correct construction of global
-arrays from process-local data; logical-axis rules do not perform that setup.
+`DataLoader(shard_index=..., shard_count=...)` assigns source records to
+processes; its output-placement arguments control the resulting JAX arrays.
+These examples use one process with four devices. For multi-process execution,
+initialize JAX distributed execution and construct global arrays from the
+process-local data.
 
 See the [SPMD API reference](../api/utils/spmd.md) for mapping helpers and the
 [data guide](data.md) for input-pipeline sharding.

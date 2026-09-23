@@ -78,6 +78,7 @@ Work with the parts of a training pipeline.
 Complete examples, from simple models to image generation.
 
 - [Linear regression](tutorial/linear_regression.md)
+- [Autoencoder](tutorial/autoencoder_easy_shard.md)
 - [Image classification](tutorial/image_classification.md)
 - [Generative adversarial networks](tutorial/gan.md)
 :::
@@ -122,6 +123,7 @@ guides/spmd
 :caption: Tutorials
 
 tutorial/linear_regression
+tutorial/autoencoder_easy_shard
 tutorial/image_classification
 tutorial/gan
 ```
