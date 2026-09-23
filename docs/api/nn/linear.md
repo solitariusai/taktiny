@@ -12,10 +12,12 @@ Standard and parameter-efficient linear layers.
 .. autoclass:: taktiny.nn.DoRALinear
 
 .. autoclass:: taktiny.nn.AdaLoRALinear
+    :members: mask_rank, orthogonal_loss
 
 .. autoclass:: taktiny.nn.LoHaLinear
 
 .. autoclass:: taktiny.nn.LoKrLinear
+    :members: _weights
 
 .. autoclass:: taktiny.nn.VeRALinear
 ```

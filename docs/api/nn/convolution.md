@@ -6,6 +6,7 @@ Dimension-agnostic spatial convolutions, poolings, folding, and unfolding.
 .. autoclass:: taktiny.nn.Conv
 
 .. autoclass:: taktiny.nn.ConvTranspose
+    :members: _transpose_padding
 
 .. autoclass:: taktiny.nn.MaxPool
 

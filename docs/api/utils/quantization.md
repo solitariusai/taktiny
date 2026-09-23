@@ -10,4 +10,6 @@ Post-training weight quantization utilities and Qwix integration.
 .. autofunction:: taktiny.utils.quantization.quantize_embedding_weight
 
 .. autofunction:: taktiny.utils.quantization.quantization_rules
+
+.. autofunction:: taktiny.utils.quantization.quantize_model
 ```

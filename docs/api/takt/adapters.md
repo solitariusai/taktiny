@@ -4,6 +4,7 @@ Parameter-efficient fine-tuning adapter configurations supported by Takt.
 
 ```{eval-rst}
 .. autoclass:: taktiny.takt.BaseAdapter
+    :members: matches, prepare, build
 
 .. autoclass:: taktiny.takt.LoRAAdapter
 
@@ -16,4 +17,5 @@ Parameter-efficient fine-tuning adapter configurations supported by Takt.
 .. autoclass:: taktiny.takt.LoKrAdapter
 
 .. autoclass:: taktiny.takt.VeRAAdapter
+    :members: prepare
 ```
