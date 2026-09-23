@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import qwix
 
-from taktiny.utils.ops import einsum, linear
+from taktiny.utils.ops import dot_general, einsum, linear
 
 
 def quantize(x):
@@ -13,6 +13,73 @@ def quantize(x):
 
 def dense(x):
     return qwix.dequantize(x) if isinstance(x, qwix.QArray) else x
+
+
+def test_dot_general_batch_axes_and_arraylikes():
+    lhs = jnp.arange(24, dtype=jnp.float32).reshape(2, 3, 4) / 7
+    rhs = jnp.arange(40, dtype=jnp.float32).reshape(2, 4, 5) / 9
+    dimensions = (((2,), (1,)), ((0,), (0,)))
+
+    result = jax.jit(lambda x, w: dot_general(x, w, dimensions))(lhs, rhs)
+
+    np.testing.assert_allclose(result, jnp.einsum('bik,bkj->bij', lhs, rhs), rtol=1e-5)
+    np.testing.assert_array_equal(
+        dot_general([1., 2.], [[1.], [3.]], (((0,), (0,)), ((), ()))),
+        [7.],
+    )
+
+
+def test_dot_general_qarrays_rule_and_operand_roles():
+    lhs = jnp.arange(12, dtype=jnp.float32).reshape(3, 4) / 7
+    rhs = jnp.arange(20, dtype=jnp.float32).reshape(4, 5) / 9
+    dimensions = (((1,), (0,)), ((), ()))
+    qlhs, qrhs = quantize(lhs), quantize(rhs)
+
+    result = jax.jit(lambda x, w: dot_general(x, w, dimensions))(qlhs, qrhs)
+    np.testing.assert_allclose(result, dense(qlhs) @ dense(qrhs), rtol=1e-5)
+
+    result = dot_general(lhs, rhs, dimensions, quant='int8')
+    expected_rhs = qwix.quantize(rhs, 'int8', channelwise_axes=(1,))
+    np.testing.assert_allclose(result, lhs @ dense(expected_rhs), rtol=1e-5)
+
+    left_weight = dot_general(rhs.T, lhs.T, (((1,), (0,)), ((), ())),
+                              quant='int8', lhs_weight=True, rhs_weight=False)
+    expected_left = qwix.quantize(rhs.T, 'int8', channelwise_axes=(0,))
+    np.testing.assert_allclose(left_weight, dense(expected_left) @ lhs.T, rtol=1e-5)
+
+
+def test_dot_general_qt_gradients_and_dtype():
+    lhs = jnp.arange(12, dtype=jnp.float32).reshape(3, 4) / 7
+    rhs = jnp.arange(20, dtype=jnp.float32).reshape(4, 5) / 9
+    dimensions = (((1,), (0,)), ((), ()))
+    rule = qwix.QtRule(weight_qtype='int8', act_qtype='int8', bwd_qtype='int8')
+
+    def loss(x, w):
+        return dot_general(x, w, dimensions, quant=rule,
+                           preferred_element_type=jnp.bfloat16).astype(jnp.float32).sum()
+
+    dx, dw = jax.jit(jax.grad(loss, argnums=(0, 1)))(lhs, rhs)
+    assert jnp.all(jnp.isfinite(dx)) and jnp.all(jnp.isfinite(dw))
+    assert dot_general(lhs, rhs, dimensions, quant=rule,
+                       preferred_element_type=jnp.bfloat16).dtype == jnp.bfloat16
+
+
+@pytest.mark.parametrize('mode', ['dense', 'qarray', 'ptq'])
+def test_dot_general_output_sharding(mode):
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()), ('model',),
+                             axis_types=(jax.sharding.AxisType.Explicit,))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(None, 'model'))
+    dimensions = (((1,), (0,)), ((), ()))
+    with jax.set_mesh(mesh):
+        lhs, rhs = jnp.ones((2, 4)), jnp.ones((4, 3))
+        if mode == 'qarray':
+            lhs, rhs = quantize(lhs), quantize(rhs)
+        rule = 'int8' if mode == 'ptq' else None
+        result = jax.jit(lambda x, w: dot_general(
+            x, w, dimensions, quant=rule, out_sharding=sharding,
+        ))(lhs, rhs)
+        assert result.sharding == sharding
+        np.testing.assert_allclose(result, jnp.full((2, 3), 4.), atol=0.1)
 
 
 @pytest.mark.parametrize('qx,qw,qb', [(False, False, False), (True, False, False),

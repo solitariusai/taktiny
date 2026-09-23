@@ -7,14 +7,25 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from taktiny import nn
-from taktiny.ensemble import quantize_model
-from taktiny.ensemble.qwix import _current_module
+from taktiny.utils.quantization import _current_module, quantize_model
 
 
 def provider(**kwargs):
     return qwix.QtProvider([qwix.QtRule(
         weight_qtype='int8', act_qtype='int8', bwd_qtype='int8', **kwargs,
     )])
+
+
+def test_qt_provider_accepts_base_rule_with_default_activation_calibration():
+    model = nn.Linear(4, 2, rngs=nn.Rngs(0))
+    x = jnp.ones((2, 4))
+    provider = qwix.QtProvider([
+        qwix.QuantizationRule(weight_qtype='int8', act_qtype='int8'),
+    ])
+
+    quantized = quantize_model(model, provider, x)
+
+    assert jnp.all(jnp.isfinite(quantized(x)))
 
 
 def test_linear_clone_jit_and_int8_backward():

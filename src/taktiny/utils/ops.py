@@ -21,7 +21,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import qwix
-from jax.lax import PrecisionLike
+from jax.lax import DotDimensionNumbers, PrecisionLike
 from jax.sharding import NamedSharding
 from jax.typing import DTypeLike
 from qwix._src.core import conv_general_qt, dot_general_qt
@@ -462,7 +462,93 @@ def conv_general_dilated(
     return output.astype(result_dtype)
 
 
-def dot_general(): ...
+def dot_general(
+    lhs: ArrayLike | qwix.QArray,
+    rhs: ArrayLike | qwix.QArray,
+    dimension_numbers: DotDimensionNumbers,
+    precision: PrecisionLike = None,
+    preferred_element_type: DTypeLike | None = None,
+    *,
+    out_sharding: NamedSharding | None = None,
+    quant: QuantConfig = None,
+    module_path: str = '',
+    lhs_weight: bool = False,
+    rhs_weight: bool = True,
+) -> Array:
+    """Contract two operands using JAX or Qwix ``dot_general``.
+
+    ``dimension_numbers`` has the same contracting and batch-axis layout as
+    :func:`jax.lax.dot_general`. Dense inputs use JAX; without an explicit
+    rule, QArray inputs use Qwix. A selected ``quant`` rule dequantizes any
+    existing QArrays before applying its configured operand quantization.
+    Rules match ``module_path`` and ``dot_general`` in first-match order.
+
+    By default, ``lhs`` is an activation and ``rhs`` is a weight. Set
+    ``lhs_weight`` or ``rhs_weight`` to choose which operand receives the
+    rule's ``weight_qtype``; other operands receive ``act_qtype``. A
+    :class:`qwix.QtRule` uses Qwix's training kernel, including its optional
+    backward quantization. Ordinary rules and strings use PTQ. QT does not
+    currently support explicit ``out_sharding``.
+
+    The result is a dense JAX array. Its implicit dtype follows the operand
+    dtypes (QArray scale dtypes), with FP8 promoted to BF16 and quantized
+    integer inputs to FP32. ``preferred_element_type`` overrides the result
+    dtype. ``out_sharding`` is forwarded to the selected operation where
+    supported.
+
+    Example:
+        >>> dot_general(
+        ...     jnp.ones((2, 3)), jnp.ones((3, 4)),
+        ...     (((1,), (0,)), ((), ())),
+        ... ).shape
+        (2, 4)
+    """
+    lhs, rhs = _as_operand(lhs), _as_operand(rhs)
+    rule = _rule(quant, module_path, 'dot_general')
+    implicit_dtype = _dtype(lhs, rhs, quantized=rule is not None)
+    result_dtype = implicit_dtype if preferred_element_type is None else jnp.dtype(preferred_element_type)
+    compute_dtype = jnp.result_type(implicit_dtype, result_dtype)
+
+    if rule is not None:
+        output = _rule_dot(
+            _dense(lhs).astype(compute_dtype),
+            _dense(rhs).astype(compute_dtype),
+            dimension_numbers,
+            precision=precision,
+            preferred_element_type=compute_dtype,
+            rule=rule,
+            lhs_weight=lhs_weight,
+            rhs_weight=rhs_weight,
+            out_sharding=out_sharding,
+        )
+    elif quant is not None:
+        output = jax.lax.dot_general(
+            _dense(lhs).astype(compute_dtype),
+            _dense(rhs).astype(compute_dtype),
+            dimension_numbers,
+            precision=precision,
+            preferred_element_type=compute_dtype,
+            out_sharding=out_sharding,
+        )
+    elif isinstance(lhs, qwix.QArray) or isinstance(rhs, qwix.QArray):
+        output = qwix.dot_general(
+            _promote(lhs, compute_dtype),
+            _promote(rhs, compute_dtype),
+            dimension_numbers,
+            precision=precision,
+            preferred_element_type=compute_dtype,
+            out_sharding=out_sharding,
+        )
+    else:
+        output = jax.lax.dot_general(
+            lhs.astype(compute_dtype),
+            rhs.astype(compute_dtype),
+            dimension_numbers,
+            precision=precision,
+            preferred_element_type=compute_dtype,
+            out_sharding=out_sharding,
+        )
+    return output.astype(result_dtype)
 
 
-__all__ = ['linear', 'einsum', 'conv_general_dilated']
+__all__ = ['linear', 'einsum', 'conv_general_dilated', 'dot_general']
