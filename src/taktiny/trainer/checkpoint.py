@@ -21,7 +21,7 @@ import json
 import os
 import re
 import shutil
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +30,9 @@ import orbax.checkpoint as ocp
 
 from taktiny.nn import Rngs
 from taktiny.utils.trainer import _combine_params, _copy_tree
+
+if TYPE_CHECKING:
+    from taktiny.trainer.config import TrainingConfig
 
 
 def _leaves(tree: Any) -> dict[str, Any]:
@@ -58,6 +61,27 @@ class TrainerCheckpointMixin:
     architecture, optimizer, parameter ordering, and data pipeline. Legacy
     safetensors Trainer checkpoints are intentionally not supported.
     """
+
+    training_config: TrainingConfig
+    rngs: Rngs
+    _active_data_iterator: Any
+    log_history: list[Any]
+    best_metric: Any
+    best_model_checkpoint: str | None
+    loss_scale: float
+    loss_scale_good_steps: int
+    skipped_updates: int
+    micro_step: int
+    _ema: Any
+    saved_checkpoints: list[str]
+    _pending_checkpoint: tuple[str, ocp.AsyncCheckpointer] | None
+
+    if TYPE_CHECKING:
+        def extract_params(self) -> Any: ...
+
+        def _inject_params(self, params: Any) -> None: ...
+
+        def _call_event(self, event: str, **kwargs: Any) -> None: ...
 
     @staticmethod
     def _has_iterator_state(iterator: Any) -> bool:
@@ -156,8 +180,10 @@ class TrainerCheckpointMixin:
         return _restore_tree(path, target)
 
     def _checkpoint_directory(self, step: int) -> str:
-        return os.path.abspath(os.path.join(os.fspath(self.training_config.output_dir),
-                                            f'checkpoint-{step}'))
+        directory = self.training_config.output_dir
+        if directory is None:
+            raise ValueError('output_dir is required to save checkpoints')
+        return os.path.abspath(os.path.join(os.fspath(directory), f'checkpoint-{step}'))
 
     def _checkpoint_paths(self) -> list[tuple[int, str]]:
         directory = self.training_config.output_dir
@@ -233,27 +259,28 @@ class TrainerCheckpointMixin:
             'model_state': ocp.args.StandardSave(_leaves(self.extract_params())),
             'trainer_state': ocp.args.JsonSave(state),
         }
-        handlers = {
-            'model_state': ocp.StandardCheckpointHandler(),
-            'trainer_state': ocp.JsonCheckpointHandler(),
-        }
+        registry = ocp.DefaultCheckpointHandlerRegistry()
+        registry.add('model_state', ocp.args.StandardSave, ocp.StandardCheckpointHandler())
+        registry.add('trainer_state', ocp.args.JsonSave, ocp.JsonCheckpointHandler())
         if self.training_config.save_optimizer_state:
             items['optimizer_state'] = ocp.args.StandardSave(_leaves(opt_state))
-            handlers['optimizer_state'] = ocp.StandardCheckpointHandler()
+            registry.add('optimizer_state', ocp.args.StandardSave, ocp.StandardCheckpointHandler())
         if self._ema is not None:
             items['ema_state'] = ocp.args.StandardSave(_leaves(self._ema))
-            handlers['ema_state'] = ocp.StandardCheckpointHandler()
-        handler = ocp.CompositeCheckpointHandler(**handlers)
-        cls = ocp.AsyncCheckpointer if self.training_config.save_async else ocp.Checkpointer
-        checkpointer = cls(handler)
+            registry.add('ema_state', ocp.args.StandardSave, ocp.StandardCheckpointHandler())
+        handler = ocp.CompositeCheckpointHandler(handler_registry=registry)
+        async_checkpointer = (
+            ocp.AsyncCheckpointer(handler) if self.training_config.save_async else None
+        )
+        checkpointer = async_checkpointer or ocp.Checkpointer(handler)
         try:
             # Orbax owns atomic publication and async host snapshots. Never overwrite.
             checkpointer.save(path, args=ocp.args.Composite(**items))
         except BaseException:
             checkpointer.close()
             raise
-        if self.training_config.save_async:
-            self._pending_checkpoint = (path, checkpointer)
+        if async_checkpointer is not None:
+            self._pending_checkpoint = (path, async_checkpointer)
         else:
             checkpointer.close()
             self._finalize_checkpoint(path)

@@ -73,7 +73,7 @@ class TensorBoardCallback(TrainerCallback):
             from tensorboardX import SummaryWriter  # ty: ignore[unresolved-import]
         except ImportError:
             try:
-                from torch.utils.tensorboard import SummaryWriter
+                from torch.utils.tensorboard import SummaryWriter  # ty: ignore[unresolved-import]
             except ImportError as error:
                 raise ImportError(
                     'TensorBoardCallback requires tensorboardX or '
