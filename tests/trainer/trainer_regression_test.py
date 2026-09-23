@@ -338,6 +338,35 @@ def test_evaluation_uses_separate_rng_for_stochastic_loss(jit_compile):
     )
 
 
+@pytest.mark.parametrize('loss_has_aux,returns_aux,error', [
+    (True, True, None),
+    (True, False, 'loss_has_aux requires'),
+    (False, True, 'returned auxiliary data'),
+])
+def test_evaluation_validates_auxiliary_loss_shape(loss_has_aux, returns_aux, error):
+    batch = {
+        'x': np.asarray([1.0], dtype=np.float32),
+        'y': np.asarray([2.0], dtype=np.float32),
+    }
+
+    def evaluation_loss(model, batch):
+        loss = squared_error(model, batch)
+        return (loss, {'aux': 1}) if returns_aux else loss
+
+    trainer = Trainer(
+        TinyModel(),
+        TrainingConfig(jit_compile=False),
+        DatasetConfig([], validation_dataloader=[batch]),
+        loss_fn=evaluation_loss,
+        loss_has_aux=loss_has_aux,
+    )
+    if error is None:
+        assert trainer.evaluate()['eval_loss'] == pytest.approx(4.0)
+    else:
+        with pytest.raises(TypeError, match=error):
+            trainer.evaluate()
+
+
 
 def test_trainer_records_log_interval_and_final_history():
     model = TinyModel()

@@ -33,7 +33,11 @@ extensions = [
     "sphinx_autodoc_typehints",
     "sphinx_copybutton",
     "sphinx_design",
+    "sphinx_codeautolink",
 ]
+
+# Resolve `nn.*` in standalone Python snippets, even when imports are shown separately.
+codeautolink_global_preface = "from taktiny import nn"
 
 # Copybutton settings
 copybutton_prompt_text = r">>> |\.\.\. |\$ |In \[\d*\]: | {2,5}\.\.\.: | {5,8}: "

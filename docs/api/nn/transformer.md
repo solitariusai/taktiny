@@ -16,8 +16,4 @@ Attention mechanisms, feed-forward networks, and transformer stacks.
 .. autoclass:: taktiny.nn.TransformerDecoder
 
 .. autoclass:: taktiny.nn.Transformer
-
-.. autofunction:: taktiny.nn.default_transformer_initializer
-
-.. autofunction:: taktiny.nn.default_transformer_bias_initializer
 ```

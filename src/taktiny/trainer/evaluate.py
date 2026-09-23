@@ -14,8 +14,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -28,10 +28,35 @@ from taktiny.utils.trainer import (
     _tree_shardings,
     _validate_parameter_placement,
 )
-from taktiny.utils.typing import PyTree
+from taktiny.utils.typing import Batch, LossFn, PyTree
+
+if TYPE_CHECKING:
+    from taktiny.trainer.config import DatasetConfig, TrainingConfig
 
 
 class TrainerEvaluateMixin:
+    training_config: TrainingConfig
+    dataset_config: DatasetConfig
+    _validation_dataloader: Iterable[Batch] | None
+    global_step: int
+    _loss_accepts_rng: bool
+    loss_fn: LossFn
+    loss_has_aux: bool
+    compute_metrics: Callable[..., Mapping[str, Any]] | None
+    _compiled_eval_step: Callable[..., Any] | None
+    log_history: list[dict[str, Any]]
+    best_metric: float | None
+    _best_step: int | None
+    best_model_checkpoint: str | None
+    _mesh: jax.sharding.Mesh | None
+
+    if TYPE_CHECKING:
+        def _place_batch(self, batch: Batch) -> Batch: ...
+
+        def extract_params(self) -> PyTree: ...
+
+        def _call_event(self, event: str, **kwargs: Any) -> None: ...
+
     def _evaluate_params(self, params: PyTree) -> dict[str, float]:
         from taktiny.nn.base import Module
         if isinstance(params, Module):
@@ -93,7 +118,11 @@ class TrainerEvaluateMixin:
                 value = self.loss_fn(params, batch)
 
             if self.loss_has_aux:
-                value, _ = value
+                if not isinstance(value, tuple) or len(value) != 2:
+                    raise TypeError('loss_has_aux requires a (loss, aux) result')
+                value = value[0]
+            elif isinstance(value, tuple):
+                raise TypeError('loss_fn returned auxiliary data but loss_has_aux is False')
             if isinstance(value, jax.Array):
                 value = value.item()
 

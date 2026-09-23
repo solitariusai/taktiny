@@ -16,8 +16,8 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
-from typing import Any
+from collections.abc import Callable, Sequence
+from typing import Any, cast
 
 from taktiny.nn.base import Module
 
@@ -90,7 +90,13 @@ class AdapterBase:
     def build(self, target: Module, *, module_path: str) -> Module:
         """Create the replacement for one matching target module."""
         del module_path
-        replacement = self._adapter(
+        adapter_type = self._adapter
+        if adapter_type is None:
+            raise TypeError(
+                f'{type(self).__name__} must define an _adapter module type'
+            )
+        constructor = cast(Callable[..., Module], adapter_type)
+        replacement = constructor(
             target,
             *self._adapter_args,
             **self._adapter_kwargs,

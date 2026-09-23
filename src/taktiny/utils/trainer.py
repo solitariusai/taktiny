@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import copy
 from collections import deque
-from collections.abc import Callable, Generator, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable
 from typing import Any
 
 import jax

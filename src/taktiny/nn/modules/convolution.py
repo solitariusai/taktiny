@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from functools import partial
 from itertools import product
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -46,6 +48,7 @@ from taktiny.nn.utils import (
     _validate_positive_float,
     _window_output_shape,
 )
+from taktiny.utils.ops import _rule, _rule_conv, _validate_conv_training_rule
 from taktiny.utils.quantization import (
     quantize_conv_weight,
     resolve_quantization_rule,
@@ -63,6 +66,67 @@ from taktiny.utils.typing import (
 
 default_kernel_initializer = lecun_uniform()
 default_bias_initializer = jax.nn.initializers.zeros
+
+
+def _channel_groups(
+    groups: GenericShape,
+    in_channels: tuple[int, ...],
+    out_channels: tuple[int, ...],
+    *,
+    transpose: bool = False,
+) -> tuple[int | tuple[int, ...], int, tuple[int, ...] | None]:
+    """Validate legacy scalar grouping or structured per-axis grouping."""
+    if isinstance(groups, int):
+        _validate_integer(groups, 'groups')
+        if in_channels[0] % groups:
+            raise ValueError('in_channels[0] must be divisible by groups')
+        output_size = out_channels[0] if transpose else math.prod(out_channels)
+        if output_size % groups:
+            raise ValueError('out_channels must be divisible by groups')
+        return groups, groups, None
+    shape = _normalize_shape(groups, 'groups')
+    if len(shape) != len(in_channels) or len(shape) != len(out_channels):
+        raise ValueError('groups must have one entry per input and output channel axis')
+    for name, channels in (('in_channels', in_channels), ('out_channels', out_channels)):
+        for axis, (size, count) in enumerate(zip(channels, shape)):
+            if size % count:
+                raise ValueError(f'{name}[{axis}] ({size}) must be divisible by groups[{axis}] ({count})')
+    return shape, math.prod(shape), shape
+
+
+def _group_channel_axes[T: (jax.Array, qwix.QArray)](
+    array: T,
+    start: int,
+    channels: tuple[int, ...],
+    groups: tuple[int, ...],
+) -> T:
+    """Reorder channel blocks from (g0,c0,g1,c1,...) to (g0,g1,...,c0,c1,...)."""
+    rank = len(channels)
+    split = tuple(v for size, count in zip(channels, groups) for v in (count, size // count))
+    shape = array.shape
+    reshaped = array.reshape(*shape[:start], *split, *shape[start + rank:])
+    order = (
+        tuple(range(start))
+        + tuple(range(start, start + 2 * rank, 2))
+        + tuple(range(start + 1, start + 2 * rank, 2))
+        + tuple(range(start + 2 * rank, reshaped.ndim))
+    )
+    return cast(T, reshaped.transpose(order).reshape(*shape))
+
+
+def _restore_channel_axes(
+    array: jax.Array,
+    channels: tuple[int, ...],
+    groups: tuple[int, ...],
+) -> jax.Array:
+    """Restore structured channels from group-major convolution output."""
+    prefix = array.shape[:-1]
+    start, rank = len(prefix), len(channels)
+    array = array.reshape(*prefix, *groups, *(size // count for size, count in zip(channels, groups)))
+    order = tuple(range(start)) + tuple(
+        axis for i in range(rank) for axis in (start + i, start + rank + i)
+    )
+    return array.transpose(order).reshape(*prefix, *channels)
 # Kept for modules that have not migrated to the new initializer name yet.
 default_conv_initializer = default_kernel_initializer
 
@@ -77,9 +141,24 @@ class Conv(Module):
     ``[batch, *spatial, *in_channels]`` produces
     ``[batch, *output_spatial, *out_channels]``.
 
-    When ``groups`` is greater than one, groups partition the first input and
-    output channel axes. Both first channel-axis sizes must therefore be
-    divisible by ``groups``.
+    A sequence ``groups=(g0, g1, ...)`` partitions each channel axis into
+    contiguous blocks. It must have the same rank as both channel shapes,
+    and each entry must divide the corresponding input and output dimension.
+    Each of the ``prod(groups)`` independent groups mixes only its own
+    ``in_channels[i] // groups[i]`` channels along each axis. Channel blocks
+    are rearranged internally; callers keep the structured channel layout.
+    The kernel shape is ``(*kernel_size, *channels_per_group, *out_channels)``.
+
+    For channels ``(8, 32)``, ``groups=(8, 32)`` is depthwise,
+    ``groups=(8, 8)`` mixes four features within each head, and
+    ``groups=(2, 2)`` mixes blocks of four heads by sixteen features.
+    For example, ``Conv((8, 32), (8, 32), 3, groups=(8, 32),
+    padding='SAME', rngs=Rngs(0))`` preserves the shape of an input
+    ``(batch, length, 8, 32)`` without manual flattening.
+
+    An integer retains legacy grouping: it divides the first input channel
+    axis and partitions flattened output channels into contiguous groups.
+    The first input dimension and total output count must be divisible by it.
 
     ``padding`` and ``pad_mode`` control different aspects of boundary
     handling. ``padding`` determines how many elements are added before and
@@ -123,7 +202,10 @@ class Conv(Module):
             padding, or a sequence of ``n`` ``(before, after)`` pairs—one for
             each spatial axis—for asymmetric padding. Defaults to ``0``.
         dilation: Spacing between kernel elements.
-        groups: Number of feature groups.
+        groups: Positive integer group count, or a sequence of positive
+            per-axis group counts. Defaults to ``1``. Sequence entries must
+            divide both corresponding channel dimensions; scalar values are
+            not broadcast across axes.
         pad_mode: How values outside the input boundary are produced. One of
             ``'zeros'``, ``'reflect'``, ``'replicate'``, or ``'circular'``.
             Nonzero modes require explicit numeric ``padding``; ``'SAME'``,
@@ -134,7 +216,14 @@ class Conv(Module):
         rngs: Random number generator used to initialize parameters.
         kernel_initializer: Function used to initialize the kernel.
         bias_initializer: Function used to initialize the bias.
-        quant: Optional Qwix quantization configuration for the kernel.
+        quant: Optional Qwix quantization configuration. A ``QtRule`` or
+            ``QtProvider`` keeps floating-point trainable parameters and
+            quantizes convolution operands; ``bwd_qtype`` controls gradient
+            quantization. Supported training formats and grouping depend on
+            Qwix QT kernels and the execution backend.
+            Tiled training quantization and ``additional_qt_config`` are
+            unsupported. Training rules cannot be combined with ``dot_general``.
+            Other rules retain weight-only quantization behavior.
         dot_general: Optional drop-in convolution callable. The name is kept
             for compatibility with other parameterized modules.
         axis_names: Optional logical names for every kernel axis.
@@ -196,7 +285,7 @@ class Conv(Module):
         stride: GenericShape = 1,
         padding: str | int | Sequence[int | tuple[int, int]] = 0,
         dilation: GenericShape = 1,
-        groups: int = 1,
+        groups: GenericShape = 1,
         pad_mode: str = 'zeros',
         bias: bool = True,
         dtype: DType | None = None,
@@ -215,20 +304,7 @@ class Conv(Module):
         in_channels = _normalize_shape(in_channels, 'in_channels')
         out_channels = _normalize_shape(out_channels, 'out_channels')
 
-        if not isinstance(groups, int) or groups <= 0:
-            raise ValueError('groups must be a positive integer')
-
-        if in_channels[0] % groups != 0:
-            raise ValueError(
-                f'in_channels[0] ({in_channels[0]}) must be divisible by groups '
-                f'({groups})'
-            )
-
-        if out_channels[0] % groups != 0:
-            raise ValueError(
-                f'out_channels ({out_channels}) must be divisible by groups '
-                f'({groups})'
-            )
+        groups, group_count, group_shape = _channel_groups(groups, in_channels, out_channels)
 
         kernel_size = self._normalize_spatial(kernel_size, name='kernel_size')
         spatial_rank = len(kernel_size)
@@ -268,6 +344,8 @@ class Conv(Module):
         self.padding = padding
         self.dilation = dilation
         self.groups = groups
+        self._group_count = group_count
+        self._group_shape = group_shape
         self.has_bias = bias
         self.pad_mode = pad_mode
         self.spatial_rank = spatial_rank
@@ -278,8 +356,9 @@ class Conv(Module):
         self._out_channel_count = math.prod(out_channels)
 
         grouped_in_channels = (
-            in_channels[0] // groups,
-            *in_channels[1:],
+            tuple(size // count for size, count in zip(in_channels, group_shape))
+            if group_shape is not None else
+            (in_channels[0] // group_count, *in_channels[1:])
         )
         weight_shape = kernel_size + grouped_in_channels + out_channels
         if axis_names is not None:
@@ -293,7 +372,13 @@ class Conv(Module):
             )
 
         kernel_array = kernel_initializer(rngs(), weight_shape, dtype)
-        if quant is not None:
+        selected_rule = _rule(quant, '', 'conv_general_dilated')
+        self._training_rule = selected_rule if isinstance(selected_rule, qwix.QtRule) else None
+        if self._training_rule is not None:
+            _validate_conv_training_rule(self._training_rule)
+            if dot_general is not None:
+                raise ValueError('QtRule and a custom dot_general cannot be supplied together')
+        if quant is not None and self._training_rule is None:
             rule = resolve_quantization_rule(
                 quant,
                 '',
@@ -534,6 +619,8 @@ class Conv(Module):
             x = jnp.pad(x, pad_width, mode=mode)
             padding = 'VALID'
 
+        if self._group_shape is not None:
+            x = _group_channel_axes(x, self.spatial_rank + 1, self.in_channels, self._group_shape)
         x = x.reshape(
             *x.shape[:self.spatial_rank + 1],
             self._in_channel_count,
@@ -554,12 +641,19 @@ class Conv(Module):
             rhs_spec,
             lhs_spec,
         )
-        kernel = self.kernel.value.reshape(
+        kernel = self.kernel.value
+        if self._group_shape is not None:
+            kernel = _group_channel_axes(
+                kernel, self.spatial_rank + len(self.in_channels), self.out_channels, self._group_shape,
+            )
+        kernel = kernel.reshape(
             *self.kernel_size,
-            self._in_channel_count // self.groups,
+            self._in_channel_count // self._group_count,
             self._out_channel_count,
         )
         conv_general_dilated = (
+            partial(_rule_conv, rule=self._training_rule)
+            if self._training_rule is not None else
             qwix.conv_general_dilated
             if isinstance(kernel, qwix.QArray)
             else self.dot_general or jax.lax.conv_general_dilated
@@ -571,11 +665,15 @@ class Conv(Module):
             padding=padding,
             rhs_dilation=self.dilation,
             dimension_numbers=dimension_numbers,
-            feature_group_count=self.groups,
+            feature_group_count=self._group_count,
             precision=self.precision,
             preferred_element_type=self.preferred_element_type,
         )
-        output = output.reshape(*output.shape[:-1], *self.out_channels)
+        output = (
+            _restore_channel_axes(output, self.out_channels, self._group_shape)
+            if self._group_shape is not None else
+            output.reshape(*output.shape[:-1], *self.out_channels)
+        )
         if self.bias is not None:
             output = output + self.bias
         if unbatched:
@@ -614,9 +712,24 @@ class ConvTranspose(Module):
     in which boundary receives an odd extra amount. String padding cannot be
     combined with ``output_padding``.
 
-    When ``groups`` is greater than one, groups partition the first input and
-    output channel axes. Both first channel-axis sizes must be divisible by
-    ``groups``.
+    A sequence ``groups=(g0, g1, ...)`` partitions each channel axis into
+    contiguous blocks. Its rank must match both channel shapes, and each
+    entry must divide the corresponding input and output dimension. There
+    are ``prod(groups)`` independent groups; channels mix within each block,
+    never between blocks. Rearrangement is internal, so structured trailing
+    channel axes are preserved. The kernel shape is
+    ``(*kernel_size, *in_channels, *output_channels_per_group)``.
+
+    For channels ``(8, 32)``, ``groups=(8, 32)`` is depthwise,
+    ``groups=(8, 8)`` mixes four features per head, and ``groups=(2, 2)``
+    mixes blocks of four heads by sixteen features. For example,
+    ``ConvTranspose((8, 32), (8, 32), 3, stride=2, padding='SAME',
+    groups=(8, 32), rngs=Rngs(0))`` maps ``(batch, length, 8, 32)`` to
+    ``(batch, 2 * length, 8, 32)`` without manual flattening.
+
+    An integer retains legacy grouping along the first input and output
+    channel axes, both of which must be divisible by that integer. Integers
+    are not broadcast across channel axes.
 
     Args:
         in_channels: Shape of the trailing input-channel axes.
@@ -628,7 +741,9 @@ class ConvTranspose(Module):
             non-negative integer, one symmetric integer per spatial axis, or
             one ``(before, after)`` pair per spatial axis. Defaults to ``0``.
         dilation: Spacing between kernel elements.
-        groups: Number of independent channel groups.
+        groups: Positive integer group count, or a sequence of positive
+            per-axis group counts dividing the corresponding input and output
+            dimensions. Defaults to ``1``.
         output_padding: Additional size added to the end of each output spatial
             axis. It resolves shape ambiguity when ``stride > 1`` and does not
             pad the output with values. Each amount must be smaller than either
@@ -638,7 +753,14 @@ class ConvTranspose(Module):
         rngs: Random number generator used to initialize parameters.
         kernel_initializer: Function used to initialize the kernel.
         bias_initializer: Function used to initialize the bias.
-        quant: Optional Qwix quantization configuration for the kernel.
+        quant: Optional Qwix quantization configuration. A ``QtRule`` or
+            ``QtProvider`` keeps floating-point trainable parameters and
+            quantizes convolution operands; ``bwd_qtype`` controls gradient
+            quantization. Supported training formats depend on Qwix QT
+            kernels and the execution backend.
+            Tiled training quantization and ``additional_qt_config`` are
+            unsupported. Training rules cannot be combined with ``dot_general``.
+            Other rules retain weight-only quantization behavior.
         dot_general: Optional replacement for ``conv_general_dilated``.
         axis_names: Optional logical names for every kernel axis.
         partition_spec: Optional partition specification for the kernel.
@@ -685,7 +807,7 @@ class ConvTranspose(Module):
         stride: GenericShape = 1,
         padding: str | int | Sequence[int | tuple[int, int]] = 0,
         dilation: GenericShape = 1,
-        groups: int = 1,
+        groups: GenericShape = 1,
         output_padding: GenericShape = 0,
         bias: bool = True,
         dtype: DType | None = None,
@@ -704,20 +826,9 @@ class ConvTranspose(Module):
         in_channels = _normalize_shape(in_channels, 'in_channels')
         out_channels = _normalize_shape(out_channels, 'out_channels')
 
-        if not isinstance(groups, int) or groups <= 0:
-            raise ValueError('groups must be a positive integer')
-
-        if in_channels[0] % groups != 0:
-            raise ValueError(
-                f'in_channels[0] ({in_channels[0]}) must be divisible by '
-                f'groups ({groups})'
-            )
-
-        if out_channels[0] % groups != 0:
-            raise ValueError(
-                f'out_channels[0] ({out_channels[0]}) must be divisible by '
-                f'groups ({groups})'
-            )
+        groups, group_count, group_shape = _channel_groups(
+            groups, in_channels, out_channels, transpose=True,
+        )
 
         kernel_size = Conv._normalize_spatial(kernel_size, name='kernel_size')
         spatial_rank = len(kernel_size)
@@ -758,6 +869,8 @@ class ConvTranspose(Module):
         self.padding = padding
         self.dilation = dilation
         self.groups = groups
+        self._group_count = group_count
+        self._group_shape = group_shape
         self.output_padding = output_padding
         self.has_bias = bias
         self.spatial_rank = spatial_rank
@@ -768,8 +881,9 @@ class ConvTranspose(Module):
         self._out_channel_count = math.prod(out_channels)
 
         grouped_out_channels = (
-            out_channels[0] // groups,
-            *out_channels[1:],
+            tuple(size // count for size, count in zip(out_channels, group_shape))
+            if group_shape is not None else
+            (out_channels[0] // group_count, *out_channels[1:])
         )
         kernel_shape = kernel_size + in_channels + grouped_out_channels
         if axis_names is not None:
@@ -783,7 +897,13 @@ class ConvTranspose(Module):
             )
 
         kernel_array = kernel_initializer(rngs(), kernel_shape, dtype)
-        if quant is not None:
+        selected_rule = _rule(quant, '', 'conv_general_dilated')
+        self._training_rule = selected_rule if isinstance(selected_rule, qwix.QtRule) else None
+        if self._training_rule is not None:
+            _validate_conv_training_rule(self._training_rule)
+            if dot_general is not None:
+                raise ValueError('QtRule and a custom dot_general cannot be supplied together')
+        if quant is not None and self._training_rule is None:
             rule = resolve_quantization_rule(
                 quant,
                 '',
@@ -934,23 +1054,28 @@ class ConvTranspose(Module):
                 f'{output_spatial_shape}'
             )
 
+        if self._group_shape is not None:
+            x = _group_channel_axes(x, self.spatial_rank + 1, self.in_channels, self._group_shape)
         x = x.reshape(
             *x.shape[:self.spatial_rank + 1],
             self._in_channel_count,
         )
         dimension_numbers = _conv_dimension_numbers(self.spatial_rank)
-        kernel = self.kernel.value.reshape(
+        kernel = self.kernel.value
+        if self._group_shape is not None:
+            kernel = _group_channel_axes(kernel, self.spatial_rank, self.in_channels, self._group_shape)
+        kernel = kernel.reshape(
             *self.kernel_size,
             self._in_channel_count,
-            self._out_channel_count // self.groups,
+            self._out_channel_count // self._group_count,
         )
-        inputs_per_group = self._in_channel_count // self.groups
+        inputs_per_group = self._in_channel_count // self._group_count
         reverse_slices = (
             (slice(None, None, -1),) * self.spatial_rank
             + (slice(None), slice(None))
         )
         outputs: list[jax.Array] = []
-        for group in range(self.groups):
+        for group in range(self._group_count):
             start = group * inputs_per_group
             stop = start + inputs_per_group
             group_kernel = kernel[
@@ -959,6 +1084,8 @@ class ConvTranspose(Module):
             ]
             group_kernel = group_kernel[reverse_slices]
             conv_general_dilated = (
+                partial(_rule_conv, rule=self._training_rule)
+                if self._training_rule is not None else
                 qwix.conv_general_dilated
                 if isinstance(group_kernel, qwix.QArray)
                 else self.dot_general or jax.lax.conv_general_dilated
@@ -978,7 +1105,11 @@ class ConvTranspose(Module):
                 )
             )
         output = jnp.concatenate(outputs, axis=-1)
-        output = output.reshape(*output.shape[:-1], *self.out_channels)
+        output = (
+            _restore_channel_axes(output, self.out_channels, self._group_shape)
+            if self._group_shape is not None else
+            output.reshape(*output.shape[:-1], *self.out_channels)
+        )
         if self.bias is not None:
             output = output + self.bias
         if unbatched:

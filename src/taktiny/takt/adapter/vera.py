@@ -22,7 +22,7 @@ from typing import Any
 import jax.numpy as jnp
 
 from taktiny.nn.base import Module, Parameter
-from taktiny.nn.modules.linear import default_kernel_initializer
+from taktiny.nn.modules.linear import Linear, default_kernel_initializer
 from taktiny.nn.modules.peft import VeRALinear
 from taktiny.nn.rng import Rngs
 from taktiny.takt.adapter.base import AdapterBase
@@ -59,7 +59,10 @@ class VeRAAdapter(AdapterBase):
         self.vera_B = vera_B
         if vera_A is not None:
             vera_A.trainable = False
+
+        if vera_B is not None:
             vera_B.trainable = False
+
         super().__init__(
             targets,
             rank,
@@ -79,13 +82,11 @@ class VeRAAdapter(AdapterBase):
         max_input = 0
         max_output = 0
         for module_path, module in targets:
-            if not (
-                hasattr(module, 'in_features')
-                and hasattr(module, 'out_features')
-            ):
+            if not isinstance(module, Linear):
                 raise TypeError(
                     f'VeRA target {module_path} is not a linear module'
                 )
+
             max_input = max(max_input, math.prod(module.in_features))
             max_output = max(max_output, math.prod(module.out_features))
 

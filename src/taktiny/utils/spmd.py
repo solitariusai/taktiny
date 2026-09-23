@@ -164,3 +164,12 @@ def with_logical_partitioning(
                 raise
         return initializer(key, shape, dtype)
     return wrapper
+
+
+__all__ = [
+    'with_logical_partitioning',
+    'logical_to_mesh_axes',
+    'map_logical_axis_names',
+    'set_logical_axis_rules',
+    'get_logical_axis_rules'
+]

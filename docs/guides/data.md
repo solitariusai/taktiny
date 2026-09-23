@@ -1,17 +1,15 @@
 # Data Loading & Transforms
 
-`taktiny.data` turns records you provide into batches. It uses Grain for
-iteration and supports arrays, mappings, images, audio, text, and other Python
-objects. It does not download datasets or choose how to decode your files.
-
-The usual order is: read a record, transform it, then batch it. Packing and
-custom collation are optional steps, not assumptions about your data.
+`taktiny.data` builds Grain pipelines over records you already have: arrays,
+mappings, images, audio, text, or other Python objects. Read a record, apply
+transforms, and batch the result. Add packing, custom collation, or device
+placement where your pipeline needs them.
 
 ## Start with records
 
 Pass `DataLoader` a random-access source: a list, an array, an already-loaded
 dataset, or an object with `__len__` and integer `__getitem__`. A record is one
-item returned by `source[index]`; it need not be a dictionary.
+item returned by `source[index]`.
 
 This example normalizes small image arrays while keeping their labels:
 
@@ -38,14 +36,13 @@ assert batches[1]["image"].shape == (1, 4, 4, 1)
 
 Operations run lazily as you iterate. By default, the loader preserves source
 order, makes one pass, and runs in the current process (`worker_count=0`).
-Final batching stacks matching leaves into NumPy arrays. It does not move them
-to JAX devices; transfer numeric batches explicitly with `jax.device_put` when
-needed.
+Default final batching stacks matching leaves into NumPy arrays. Place a batch
+on a JAX device with `jax.device_put`, or configure output placement in the
+loader as shown below.
 
-Do not pass a repository ID, a file path, or a column dictionary as the source.
-Load or wrap the data yourself first. Streaming generators are not supported by
-`DataLoader`; use a streaming backend directly, or materialize a finite stream
-only if it fits in memory.
+For files or dataset repositories, load or wrap the records into a
+random-access source first. A finite generator can be materialized when it
+fits in memory; keep larger streams on a streaming data pipeline.
 
 ## Choose an operation
 
@@ -68,12 +65,13 @@ wrappers can be mixed with native Grain operations.
 
 Use `Map` for computations involving several fields, renaming keys, or nested
 structures. Use `MapFields` when each selected field can be handled separately.
-Transforms should return new values rather than mutate source records;
-`MapFields` makes a shallow copy, not a deep copy of untouched values.
+Return new values from transforms to keep source records reusable.
+`MapFields` makes a shallow copy of the record and retains references to
+untouched values.
 
 ## Control where batching happens
 
-`DataLoader(..., batch_size=32)` appends batching **after every operation**.
+`DataLoader(..., batch_size=32)` appends batching **after all operations**.
 To run an operation on a completed batch, put `Batch` inside the pipeline and
 leave the loader's `batch_size` unset:
 
@@ -99,8 +97,8 @@ smaller. With multiple workers, batching happens independently in each worker.
 
 ### Ragged records
 
-Default batching does not pad unequal array shapes. Supply a `collate_fn` that
-pads or combines your records, or use `list` to keep them as individual objects:
+For records with unequal array shapes, supply a `collate_fn` that pads or
+combines them, or use `list` to keep them as individual objects:
 
 ```python
 import numpy as np
@@ -115,10 +113,10 @@ batch = next(iter(loader))
 assert [row.shape for row in batch] == [(2,), (5,)]
 ```
 
-A custom collator receives a sequence of rows, not a dictionary of stacked
-columns. Its return value becomes the batch.
+A custom collator receives a sequence of rows. Its return value becomes the
+batch.
 
-### Buffered preprocessing is not final batching
+### Buffered preprocessing with `BatchMap`
 
 `BatchMap` is useful when a decoder or another preprocessing function can
 process several records at once. Its function receives raw rows and must
@@ -134,17 +132,17 @@ loader = DataLoader(
 assert list(loader) == [{"value": 2}, {"value": 4}, {"value": 6}]
 ```
 
-The output is still a stream of individual records. Add final batching
-separately if needed. Use `FlatMap`, not `BatchMap`, to change the row count.
+The output is a stream of individual records; add final batching separately
+when needed. Use `FlatMap` for operations that change the row count.
 
 ## Pack aligned sequences
 
-`Pack` concatenates steps from several records into fixed-length arrays. It is
-not text-specific: the packing axis could represent audio samples, sensor
-readings, frames, or token positions.
+`Pack` concatenates steps from several records into fixed-length arrays. The
+packing axis can represent audio samples, sensor readings, frames, or token
+positions.
 
 Put `Pack` **before batching**. Its default `axis=0` refers to an individual
-record, not a batch. A record shaped `(time, channels)` becomes
+record. A record shaped `(time, channels)` becomes
 `(length, channels)` after packing, then `(batch, length, channels)` after
 batching.
 
@@ -198,17 +196,17 @@ input record once the current pack fills.
 `mask_key` emits a one-dimensional validity mask per pack. If an input already
 has that mask field, its nonzero entries select steps from every packed field
 before packing. `position_key` resets positions at input boundaries and
-continues them across split fragments. It does not create segment IDs or an
-attention mask; any model-specific boundary handling is your responsibility.
+continues them across split fragments. Add a model-specific transform if you
+also need segment IDs or an attention mask.
 
 `Pack(drop_remainder=True)` drops a partial **pack**. The loader's
 `drop_remainder=True` drops a partial **batch of packs**. These are independent.
-To pack a plain iterable without a loader, use `packer.pack(records)`.
+For a plain iterable, use `packer.pack(records)`.
 
 ## Reproducible random transforms
 
-Use `RandomMap`'s supplied generator for augmentation instead of a global RNG.
-The loader's `seed` controls sampling and these random transforms:
+Use `RandomMap`'s supplied generator for reproducible augmentation. The
+loader's `seed` controls sampling and these random transforms:
 
 ```python
 import numpy as np
@@ -236,8 +234,8 @@ unbounded iterator. Keep the source and pipeline unchanged when comparing runs.
 
 ## Split a source
 
-`train_validation_split` returns random-access views without copying the
-records or changing the source's order. `validation_size` accepts an integer
+`train_validation_split` returns random-access views into the original
+records. `validation_size` accepts an integer
 count or a fraction between zero and one; both resulting splits must be nonempty.
 
 ```python
@@ -256,17 +254,31 @@ validation_loader = DataLoader(validation, batch_size=2)
 Start with `worker_count=0` while developing a pipeline. A positive value uses
 child workers; your source and transforms must be serializable. Use a guarded
 `if __name__ == "__main__":` entry point in multiprocessing scripts.
-`worker_buffer_size` controls each worker's prefetch buffer.
+`worker_buffer_size` controls each worker's prefetch buffer. Benchmark worker
+settings against your pipeline. For an in-memory source, disabling Grain's
+reader threads and record prefetch can reduce overhead:
+
+```python
+import grain.python as grain
+
+loader = DataLoader(
+    records,
+    batch_size=2,
+    read_options=grain.ReadOptions(num_threads=0, prefetch_buffer_size=0),
+)
+```
+
+For expensive decoding or remote reads, benchmark workers and prefetching
+with the actual pipeline instead.
 
 For multiple processes, set `shard_index` and `shard_count` to assign separate
-input indices to each process. This partitions input records; it does not
-create sharded JAX arrays. Shards can have unequal lengths, and workers and
-shards batch and pack independently. Account for unequal step counts if your
-training loop requires processes to advance together.
+input indices to each process. Use `axis_names` or `partition_spec` below to
+place finished batches on a JAX mesh. Shards can have unequal lengths; workers
+and shards batch and pack independently. Account for unequal step counts if
+your training loop requires processes to advance together.
 
 If you pass a native Grain `sampler`, it owns sampling, epochs, randomness,
-and sharding; the loader's corresponding convenience settings no longer
-control those choices.
+and sharding. Configure those choices on the sampler itself.
 
 Loader iterators expose Grain's `get_state()` and `set_state()` methods:
 
@@ -286,16 +298,70 @@ assert np.array_equal(next(resumed), expected)
 ```
 
 Restore against the same source and pipeline. This state is separate from a
-model checkpoint. **`Pack` does not checkpoint its buffered packing state**, so
-do not rely on exact mid-pack resume. Custom Grain iterator operations can
-have their own checkpoint limitations.
+model checkpoint. **`Pack`'s buffered state is outside Grain's iterator
+checkpoint**, so resume at pack boundaries when exact replay matters. Custom
+Grain iterator operations may have their own checkpoint behavior.
+
+## Place output batches on JAX devices
+
+`shard_index` and `shard_count` divide input records among processes. To place
+the **finished batch arrays** on a JAX mesh, use `partition_spec` or
+`axis_names`. The specifications describe the final batched shapes, including
+the leading batch dimension:
+
+```python
+import jax
+import numpy as np
+from jax.sharding import Mesh, PartitionSpec as P
+from taktiny.data import DataLoader
+
+device_count = len(jax.devices())
+mesh = Mesh(np.asarray(jax.devices()), ("data",))
+records = [
+    {"image": np.ones(2, dtype=np.float32), "label": np.int32(i)}
+    for i in range(2 * device_count)
+]
+loader = DataLoader(
+    records,
+    batch_size=device_count,
+    partition_spec={"image": P("data", None), "label": P("data")},
+)
+
+with jax.set_mesh(mesh):
+    batch = next(iter(loader))
+
+assert batch["image"].sharding.spec == P("data", None)
+assert batch["label"].sharding.spec == P("data")
+```
+
+The mesh must be active when `iter(loader)` is called. Fields with resolved
+specs become placed JAX arrays; other fields retain Grain's output.
+Alternatively, set `axis_names` for each field and map those logical names to
+mesh axes when constructing the loader:
+
+```python
+from taktiny.utils.spmd import map_logical_axis_names
+
+with map_logical_axis_names({"batch": "data"}):
+    loader = DataLoader(
+        records,
+        batch_size=device_count,
+        axis_names={"image": ("batch", None), "label": ("batch",)},
+    )
+
+with jax.set_mesh(mesh):
+    batch = next(iter(loader))
+```
+
+For a field with both `axis_names` and `partition_spec`, the resolved logical
+names take precedence. Placement happens after Grain produces each batch. See
+the [SPMD guide](spmd.md) for mesh setup and logical-axis rules.
 
 ## Format metadata or text
 
 `ApplyTemplate` formats string leaves inside strings, dictionaries, lists, or
 tuples. It preserves other record fields and stores the result under
-`return_key` (default: `"template"`). It does not read the resulting path or
-tokenize text.
+`return_key` (default: `"template"`).
 
 ```python
 from taktiny.data import ApplyTemplate

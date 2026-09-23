@@ -21,12 +21,56 @@ from dataclasses import replace
 from typing import Any, Protocol
 
 import grain.python as grain
+import jax
 import numpy as np
 from absl import flags
 from absl.flags import UnparsedFlagAccessError
 from grain._src.python.dataset import base as dataset_base
+from jax.sharding import NamedSharding, PartitionSpec
 
 from taktiny.data.transforms import Batch, _expand_operations
+from taktiny.utils.spmd import logical_to_mesh_axes
+from taktiny.utils.typing import AxisNames
+
+
+class _PlacedIterator:
+    def __init__(self, parent: Any, axis_names: Any, specs: Any, mesh: Any, default_spec: Any):
+        self._parent = parent
+        self._axis_names = axis_names
+        self._specs = specs
+        self._mesh = mesh
+        self._default_spec = default_spec
+
+    def __iter__(self):
+        return self
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._parent, name)
+
+    def __next__(self):
+        def place(value, names, spec):
+            if isinstance(names, Mapping) or isinstance(spec, Mapping):
+                if not isinstance(value, Mapping):
+                    raise TypeError('Field sharding specifications require a mapping batch')
+                for config in (names, spec):
+                    if isinstance(config, Mapping) and config.keys() - value.keys():
+                        raise ValueError('Sharding configuration contains unknown batch fields')
+                return {key: place(item,
+                                   names.get(key) if isinstance(names, Mapping) else names,
+                                   spec.get(key, self._default_spec) if isinstance(spec, Mapping) else spec)
+                        for key, item in value.items()}
+            if spec is None:
+                return value
+
+            def put(array):
+                array = array if isinstance(array, jax.Array) else np.asarray(array)
+                if names is not None and len(names) != array.ndim:
+                    raise ValueError('axis_names length must match batch array ndim')
+                return jax.device_put(array, NamedSharding(self._mesh, spec))
+
+            return jax.tree.map(put, value)
+
+        return place(next(self._parent), self._axis_names, self._specs)
 
 
 class RandomAccessSource(Protocol):
@@ -127,6 +171,18 @@ class DataLoader(grain.DataLoader):
         worker_count: Child workers; 0 runs locally, None lets Grain choose.
             Sources and transforms must be serializable when workers are used.
         worker_buffer_size: Positive per-worker prefetch buffer size.
+        read_options: Grain reader settings. None uses Grain's defaults. For an
+            in-memory source, ``grain.ReadOptions(num_threads=0,
+            prefetch_buffer_size=0)`` avoids threaded record prefetching.
+        axis_names: Logical axis names for output arrays, or a mapping from
+            batch fields to axis names. Names describe the final batched rank
+            and override partition_spec for that field, using logical rules
+            active when the loader is constructed.
+        partition_spec: Explicit output PartitionSpec, or a mapping from batch
+            fields to specs. Placement uses the mesh active when iter(loader)
+            is called and occurs after Grain produces each batch. An active
+            mesh is required when a spec is resolved. Fields without names or
+            a spec are unchanged. Neither argument changes record sampling.
 
     Iterators retain Grain's get_state()/set_state() checkpoint API. Restore
     against the same source and pipeline. Custom iterator operations retain
@@ -157,6 +213,9 @@ class DataLoader(grain.DataLoader):
         shard_count: int = 1,
         worker_count: int | None = 0,
         worker_buffer_size: int = 1,
+        read_options: grain.ReadOptions | None = None,
+        axis_names: AxisNames | Mapping[str, AxisNames | None] | None = None,
+        partition_spec: PartitionSpec | Mapping[str, PartitionSpec | None] | None = None,
     ) -> None:
         """Create a Grain loader from a random-access dataset.
 
@@ -172,6 +231,25 @@ class DataLoader(grain.DataLoader):
         ``None`` for an unbounded loader.
         """
         _validate_source(source)
+        self.axis_names = axis_names
+
+        def resolve(names, spec):
+            if isinstance(names, Mapping) or isinstance(spec, Mapping):
+                keys = set(names if isinstance(names, Mapping) else ())
+                keys.update(spec if isinstance(spec, Mapping) else ())
+                return {key: resolve(names.get(key) if isinstance(names, Mapping) else names,
+                                     spec.get(key) if isinstance(spec, Mapping) else spec)
+                        for key in keys}
+            if spec is not None and not isinstance(spec, PartitionSpec):
+                raise TypeError('partition_spec must contain PartitionSpec values')
+            if names is not None:
+                if isinstance(names, (str, PartitionSpec)):
+                    raise TypeError('axis_names must contain logical axis-name tuples')
+                return logical_to_mesh_axes(names)
+            return spec
+
+        self.partition_spec = partition_spec
+        self._resolved_specs = resolve(axis_names, partition_spec)
 
         if operations is None or isinstance(operations, (str, bytes)):
             raise TypeError('operations must be a sequence')
@@ -270,7 +348,17 @@ class DataLoader(grain.DataLoader):
             operations=operations,
             worker_count=worker_count,
             worker_buffer_size=worker_buffer_size,
+            read_options=read_options,
         )
+
+    def __iter__(self):
+        if self.axis_names is None and self.partition_spec is None:
+            return super().__iter__()
+        mesh = jax.sharding.get_mesh()
+        if mesh.empty:
+            raise ValueError('DataLoader output sharding requires an active JAX mesh')
+        default_spec = self.partition_spec if isinstance(self.partition_spec, PartitionSpec) else None
+        return _PlacedIterator(super().__iter__(), self.axis_names, self._resolved_specs, mesh, default_spec)
 
 
 

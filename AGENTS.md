@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-Taktiny is an experimental JAX neural-network library. Python packages live under `src/taktiny/`. Put automated tests in `tests/`, hardware-specific cases in `tests/accelerators/{gpu,tpu}/`, benchmarks in `benchmarks/`, and exploratory notebooks in `notebook/colab/`. Project metadata is defined by `pyproject.toml` and `uv.lock`.
+Taktiny is an experimental JAX neural-network library. Python packages live under `src/taktiny/`. Put automated tests in `tests/`, hardware-specific cases in `tests/accelerators/{gpu,tpu}/`, benchmarks in `benchmarks/`, and exploratory notebooks in `notebook/`. Project metadata is defined by `pyproject.toml` and `uv.lock`.
 
 ## Build, Test, and Development Commands
 

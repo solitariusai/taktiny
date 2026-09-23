@@ -20,21 +20,15 @@ __description__ = (
     "Build, train, and scale neural networks with JAX."
 )
 
-from taktiny import data as data
-from taktiny import nn as nn
-from taktiny import takt as takt
-from taktiny import trainer as trainer
-from taktiny import utils as utils
-from taktiny.takt import Takt as Takt
+from taktiny.takt import Takt
+from taktiny.takt.optimizer import Optimizer
+from taktiny.utils import typing
 from taktiny.utils.transforms import scan, vmap
 
 __all__ = [
-    'data',
-    'nn',
-    'takt',
-    'trainer',
-    'utils',
     'Takt',
     'vmap',
     'scan',
+    'Optimizer',
+    'typing'
 ]

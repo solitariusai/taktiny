@@ -105,6 +105,47 @@ def vmap[F: Callable[..., Any]](
     return transform(fun)
 
 
+def _is_carry(axis: Any) -> bool:
+    return isinstance(axis, str) and axis == 'carry'
+
+
+def _positional_scan(function: Any, in_axes: Any, out_axes: Any, **options: Any) -> Any:
+    """Adapt positional carry slots to the legacy single-carry scan engine."""
+    if not isinstance(in_axes, (tuple, list)) or not isinstance(out_axes, (tuple, list)):
+        raise ValueError("positional scan requires sequences for both in_axes and out_axes")
+    in_axes, out_axes = tuple(in_axes), tuple(out_axes)
+    input_carries = tuple(i for i, axis in enumerate(in_axes) if _is_carry(axis))
+    output_carries = tuple(i for i, axis in enumerate(out_axes) if _is_carry(axis))
+    if not input_carries or len(input_carries) != len(output_carries):
+        raise ValueError("in_axes and out_axes must have the same nonzero number of 'carry' entries")
+    scanned_axes = tuple(axis for axis in in_axes if not _is_carry(axis))
+    stacked_axes = tuple(axis for axis in out_axes if not _is_carry(axis))
+
+    @wraps(function)
+    def scanned(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        if len(args) != len(in_axes):
+            raise ValueError(f'in_axes specifies {len(in_axes)} positional arguments, got {len(args)}')
+        initial = tuple(args[i] for i in input_carries)
+        inputs = tuple(arg for arg, axis in zip(args, in_axes) if not _is_carry(axis))
+
+        def body(carry: Any, slices: Any) -> Any:
+            carried, sliced = iter(carry), iter(slices)
+            arguments = tuple(next(carried) if _is_carry(axis) else next(sliced) for axis in in_axes)
+            outputs = function(*arguments, **kwargs)
+            if not isinstance(outputs, tuple) or len(outputs) != len(out_axes):
+                raise ValueError(f'positional scan body must return a tuple of {len(out_axes)} outputs')
+            return (
+                tuple(outputs[i] for i in output_carries),
+                tuple(output for output, axis in zip(outputs, out_axes) if not _is_carry(axis)),
+            )
+
+        final, history = scan(body, in_axes=scanned_axes, out_axes=stacked_axes, **options)(initial, inputs)
+        carried, stacked = iter(final), iter(history)
+        return tuple(next(carried) if _is_carry(axis) else next(stacked) for axis in out_axes)
+
+    return scanned
+
+
 def scan[F: Callable[..., Any]](
     fun: F | None = None,
     *,
@@ -116,6 +157,22 @@ def scan[F: Callable[..., Any]](
     _split_transpose: bool = False,
 ) -> Any:
     """Build a generic scan callable with configurable input and output axes.
+
+    Positional mode is selected by a top-level ``'carry'`` entry in either
+    axis specification. In this mode, ``in_axes`` has one entry per positional
+    argument and ``out_axes`` one entry per element of the body's return tuple.
+    A ``'carry'`` entry carries an entire argument PyTree between iterations.
+    Carry outputs feed carry inputs in declaration order, regardless of their
+    positions; their counts must match. The returned tuple contains final
+    carries and stacked outputs in the body's original output order.
+    Integer input axes are scanned; ``None`` inputs are broadcast unchanged.
+    Integer output axes place the stacked dimension; ``None`` outputs are
+    discarded and returned as ``None``. Non-carry entries may also be PyTree
+    prefixes. Carry markers must be top-level entries, not nested in a PyTree.
+    Keyword arguments are broadcast, and arguments described by ``in_axes``
+    must be supplied positionally. Supply ``length`` if no inputs are scanned.
+
+    Without carry markers, the legacy API below remains unchanged.
 
     The transformed function accepts ``(init, xs, *args, **kwargs)``. Extra
     arguments are broadcast across iterations and passed to the scan body
@@ -139,6 +196,16 @@ def scan[F: Callable[..., Any]](
 
     Examples:
         >>> import jax.numpy as jnp
+        >>> @scan(in_axes=('carry', 'carry', 0, 1),
+        ...       out_axes=('carry', 'carry', 0))
+        ... def step(total, count, x, context):
+        ...     total = total + x + context
+        ...     return total, count + 1, total
+        >>> total, count, history = step(
+        ...     jnp.zeros(2), 0, jnp.ones((3, 2)), jnp.ones((2, 3)))
+        >>> total.tolist(), int(count), history.shape
+        ([6.0, 6.0], 3, (3, 2))
+
         >>> @scan(in_axes=1, out_axes=-1)
         ... def accumulate(carry, x, *, factor=1):
         ...     carry = carry + x * factor
@@ -159,6 +226,16 @@ def scan[F: Callable[..., Any]](
         if not callable(function):
             raise TypeError(
                 f'fun must be callable, got {type(function).__name__}'
+            )
+
+        if any(
+            _is_carry(axis)
+            for spec in (in_axes, out_axes)
+            for axis in (spec if isinstance(spec, (tuple, list)) else (spec,))
+        ):
+            return _positional_scan(
+                function, in_axes, out_axes, length=length, reverse=reverse,
+                unroll=unroll, _split_transpose=_split_transpose,
             )
 
         @wraps(function)

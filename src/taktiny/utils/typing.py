@@ -48,7 +48,7 @@ type StateDict = dict[str, PyTree]
 type ParameterDict = dict[str, Any]
 type ModuleFactory = Callable[..., Any]
 type LossFn = Callable[..., Array | tuple[Array, Any]]
-type QuantConfig = str | qwix.QuantizationRule | qwix.PtqProvider | Sequence[qwix.QuantizationRule] | None
+type QuantConfig = str | qwix.QuantizationRule | qwix.PtqProvider | qwix.QtProvider | Sequence[qwix.QuantizationRule] | None
 type MetaData = dict[str, Any] | Sequence[tuple[str, Any]]
 
 

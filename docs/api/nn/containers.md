@@ -12,4 +12,5 @@ Sequential and structured container modules.
 .. autoclass:: taktiny.nn.List
 
 .. autoclass:: taktiny.nn.Dict
+    :members: keys, values, items
 ```

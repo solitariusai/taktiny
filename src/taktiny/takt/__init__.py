@@ -23,6 +23,7 @@ from taktiny.takt.adapter import (
     VeRAAdapter,
 )
 from taktiny.takt.base import Takt
+from taktiny.takt.optimizer import Optimizer
 
 __all__ = [
     'AdaLoRAAdapter',
