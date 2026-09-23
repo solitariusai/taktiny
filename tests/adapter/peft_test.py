@@ -246,3 +246,13 @@ def test_invalid_adapter_type_raises_error():
     model = SimpleMLP()
     with pytest.raises(TypeError, match='adapter must be a BaseAdapter instance'):
         Takt.apply_adapter(model, object())
+
+
+def test_adapter_without_module_type_raises_error():
+    adapter = LoRAAdapter('fc1', rank=2, rngs=nn.Rngs(0))
+    adapter._adapter = None
+    model = SimpleMLP()
+    with pytest.raises(TypeError, match='must define an _adapter module type'):
+        Takt.apply_adapter(model, adapter)
+    with pytest.raises(TypeError, match='must define an _adapter module type'):
+        adapter.build(model.fc1, module_path='fc1')

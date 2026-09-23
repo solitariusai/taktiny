@@ -25,12 +25,13 @@ def _replace_child(parent: Module, name: str, child: Module) -> None:
     """Replace a direct child, including list and tuple-backed children."""
     if name.isdigit() and hasattr(parent, 'layers'):
         position = int(name)
-        if isinstance(parent.layers, tuple):
-            layers = list(parent.layers)
+        sequence = getattr(parent, 'layers')
+        if isinstance(sequence, tuple):
+            layers = list(sequence)
             layers[position] = child
-            parent.layers = tuple(layers)
+            setattr(parent, 'layers', tuple(layers))
         else:
-            parent.layers[position] = child
+            sequence[position] = child
         return
 
     if '.' in name:
@@ -64,6 +65,9 @@ class Takt[M]:
             raise TypeError('Adapters require a Taktiny nn.Module model')
         if not isinstance(adapter, AdapterBase):
             raise TypeError('adapter must be a BaseAdapter instance')
+        adapter_type = adapter._adapter
+        if adapter_type is None:
+            raise TypeError('adapter must define an _adapter module type')
 
         targets: list[tuple[Module, str, Module, str]] = []
 
@@ -73,7 +77,7 @@ class Takt[M]:
                     continue
                 module_path = f'{prefix}.{name}' if prefix else name
                 if adapter.matches(module_path):
-                    if isinstance(child, adapter._adapter):
+                    if isinstance(child, adapter_type):
                         raise ValueError(
                             f'{type(adapter).__name__} is already applied '
                             f'to {module_path}'
@@ -113,7 +117,7 @@ class Takt[M]:
                 parameter.trainable = False
 
         adapters = tuple(getattr(model, '_takt_adapters', ()))
-        model._takt_adapters = adapters + (adapter,)
+        setattr(model, '_takt_adapters', adapters + (adapter,))
         return model
 
     @classmethod
