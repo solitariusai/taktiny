@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """Utilities for mapping and loading weights from various formats."""
+
 
 def map_state_dict(source_state_dict: dict, module_map: list) -> dict:
     """
@@ -39,7 +39,8 @@ def map_state_dict(source_state_dict: dict, module_map: list) -> dict:
             source_patterns, target_patterns, transform_fn = rule
         else:
             source_patterns, target_patterns = rule
-            transform_fn = lambda x: x
+            def transform_fn(x):
+                return x
 
         if isinstance(source_patterns, str):
             source_patterns = [source_patterns]
@@ -95,3 +96,6 @@ def map_state_dict(source_state_dict: dict, module_map: list) -> dict:
             current_state_dict = new_dict
 
     return current_state_dict
+
+
+__all__ = ['map_state_dict']

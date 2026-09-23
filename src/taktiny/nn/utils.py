@@ -17,6 +17,7 @@ import math
 from collections.abc import Sequence
 from itertools import product
 from numbers import Real
+from typing import Any
 
 import jax
 import jax.numpy as jnp
